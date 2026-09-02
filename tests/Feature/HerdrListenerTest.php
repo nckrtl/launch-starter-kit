@@ -15,8 +15,15 @@ use Tests\Support\FakeHerdrServer;
 
 uses(RefreshDatabase::class);
 
-beforeEach(function () {
-    $this->server = FakeHerdrServer::start([
+/**
+ * Two panes in ORB-15; the first goes idle, the second goes back to work.
+ *
+ * @param  array<string, mixed>  $overrides
+ * @return array{agents: list<array<string, mixed>>, workspaces: list<array<string, mixed>>, events: list<array<string, mixed>>, later_agents?: list<array<string, mixed>>}
+ */
+function herdrScenario(array $overrides = []): array
+{
+    return [
         'agents' => [
             ['pane_id' => 'w1:p1', 'workspace_id' => 'w1', 'tab_id' => 'w1:t1', 'terminal_id' => 't1', 'focused' => false, 'revision' => 1, 'agent' => 'codex', 'name' => 'orb15-impl', 'agent_status' => 'working'],
             ['pane_id' => 'w1:p2', 'workspace_id' => 'w1', 'tab_id' => 'w1:t1', 'terminal_id' => 't2', 'focused' => true, 'revision' => 1, 'agent' => 'claude', 'name' => 'orb15-review', 'agent_status' => 'idle'],
@@ -28,7 +35,12 @@ beforeEach(function () {
             ['event' => 'pane.agent_status_changed', 'data' => ['pane_id' => 'w1:p1', 'workspace_id' => 'w1', 'agent' => 'codex', 'agent_status' => 'idle']],
             ['event' => 'pane.agent_status_changed', 'data' => ['pane_id' => 'w1:p2', 'workspace_id' => 'w1', 'agent' => 'claude', 'agent_status' => 'working']],
         ],
-    ]);
+        ...$overrides,
+    ];
+}
+
+beforeEach(function () {
+    $this->server = FakeHerdrServer::start(herdrScenario());
 
     config([
         'herdr.socket' => $this->server->socketPath,
@@ -90,6 +102,100 @@ it('records and notifies exactly the transition into idle', function () {
             ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p2'],
         ])
         ->and(implode("\n", $log))->toContain('w1:p1')->toContain('w1:p2')->toContain('working -> idle');
+});
+
+it('opens a new subscription that includes a pane created after the first one', function () {
+    $this->server->stop();
+    $this->server = FakeHerdrServer::start(herdrScenario([
+        'events' => [
+            ['event' => 'pane.created', 'data' => ['pane_id' => 'w1:p3', 'workspace_id' => 'w1', 'tab_id' => 'w1:t1', 'terminal_id' => 't3']],
+        ],
+        'later_agents' => [
+            ...herdrScenario()['agents'],
+            ['pane_id' => 'w1:p3', 'workspace_id' => 'w1', 'tab_id' => 'w1:t1', 'terminal_id' => 't3', 'focused' => false, 'revision' => 1, 'agent' => 'claude', 'name' => 'orb15-review2', 'agent_status' => 'working'],
+        ],
+    ]));
+
+    $log = [];
+    $socket = $this->server->socketPath;
+    $tracker = new StatusTracker(['idle', 'done', 'blocked'], new Debouncer(0.0));
+
+    $listener = new Listener(
+        client: fn (): SocketClient => new SocketClient($socket),
+        tracker: $tracker,
+        recorder: app(TransitionRecorder::class),
+        log: function (string $line) use (&$log): void {
+            $log[] = $line;
+        },
+    );
+
+    $listener->run(timeout: 1.0);
+
+    $subscriptions = array_values(array_filter(
+        $this->server->requests(),
+        fn (array $request): bool => $request['method'] === 'events.subscribe',
+    ));
+
+    expect($subscriptions)->toHaveCount(2)
+        ->and($subscriptions[0]['params']['subscriptions'])->toBe([
+            ['type' => 'pane.created'],
+            ['type' => 'pane.agent_detected'],
+            ['type' => 'pane.exited'],
+            ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p1'],
+            ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p2'],
+        ])
+        ->and($subscriptions[1]['params']['subscriptions'])->toBe([
+            ['type' => 'pane.created'],
+            ['type' => 'pane.agent_detected'],
+            ['type' => 'pane.exited'],
+            ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p1'],
+            ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p2'],
+            ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p3'],
+        ])
+        ->and($tracker->knownPanes())->toBe(['w1:p1', 'w1:p2', 'w1:p3'])
+        ->and(implode("\n", $log))->toContain('subscribed to 2 panes')
+        ->toContain('new panes w1:p3; re-subscribing')
+        ->toContain('subscribed to 3 panes')
+        ->not->toContain('failed')
+        ->not->toContain('retrying')
+        ->and(HerdrEvent::count())->toBe(0);
+
+    Notification::assertNothingSent();
+});
+
+it('forgets a pane that exited and keeps the subscription', function () {
+    $this->server->stop();
+    $this->server = FakeHerdrServer::start(herdrScenario([
+        'events' => [
+            ['event' => 'pane.exited', 'data' => ['pane_id' => 'w1:p2', 'workspace_id' => 'w1', 'tab_id' => 'w1:t1', 'terminal_id' => 't2']],
+        ],
+        'later_agents' => [herdrScenario()['agents'][0]],
+    ]));
+
+    $log = [];
+    $socket = $this->server->socketPath;
+    $tracker = new StatusTracker(['idle', 'done', 'blocked'], new Debouncer(0.0));
+
+    $listener = new Listener(
+        client: fn (): SocketClient => new SocketClient($socket),
+        tracker: $tracker,
+        recorder: app(TransitionRecorder::class),
+        log: function (string $line) use (&$log): void {
+            $log[] = $line;
+        },
+    );
+
+    $listener->run(timeout: 1.0);
+
+    expect($tracker->knownPanes())->toBe(['w1:p1'])
+        ->and(array_column($this->server->requests(), 'method'))->toBe(['agent.list', 'workspace.list', 'events.subscribe', 'agent.list', 'workspace.list'])
+        ->and(implode("\n", $log))->toContain('subscribed to 2 panes')
+        ->not->toContain('re-subscribing')
+        ->not->toContain('failed')
+        ->not->toContain('retrying')
+        ->and(HerdrEvent::count())->toBe(0);
+
+    Notification::assertNothingSent();
 });
 
 it('logs instead of recording or notifying in a dry run', function () {

@@ -5,7 +5,7 @@ use App\Notifications\Channels\SlackChannel;
 use App\Notifications\HerdrAgentStatusChanged;
 use Illuminate\Notifications\AnonymousNotifiable;
 
-it('describes the agent, workspace, pane, and new status', function () {
+it('posts a done transition as idle and keeps the raw status on the event', function () {
     $event = new HerdrEvent([
         'occurred_at' => now(),
         'workspace_id' => 'w7',
@@ -19,8 +19,25 @@ it('describes the agent, workspace, pane, and new status', function () {
 
     $message = (new HerdrAgentStatusChanged($event))->toSlack(new AnonymousNotifiable);
 
-    expect($message->text)->toBe('Herdr: orb15-impl (ORB-15, w7:p1) is now done')
-        ->and($message->toArray())->toBe(['text' => 'Herdr: orb15-impl (ORB-15, w7:p1) is now done']);
+    expect($message->text)->toBe('Herdr: orb15-impl (ORB-15, w7:p1) is now idle')
+        ->and($message->toArray())->toBe(['text' => 'Herdr: orb15-impl (ORB-15, w7:p1) is now idle'])
+        ->and($event->to_status)->toBe('done');
+});
+
+it('posts a status without a label verbatim', function () {
+    $event = new HerdrEvent([
+        'occurred_at' => now(),
+        'workspace_id' => 'w7',
+        'workspace_label' => 'ORB-15',
+        'pane_id' => 'w7:p1',
+        'agent' => 'codex',
+        'agent_name' => 'orb15-impl',
+        'from_status' => 'working',
+        'to_status' => 'idle',
+    ]);
+
+    expect((new HerdrAgentStatusChanged($event))->toSlack(new AnonymousNotifiable)->text)
+        ->toBe('Herdr: orb15-impl (ORB-15, w7:p1) is now idle');
 });
 
 it('falls back to the pane id and workspace id', function () {

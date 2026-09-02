@@ -31,11 +31,28 @@ return [
     |--------------------------------------------------------------------------
     |
     | A pane entering one of these statuses is recorded and posted. Every
-    | other status (working, unknown) only updates the tracked state.
+    | other status (working, unknown) only updates the tracked state. Set
+    | HERDR_NOTIFY_STATUSES to a comma-separated list to narrow the set.
     |
     */
 
-    'notify_statuses' => ['idle', 'done', 'blocked'],
+    'notify_statuses' => array_values(array_filter(
+        array_map('trim', explode(',', (string) env('HERDR_NOTIFY_STATUSES', 'idle,done,blocked'))),
+        fn (string $status): bool => $status !== '',
+    )),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Status labels
+    |--------------------------------------------------------------------------
+    |
+    | How a Herdr status is worded when posted. Herdr reports "done" for an
+    | idle agent nobody has viewed yet, which reads as idle to the recipient.
+    | The stored event keeps Herdr's raw status.
+    |
+    */
+
+    'status_labels' => ['done' => 'idle'],
 
     /*
     |--------------------------------------------------------------------------

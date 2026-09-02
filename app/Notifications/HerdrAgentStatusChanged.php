@@ -27,7 +27,18 @@ final class HerdrAgentStatusChanged extends Notification implements SendsSlackNo
             $this->event->agent_name ?? $this->event->pane_id,
             $this->event->workspace_label ?? $this->event->workspace_id,
             $this->event->pane_id,
-            $this->event->to_status,
+            $this->label($this->event->to_status),
         ));
+    }
+
+    /**
+     * The wording for a Herdr status from config('herdr.status_labels'); the status itself when it has no label.
+     */
+    private function label(string $status): string
+    {
+        $labels = config('herdr.status_labels');
+        $label = is_array($labels) ? ($labels[$status] ?? null) : null;
+
+        return is_string($label) && $label !== '' ? $label : $status;
     }
 }

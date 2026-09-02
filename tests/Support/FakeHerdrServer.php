@@ -7,7 +7,11 @@ use RuntimeException;
 /**
  * A stand-in for the Herdr socket server: newline-delimited JSON on a Unix socket,
  * answering agent.list, workspace.list, ping, and events.subscribe from a scenario file
- * and pushing the scenario's events after the subscription acknowledgement.
+ * and pushing the scenario's events after each subscription acknowledgement.
+ *
+ * Like Herdr it serves many connections at once, so a request is answered while a
+ * subscription stays open. The optional `later_agents` roster answers every agent.list
+ * after the first, which is how a scenario changes the roster behind a lifecycle event.
  */
 final class FakeHerdrServer
 {
@@ -21,7 +25,7 @@ final class FakeHerdrServer
     ) {}
 
     /**
-     * @param  array{agents: list<array<string, mixed>>, workspaces: list<array<string, mixed>>, events: list<array<string, mixed>>}  $scenario
+     * @param  array{agents: list<array<string, mixed>>, workspaces: list<array<string, mixed>>, events: list<array<string, mixed>>, later_agents?: list<array<string, mixed>>}  $scenario
      */
     public static function start(array $scenario): self
     {
@@ -93,37 +97,80 @@ final class FakeHerdrServer
             exit(1);
         }
 
-        while (true) {
-            $peer = @stream_socket_accept($server, 5.0);
+        $peers = [];
+        $buffers = [];
+        $agentListCalls = 0;
 
-            if ($peer === false) {
+        while (true) {
+            $read = [$server, ...array_values($peers)];
+            $write = null;
+            $except = null;
+
+            if (@stream_select($read, $write, $except, 5) === false) {
                 continue;
             }
 
-            while (($line = fgets($peer)) !== false) {
-                file_put_contents($directory.'/requests.log', $line, FILE_APPEND);
-                $request = json_decode($line, true);
-                $id = $request['id'] ?? '';
-                $method = $request['method'] ?? '';
+            foreach ($read as $stream) {
+                if ($stream === $server) {
+                    $peer = @stream_socket_accept($server, 0);
 
-                $reply = match ($method) {
-                    'ping' => ['id' => $id, 'result' => ['type' => 'pong', 'version' => 'fake', 'protocol' => 20]],
-                    'agent.list' => ['id' => $id, 'result' => ['type' => 'agent_list', 'agents' => $scenario['agents']]],
-                    'workspace.list' => ['id' => $id, 'result' => ['type' => 'workspace_list', 'workspaces' => $scenario['workspaces']]],
-                    'events.subscribe' => ['id' => $id, 'result' => ['type' => 'subscription_started']],
-                    default => ['id' => $id, 'error' => ['code' => 'unknown_method', 'message' => "unknown method {$method}"]],
-                };
-
-                fwrite($peer, json_encode($reply)."\n");
-
-                if ($method === 'events.subscribe') {
-                    foreach ($scenario['events'] as $event) {
-                        fwrite($peer, json_encode($event)."\n");
+                    if ($peer !== false) {
+                        $peers[(int) $peer] = $peer;
+                        $buffers[(int) $peer] = '';
                     }
+
+                    continue;
+                }
+
+                $chunk = fread($stream, 65536);
+
+                if ($chunk === false || ($chunk === '' && feof($stream))) {
+                    fclose($stream);
+                    unset($peers[(int) $stream], $buffers[(int) $stream]);
+
+                    continue;
+                }
+
+                $buffers[(int) $stream] .= $chunk;
+
+                while (($newline = strpos($buffers[(int) $stream], "\n")) !== false) {
+                    $line = substr($buffers[(int) $stream], 0, $newline + 1);
+                    $buffers[(int) $stream] = substr($buffers[(int) $stream], $newline + 1);
+
+                    self::answer($stream, $line, $scenario, $directory, $agentListCalls);
                 }
             }
+        }
+    }
 
-            fclose($peer);
+    /**
+     * @param  resource  $peer
+     * @param  array<string, mixed>  $scenario
+     */
+    private static function answer($peer, string $line, array $scenario, string $directory, int &$agentListCalls): void
+    {
+        file_put_contents($directory.'/requests.log', $line, FILE_APPEND);
+        $request = json_decode($line, true);
+        $id = $request['id'] ?? '';
+        $method = $request['method'] ?? '';
+
+        $reply = match ($method) {
+            'ping' => ['id' => $id, 'result' => ['type' => 'pong', 'version' => 'fake', 'protocol' => 20]],
+            'agent.list' => ['id' => $id, 'result' => [
+                'type' => 'agent_list',
+                'agents' => $agentListCalls++ === 0 ? $scenario['agents'] : ($scenario['later_agents'] ?? $scenario['agents']),
+            ]],
+            'workspace.list' => ['id' => $id, 'result' => ['type' => 'workspace_list', 'workspaces' => $scenario['workspaces']]],
+            'events.subscribe' => ['id' => $id, 'result' => ['type' => 'subscription_started']],
+            default => ['id' => $id, 'error' => ['code' => 'unknown_method', 'message' => "unknown method {$method}"]],
+        };
+
+        fwrite($peer, json_encode($reply)."\n");
+
+        if ($method === 'events.subscribe') {
+            foreach ($scenario['events'] as $event) {
+                fwrite($peer, json_encode($event)."\n");
+            }
         }
     }
 }

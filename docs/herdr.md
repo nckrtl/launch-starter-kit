@@ -8,6 +8,8 @@ Commander follows the Herdr `orbit` session over its Unix socket and posts to Sl
 
 The notification is `App\Notifications\HerdrAgentStatusChanged`, delivered through the existing Slack channel to `config('herdr.slack_channel')` (`HERDR_SLACK_CHANNEL`, falling back to `SLACK_BOT_USER_DEFAULT_CHANNEL`) as `Herdr: <agent name or pane id> (<workspace label or id>, <pane id>) is now <status>`.
 
+In Herdr, `done` means idle and not yet viewed by a human in the Herdr UI, so in an unattended session a finished agent reports `done` rather than `idle`. Commander posts a `done` transition as `is now idle` through `config('herdr.status_labels')`, while the stored `to_status` keeps Herdr's raw value. `HERDR_NOTIFY_STATUSES` (default `idle,done,blocked`) is the comma-separated list of statuses that are posted, so `HERDR_NOTIFY_STATUSES=idle,done` drops blocked.
+
 ## Running it
 
 ```bash
