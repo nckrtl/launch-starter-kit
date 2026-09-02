@@ -12,6 +12,11 @@ it('renders the homepage with the Home inertia component', function () {
         );
 });
 
+it('does not ship the launch marketing interface', function () {
+    expect(resource_path('js/components/launch'))->not->toBeDirectory()
+        ->and(public_path('assets/logo-launch.svg'))->not->toBeFile();
+});
+
 it('serves the Agentation runtime alongside the toolbar', function () {
     // The toolbar, and with it the runtime, stays off in console contexts.
     app(Toolbar::class)->config->enabledInConsole = true;

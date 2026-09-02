@@ -2,6 +2,8 @@
 
 Laravel 13 + Launch Laravel + React 19 + Inertia v3 + VitePlus + Tailwind CSS v4 + shadcn
 
+This repository contains the reusable application starter only. The Launch marketing and documentation website lives in [`nckrtl/launch`](https://github.com/nckrtl/launch) and is not shipped in newly created applications.
+
 ## Getting started
 
 ```bash

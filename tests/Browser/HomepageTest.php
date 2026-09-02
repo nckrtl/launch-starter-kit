@@ -1,13 +1,10 @@
 <?php
 
-it('renders the launch marketing homepage without javascript errors', function () {
+it('renders the minimal starter homepage without javascript errors', function () {
     $page = visit('/');
 
-    $page->assertSee('idea')
-        ->assertSee('How it works')
-        ->assertSee("What's inside")
-        ->assertSee('launch-ui')
-        ->assertSee('The stack')
-        ->assertSee('Give your next idea')
+    $page->assertSee('Launch Starter Kit')
+        ->assertSee('Laravel 13 + React 19 + Inertia v3 + Tailwind CSS v4')
+        ->assertDontSee('Launch your next idea')
         ->assertNoJavaScriptErrors();
 });

@@ -1,30 +1,15 @@
 import { Head } from "@inertiajs/react";
-import { SiteHeader } from "@/components/launch/site-header";
-import { Hero } from "@/components/launch/hero";
-import { HowItWorks } from "@/components/launch/how-it-works";
-import { Features } from "@/components/launch/features";
-import { LibraryStrip } from "@/components/launch/library-strip";
-import { StackSection } from "@/components/launch/stack-section";
-import { CTA } from "@/components/launch/cta";
-import { SiteFooter } from "@/components/launch/site-footer";
 
 export default function Home() {
     return (
-        <div
-            id="top"
-            className="min-h-screen bg-background text-foreground antialiased selection:bg-accent selection:text-primary-foreground"
-        >
-            <Head title="Ship your next idea in minutes" />
-            <SiteHeader />
-            <main>
-                <Hero />
-                <HowItWorks />
-                <Features />
-                <LibraryStrip />
-                <StackSection />
-                <CTA />
-            </main>
-            <SiteFooter />
-        </div>
+        <main className="flex min-h-screen items-center justify-center bg-background text-foreground">
+            <Head title="Home" />
+            <div className="text-center">
+                <h1 className="text-4xl font-bold tracking-tight">Launch Starter Kit</h1>
+                <p className="mt-3 text-muted-foreground">
+                    Laravel 13 + React 19 + Inertia v3 + Tailwind CSS v4
+                </p>
+            </div>
+        </main>
     );
 }
