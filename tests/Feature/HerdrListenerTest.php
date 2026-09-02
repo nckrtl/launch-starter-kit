@@ -1,0 +1,110 @@
+<?php
+
+use App\Herdr\Debouncer;
+use App\Herdr\Listener;
+use App\Herdr\SocketClient;
+use App\Herdr\StatusTracker;
+use App\Herdr\TransitionRecorder;
+use App\Models\HerdrEvent;
+use App\Notifications\HerdrAgentStatusChanged;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Notifications\AnonymousNotifiable;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Notification;
+use Tests\Support\FakeHerdrServer;
+
+uses(RefreshDatabase::class);
+
+beforeEach(function () {
+    $this->server = FakeHerdrServer::start([
+        'agents' => [
+            ['pane_id' => 'w1:p1', 'workspace_id' => 'w1', 'tab_id' => 'w1:t1', 'terminal_id' => 't1', 'focused' => false, 'revision' => 1, 'agent' => 'codex', 'name' => 'orb15-impl', 'agent_status' => 'working'],
+            ['pane_id' => 'w1:p2', 'workspace_id' => 'w1', 'tab_id' => 'w1:t1', 'terminal_id' => 't2', 'focused' => true, 'revision' => 1, 'agent' => 'claude', 'name' => 'orb15-review', 'agent_status' => 'idle'],
+        ],
+        'workspaces' => [
+            ['workspace_id' => 'w1', 'label' => 'ORB-15', 'number' => 1, 'focused' => true, 'pane_count' => 2, 'tab_count' => 1, 'active_tab_id' => 'w1:t1', 'agent_status' => 'working'],
+        ],
+        'events' => [
+            ['event' => 'pane.agent_status_changed', 'data' => ['pane_id' => 'w1:p1', 'workspace_id' => 'w1', 'agent' => 'codex', 'agent_status' => 'idle']],
+            ['event' => 'pane.agent_status_changed', 'data' => ['pane_id' => 'w1:p2', 'workspace_id' => 'w1', 'agent' => 'claude', 'agent_status' => 'working']],
+        ],
+    ]);
+
+    config([
+        'herdr.socket' => $this->server->socketPath,
+        'herdr.slack_channel' => 'C0TESTCHAN',
+        'herdr.notify_statuses' => ['idle', 'done', 'blocked'],
+        'herdr.debounce_seconds' => 0,
+    ]);
+
+    Notification::fake();
+});
+
+afterEach(function () {
+    $this->server->stop();
+});
+
+it('records and notifies exactly the transition into idle', function () {
+    $log = [];
+    $socket = $this->server->socketPath;
+
+    $listener = new Listener(
+        client: fn (): SocketClient => new SocketClient($socket),
+        tracker: new StatusTracker(['idle', 'done', 'blocked'], new Debouncer(0.0)),
+        recorder: app(TransitionRecorder::class),
+        log: function (string $line) use (&$log): void {
+            $log[] = $line;
+        },
+    );
+
+    $listener->run(timeout: 1.0);
+
+    expect(HerdrEvent::count())->toBe(1);
+
+    $event = HerdrEvent::sole();
+
+    expect($event->pane_id)->toBe('w1:p1')
+        ->and($event->workspace_id)->toBe('w1')
+        ->and($event->workspace_label)->toBe('ORB-15')
+        ->and($event->agent)->toBe('codex')
+        ->and($event->agent_name)->toBe('orb15-impl')
+        ->and($event->from_status)->toBe('working')
+        ->and($event->to_status)->toBe('idle')
+        ->and($event->notified_at)->not->toBeNull();
+
+    Notification::assertSentOnDemandTimes(HerdrAgentStatusChanged::class, 1);
+    Notification::assertSentOnDemand(
+        HerdrAgentStatusChanged::class,
+        fn (HerdrAgentStatusChanged $notification, array $channels, AnonymousNotifiable $notifiable): bool => $notifiable->routes['slack'] === 'C0TESTCHAN'
+            && $notification->event->is($event),
+    );
+
+    $requests = $this->server->requests();
+
+    expect(array_column($requests, 'method'))->toBe(['agent.list', 'workspace.list', 'events.subscribe'])
+        ->and($requests[2]['params']['subscriptions'])->toBe([
+            ['type' => 'pane.created'],
+            ['type' => 'pane.agent_detected'],
+            ['type' => 'pane.exited'],
+            ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p1'],
+            ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p2'],
+        ])
+        ->and(implode("\n", $log))->toContain('w1:p1')->toContain('w1:p2')->toContain('working -> idle');
+});
+
+it('logs instead of recording or notifying in a dry run', function () {
+    $this->withoutMockingConsoleOutput();
+
+    $exitCode = Artisan::call('herdr:listen', ['--dry-run' => true, '--timeout' => 1]);
+    $output = Artisan::output();
+
+    expect($exitCode)->toBe(0)
+        ->and($output)->toContain('subscribed to 2 panes')
+        ->toContain('orb15-impl (ORB-15, w1:p1): working -> idle')
+        ->toContain('dry run: would post orb15-impl (ORB-15, w1:p1) is now idle')
+        ->toContain('orb15-review (ORB-15, w1:p2): idle -> working')
+        ->not->toContain('is now working')
+        ->and(HerdrEvent::count())->toBe(0);
+
+    Notification::assertNothingSent();
+});
