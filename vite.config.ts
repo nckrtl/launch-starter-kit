@@ -9,9 +9,18 @@ const launchConfig = await defineLaunchConfig({
     agentation: false,
 });
 
+const appUrl = process.env.VITE_APP_URL ?? process.env.APP_URL;
+const appHost = appUrl ? new URL(appUrl).hostname : undefined;
+
 export default defineConfig(async (environment) => ({
     ...(await launchConfig(environment)),
     fmt: { ignorePatterns: [".agents/**"] },
+    server: appHost
+        ? {
+              host: "0.0.0.0",
+              ws: { host: appHost },
+          }
+        : undefined,
     // Pre-commit tasks, run against staged files only by `vp staged` from
     // .vite-hooks/pre-commit. Anything they fix is re-staged automatically.
     staged: {
