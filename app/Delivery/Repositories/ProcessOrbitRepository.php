@@ -11,6 +11,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use Illuminate\Support\Facades\Process;
@@ -378,6 +379,65 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             snapshotPath: $snapshot->path,
             snapshotContentsHash: $snapshot->contentsHash,
         );
+    }
+
+    public function verifyPlanningArtifact(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        string $issueKey,
+        string $artifactSha,
+    ): VerifiedOrbitPlanningArtifact {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree->path);
+        $validator = $repository === false ? false : realpath($repository.'/bin/plan-lint');
+
+        if ($repository === false || $root === false || $path === false || $path !== $worktree->path
+            || $validator === false || ! is_executable($validator)
+            || ! str_starts_with($path, $root.'/')
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $worktree->headSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1) {
+            throw new OrbitRepositoryFailed('The Orbit planning artifact metadata is invalid.');
+        }
+
+        try {
+            $verification = Process::path($path)->timeout(60)->run([
+                $validator,
+                'verify',
+                $issueKey,
+                '--worktree='.$path,
+                '--artifact='.$artifactSha,
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The Orbit planning artifact validator could not run.', 0, $exception);
+        }
+
+        if ($verification->failed()) {
+            $details = trim($verification->errorOutput()) ?: trim($verification->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit planning artifact verification failed: '.$details);
+        }
+
+        try {
+            $plan = Process::path($path)->timeout(10)->run([
+                'git',
+                'show',
+                $artifactSha.':.loop/plan.md',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The saved Orbit planning artifact could not be read.', 0, $exception);
+        }
+
+        $contents = $plan->output();
+        $lines = preg_split('/\R/', $contents) ?: [];
+
+        if ($plan->failed() || ! in_array('Review verdict: PENDING', $lines, true)) {
+            throw new OrbitRepositoryFailed('The saved Orbit planning artifact must have a PENDING review verdict.');
+        }
+
+        return new VerifiedOrbitPlanningArtifact($artifactSha, hash('sha256', $contents));
     }
 
     public function writeIssueSnapshot(

@@ -27,6 +27,8 @@ beforeEach(function () {
     File::makeDirectory($this->worktreePath.'/.loop', 0755, true);
     File::put($this->repositoryPath.'/bin/loop-flow', "#!/usr/bin/env python3\n");
     chmod($this->repositoryPath.'/bin/loop-flow', 0755);
+    File::put($this->repositoryPath.'/bin/plan-lint', "#!/usr/bin/env bash\n");
+    chmod($this->repositoryPath.'/bin/plan-lint', 0755);
     File::put($this->receiptPath, json_encode(
         planningRepositoryReceipt($this->worktreePath, $this->headSha, $this->treeSha),
         JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR,
@@ -244,3 +246,76 @@ it('rejects changed retained issue snapshot state', function (string $case) {
         $this->snapshot,
     ))->toThrow(OrbitRepositoryFailed::class);
 })->with(['bytes', 'mode', 'symlink']);
+
+it('verifies a saved planning artifact and its pending verdict through Orbit plan-lint', function () {
+    $artifactSha = str_repeat('d', 40);
+    $plan = "Plan format: 1\nIssue: ORB-234\nFlow: discovery\nReview verdict: PENDING\n";
+    $validator = realpath($this->repositoryPath.'/bin/plan-lint');
+
+    Process::fake(function ($process) use ($artifactSha, $plan, $validator) {
+        return match ($process->command) {
+            [$validator, 'verify', 'ORB-234', '--worktree='.$this->worktreePath, '--artifact='.$artifactSha] => Process::result(output: "passed\n"),
+            ['git', 'show', $artifactSha.':.loop/plan.md'] => Process::result(output: $plan),
+            default => throw new RuntimeException('Unexpected planning artifact command.'),
+        };
+    })->preventStrayProcesses();
+
+    $verified = app(ProcessOrbitRepository::class)->verifyPlanningArtifact(
+        $this->config,
+        $this->worktree,
+        'ORB-234',
+        $artifactSha,
+    );
+
+    expect($verified->artifactSha)->toBe($artifactSha)
+        ->and($verified->planContentsHash)->toBe(hash('sha256', $plan));
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('rejects a failed Orbit plan-lint verification', function () {
+    $artifactSha = str_repeat('d', 40);
+    $validator = realpath($this->repositoryPath.'/bin/plan-lint');
+
+    Process::fake(function ($process) use ($artifactSha, $validator) {
+        if ($process->command === [
+            $validator,
+            'verify',
+            'ORB-234',
+            '--worktree='.$this->worktreePath,
+            '--artifact='.$artifactSha,
+        ]) {
+            return Process::result(errorOutput: 'stale plan receipt', exitCode: 1);
+        }
+
+        throw new RuntimeException('Unexpected planning artifact command.');
+    })->preventStrayProcesses();
+
+    expect(fn () => app(ProcessOrbitRepository::class)->verifyPlanningArtifact(
+        $this->config,
+        $this->worktree,
+        'ORB-234',
+        $artifactSha,
+    ))->toThrow(OrbitRepositoryFailed::class, 'stale plan receipt');
+
+    Process::assertNotRan(fn ($process): bool => $process->command[0] === 'git');
+});
+
+it('rejects a saved planning artifact without an exact pending verdict', function () {
+    $artifactSha = str_repeat('d', 40);
+    $validator = realpath($this->repositoryPath.'/bin/plan-lint');
+
+    Process::fake(function ($process) use ($artifactSha, $validator) {
+        return match ($process->command) {
+            [$validator, 'verify', 'ORB-234', '--worktree='.$this->worktreePath, '--artifact='.$artifactSha] => Process::result(output: "passed\n"),
+            ['git', 'show', $artifactSha.':.loop/plan.md'] => Process::result(output: "Review verdict: PASS\n"),
+            default => throw new RuntimeException('Unexpected planning artifact command.'),
+        };
+    })->preventStrayProcesses();
+
+    expect(fn () => app(ProcessOrbitRepository::class)->verifyPlanningArtifact(
+        $this->config,
+        $this->worktree,
+        'ORB-234',
+        $artifactSha,
+    ))->toThrow(OrbitRepositoryFailed::class, 'must have a PENDING review verdict');
+});
