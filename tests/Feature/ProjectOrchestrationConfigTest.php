@@ -28,7 +28,6 @@ function orbitConfig(array $overrides = []): array
 {
     return [
         'type' => 'orbit',
-        'version' => 1,
         'repository' => '/home/nckrtl/orbit',
         'worktreeRoot' => '/fast/worktrees/orbit',
         'herdrSession' => 'orbit',
@@ -38,27 +37,21 @@ function orbitConfig(array $overrides = []): array
     ];
 }
 
-it('round trips flat config JSON as an immutable typed DTO and enum state', function () {
+it('stores validated config as plain JSON with an enum state', function () {
     $project = app(ConfigureProjectOrchestration::class)->handle('orbit', orbitConfig());
     $fresh = $project->fresh();
 
-    expect($fresh->config)->toBeInstanceOf(OrbitProjectConfig::class)
-        ->and($fresh->config->repository)->toBe('/home/nckrtl/orbit')
+    expect($fresh->config)->toEqual(orbitConfig())
+        ->and($fresh->config['repository'])->toBe('/home/nckrtl/orbit')
         ->and($fresh->state)->toBe(ProjectOrchestrationState::Enabled)
         ->and(json_decode($fresh->getRawOriginal('config'), true))->toEqual(orbitConfig());
 });
 
-it('upcasts Orbit version zero and rejects unknown fields, types, and future versions', function () {
-    $legacy = orbitConfig();
-    $legacy['version'] = 0;
-    unset($legacy['defaultFlow']);
-
-    expect(app(ProjectConfigRegistry::class)->hydrate($legacy)->toArray())->toEqual(orbitConfig())
+it('hydrates valid config and rejects unknown fields and types', function () {
+    expect(app(ProjectConfigRegistry::class)->hydrate(orbitConfig()))->toBeInstanceOf(OrbitProjectConfig::class)
         ->and(fn () => app(ProjectConfigRegistry::class)->hydrate(orbitConfig(['extra' => true])))
         ->toThrow(ValidationException::class)
         ->and(fn () => app(ProjectConfigRegistry::class)->hydrate(orbitConfig(['type' => 'unknown'])))
-        ->toThrow(InvalidArgumentException::class)
-        ->and(fn () => app(ProjectConfigRegistry::class)->hydrate(orbitConfig(['version' => 2])))
         ->toThrow(InvalidArgumentException::class);
 });
 
@@ -71,7 +64,7 @@ it('validates fields and upserts one orchestration for an existing manifest', fu
 
     expect($second->is($first))->toBeTrue()
         ->and(ProjectOrchestration::count())->toBe(1)
-        ->and($second->config->concurrency)->toBe(4)
+        ->and($second->config['concurrency'])->toBe(4)
         ->and($second->state)->toBe(ProjectOrchestrationState::Paused)
         ->and(fn () => $action->handle('missing', orbitConfig()))->toThrow(InvalidArgumentException::class)
         ->and(fn () => $action->handle('orbit', orbitConfig(['repository' => 'relative'])))
@@ -98,7 +91,6 @@ it('exposes configured and unconfigured status through read-only MCP tools', fun
                 'configured' => true,
                 'state' => 'enabled',
                 'config_type' => 'orbit',
-                'config_version' => 1,
             ],
         ]);
 });

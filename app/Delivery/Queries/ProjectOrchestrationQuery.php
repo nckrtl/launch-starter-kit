@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace App\Delivery\Queries;
 
-use App\Delivery\Data\ProjectConfig;
 use App\Models\ProjectOrchestration;
 use App\Projects\SharedKnowledgeProjectRepository;
 
@@ -22,11 +21,11 @@ final readonly class ProjectOrchestrationQuery
             'project_id' => $projectId,
             'configured' => $orchestration !== null,
             'state' => $orchestration?->state->value,
-            'config' => $orchestration?->config instanceof ProjectConfig ? $orchestration->config->toArray() : null,
+            'config' => $orchestration?->config,
         ];
     }
 
-    /** @return array{project: array{id: string, name: string, manifest_status: string}, orchestration: array{configured: bool, state: string|null, config_type: string|null, config_version: int|null}} */
+    /** @return array{project: array{id: string, name: string, manifest_status: string}, orchestration: array{configured: bool, state: string|null, config_type: string|null}} */
     public function status(string $projectId): array
     {
         $manifest = $this->projects->find($projectId);
@@ -42,8 +41,7 @@ final readonly class ProjectOrchestrationQuery
             'orchestration' => [
                 'configured' => $orchestration !== null,
                 'state' => $orchestration?->state->value,
-                'config_type' => $config instanceof ProjectConfig ? $config->type : null,
-                'config_version' => $config instanceof ProjectConfig ? $config->version : null,
+                'config_type' => is_string($config['type'] ?? null) ? $config['type'] : null,
             ],
         ];
     }

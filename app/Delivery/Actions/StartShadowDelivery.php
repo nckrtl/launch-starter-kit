@@ -25,7 +25,6 @@ final readonly class StartShadowDelivery
             'external_issue_key' => $issueKey,
             'workflow_type' => ShadowWorkflow::TYPE,
             'workflow_version' => ShadowWorkflow::VERSION,
-            'config_snapshot' => $project->config->toArray(),
             'status' => DeliveryStatus::Queued,
             'current_phase' => 'herdr_test',
             'worktree_path' => $worktreePath,

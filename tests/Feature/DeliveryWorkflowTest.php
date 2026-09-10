@@ -20,8 +20,10 @@ use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Contracts\Queue\ShouldQueueAfterCommit;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Validation\ValidationException;
 
 uses(RefreshDatabase::class);
 
@@ -102,12 +104,13 @@ beforeEach(function () {
 
 afterEach(fn () => File::deleteDirectory($this->projectsPath));
 
-function workflowOrbitConfig(): array
+function workflowOrbitConfig(array $overrides = []): array
 {
     return [
-        'type' => 'orbit', 'version' => 1, 'repository' => '/home/nckrtl/orbit',
+        'type' => 'orbit', 'repository' => '/home/nckrtl/orbit',
         'worktreeRoot' => '/fast/worktrees/orbit', 'herdrSession' => 'orbit',
         'concurrency' => 3, 'defaultFlow' => 'discovery',
+        ...$overrides,
     ];
 }
 
@@ -191,6 +194,37 @@ it('starts each phase once and advances two phases idempotently from repeated ev
         ->and($this->delivery->fresh()->active_issue_key)->toBeNull()
         ->and(PhaseRun::where('status', PhaseRunStatus::Completed)->count())->toBe(2)
         ->and(AgentDispatch::count())->toBe(2);
+});
+
+it('uses the latest project config when an active delivery advances', function () {
+    Queue::fake();
+    app(ConfigureProjectOrchestration::class)->handle(
+        'orbit-workflow',
+        workflowOrbitConfig(['herdrSession' => 'orbit-updated']),
+    );
+
+    (new AdvanceDelivery($this->delivery->id))->handle(app(AdvanceDeliveryAction::class));
+
+    expect(AgentDispatch::sole()->herdr_session)->toBe('orbit-updated');
+});
+
+it('rejects corrupt live config before calling Herdr', function () {
+    DB::table('project_orchestrations')
+        ->where('id', $this->delivery->project_orchestration_id)
+        ->update(['config' => json_encode(['type' => 'orbit'], JSON_THROW_ON_ERROR)]);
+
+    expect(fn () => (new AdvanceDelivery($this->delivery->id))->handle(app(AdvanceDeliveryAction::class)))
+        ->toThrow(ValidationException::class)
+        ->and($this->herdr->calls)->toBe([]);
+});
+
+it('rejects an unsupported workflow version before calling Herdr', function () {
+    $this->delivery->workflow_version = 999;
+    $this->delivery->save();
+
+    expect(fn () => (new AdvanceDelivery($this->delivery->id))->handle(app(AdvanceDeliveryAction::class)))
+        ->toThrow(InvalidArgumentException::class)
+        ->and($this->herdr->calls)->toBe([]);
 });
 
 it('captures invalid receipts once and blocks without advancing', function () {

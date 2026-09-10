@@ -10,18 +10,17 @@ final class OrbitProjectConfig extends ProjectConfig
 {
     public const string TYPE = 'orbit';
 
-    public const int VERSION = 1;
+    public const array KEYS = ['type', 'repository', 'worktreeRoot', 'herdrSession', 'concurrency', 'defaultFlow'];
 
     public function __construct(
         string $type,
-        int $version,
         public readonly string $repository,
         public readonly string $worktreeRoot,
         public readonly string $herdrSession,
         public readonly int $concurrency,
         public readonly string $defaultFlow,
     ) {
-        parent::__construct($type, $version);
+        parent::__construct($type);
     }
 
     /** @return array<string, list<mixed>> */
@@ -29,7 +28,6 @@ final class OrbitProjectConfig extends ProjectConfig
     {
         return [
             'type' => ['required', 'string', Rule::in([self::TYPE])],
-            'version' => ['required', 'integer', Rule::in([self::VERSION])],
             'repository' => ['required', 'string', 'max:4096', 'regex:/^\//'],
             'worktreeRoot' => ['required', 'string', 'max:4096', 'regex:/^\//'],
             'herdrSession' => ['required', 'string', 'max:100'],

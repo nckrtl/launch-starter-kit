@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace App\Delivery\Actions;
 
+use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
+use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -25,6 +27,7 @@ final readonly class AdvanceDeliveryAction
     public function __construct(
         private WorkflowRegistry $workflows,
         private HerdrRuntime $herdr,
+        private ProjectConfigRegistry $configs,
     ) {}
 
     /** Return true when a continuation should be queued after the caller releases its lock. */
@@ -40,6 +43,12 @@ final readonly class AdvanceDeliveryAction
         }
 
         $workflow = $this->workflows->for($delivery);
+        $config = $this->configs->hydrate($delivery->projectOrchestration->config);
+
+        if (! $config instanceof OrbitProjectConfig) {
+            return false;
+        }
+
         $phase = $workflow->phase($delivery->current_phase);
 
         $phaseRun = DB::transaction(function () use ($delivery, $phase): PhaseRun {
@@ -76,13 +85,13 @@ final readonly class AdvanceDeliveryAction
         $dispatch = $phaseRun->agentDispatches()->firstOrFail();
 
         if ($dispatch->status === AgentDispatchStatus::Ambiguous) {
-            $this->reconcileAmbiguous($delivery, $dispatch, $phase->prompt);
+            $this->reconcileAmbiguous($delivery, $dispatch, $phase->prompt, $config);
 
             return false;
         }
 
         if ($dispatch->status === AgentDispatchStatus::Pending) {
-            $this->startAgent($delivery, $dispatch, $phase->prompt);
+            $this->startAgent($delivery, $dispatch, $phase->prompt, $config);
 
             return false;
         }
@@ -139,7 +148,7 @@ final readonly class AdvanceDeliveryAction
         });
     }
 
-    private function startAgent(Delivery $delivery, AgentDispatch $dispatch, string $prompt): void
+    private function startAgent(Delivery $delivery, AgentDispatch $dispatch, string $prompt, OrbitProjectConfig $config): void
     {
         $claimed = AgentDispatch::query()
             ->whereKey($dispatch->id)
@@ -159,7 +168,7 @@ final readonly class AdvanceDeliveryAction
         }
 
         $dispatch->forceFill([
-            'herdr_session' => $delivery->config_snapshot['herdrSession'] ?? null,
+            'herdr_session' => $config->herdrSession,
             'herdr_workspace_id' => $opened->workspaceId,
             'herdr_tab_id' => $opened->tabId,
             'herdr_pane_id' => $opened->paneId,
@@ -178,7 +187,7 @@ final readonly class AdvanceDeliveryAction
         $this->submitPrompt($delivery, $dispatch, $started->agentName, $prompt);
     }
 
-    private function reconcileAmbiguous(Delivery $delivery, AgentDispatch $dispatch, string $prompt): void
+    private function reconcileAmbiguous(Delivery $delivery, AgentDispatch $dispatch, string $prompt, OrbitProjectConfig $config): void
     {
         if ($dispatch->error_code === 'herdr_prompt_ambiguous') {
             return;
@@ -186,7 +195,7 @@ final readonly class AdvanceDeliveryAction
 
         if ($dispatch->error_code === 'herdr_worktree_open_ambiguous') {
             $dispatch->forceFill(['status' => AgentDispatchStatus::Pending])->save();
-            $this->startAgent($delivery, $dispatch, $prompt);
+            $this->startAgent($delivery, $dispatch, $prompt, $config);
 
             return;
         }

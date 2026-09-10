@@ -76,7 +76,6 @@ stable manifest project ID and adds the execution config.
 ```json
 {
     "type": "orbit",
-    "version": 1,
     "repository": "/home/nckrtl/orbit",
     "worktreeRoot": "/fast/worktrees/orbit",
     "herdrSession": "orbit",
@@ -85,21 +84,22 @@ stable manifest project ID and adds the execution config.
 }
 ```
 
-Use these PHP boundaries:
+Start with these PHP boundaries:
 
-- `ProjectConfig` defines the common type and version contract.
+- `ProjectConfig` defines the common project type contract.
 - `OrbitProjectConfig` is a strict data DTO for Orbit.
-- `ProjectConfigCast` decodes JSON, resolves the DTO by `type`, applies version
-  upcasters, and validates the result.
-- `ProjectConfigRegistry` maps known type names to DTOs, upcasters, and workflow
-  definitions.
+- `ProjectConfigRegistry` resolves and validates DTOs by `type` when a project
+  is configured.
+- Eloquent stores the validated config as a plain JSON array.
 
-Every config has a schema version. Add an upcaster when a stored shape changes.
 Do not put live delivery state, receipts, event cursors, locks, or agent IDs in
 the config column.
 
-Snapshot the relevant config type and version when a delivery starts. An edit to
-project config must not silently change the meaning of an in-flight delivery.
+Project config is live. An edit applies to active deliveries the next time they
+advance. Each advancement validates and reads config once, so a concurrent edit
+applies on the following advancement. Add config schema versions and delivery
+snapshots only when an actual compatibility requirement appears. Workflow
+versions remain separate because they identify executable transition behavior.
 
 ## Persistent model
 
@@ -120,7 +120,6 @@ Names may be adjusted to match existing Commander conventions.
 - workflow type and version;
 - status and current phase;
 - branch, worktree path, candidate SHA, and pull request identifiers when known;
-- config snapshot needed to preserve in-flight behavior;
 - timestamps and completion/failure details.
 
 Only one non-terminal delivery may exist for the same project and external issue.
@@ -354,9 +353,9 @@ separate enum value.
 
 ### 1. Configuration foundation
 
-- Add `project_orchestrations` with its versioned config cast.
-- Add `ProjectConfig`, `OrbitProjectConfig`, registry, and upcaster boundary.
-- Add focused tests for hydration, validation, unknown types, and upcasting.
+- Add `project_orchestrations` with plain JSON config.
+- Add `ProjectConfig`, `OrbitProjectConfig`, and a small validation registry.
+- Add focused tests for hydration, validation, unknown types, and live updates.
 - Expose read-only config and project status through MCP.
 
 ### 2. Delivery ledger
@@ -423,7 +422,7 @@ only after dispatch correlation and idempotent advancement are reliable.
 
 ## Verification strategy
 
-Use focused Pest tests for DTO casting, config upcasting, state transitions,
+Use focused Pest tests for config validation and live updates, state transitions,
 idempotency, event correlation, receipt validation, retries, and locking. Use
 fakes around Herdr and repository adapters. Add one integration test that runs a
 delivery through multiple phases with repeated events.
@@ -545,8 +544,8 @@ shadow-mode parity permits cutover.
 
 Implement the reviewable slice in this order:
 
-1. Add configuration DTOs, upcasting, the cast, registry, orchestration record,
-   and read-only MCP tools.
+1. Add configuration DTOs, a validation registry, orchestration record, and
+   read-only MCP tools.
 2. Add portable ledger migrations, string-backed enums, relationships, database
    constraints, and a deterministic timeline query.
 3. Add a small test workflow and `AdvanceDelivery` with a cache lock, database

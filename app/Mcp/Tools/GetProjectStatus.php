@@ -34,7 +34,6 @@ final class GetProjectStatus extends Tool
                 'configured' => $schema->boolean()->required(),
                 'state' => $schema->string()->nullable()->required(),
                 'config_type' => $schema->string()->nullable()->required(),
-                'config_version' => $schema->integer()->nullable()->required(),
             ])->required(),
         ];
     }

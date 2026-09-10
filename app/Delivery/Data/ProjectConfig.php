@@ -10,6 +10,5 @@ abstract class ProjectConfig extends Data
 {
     public function __construct(
         public readonly string $type,
-        public readonly int $version,
     ) {}
 }

@@ -19,7 +19,6 @@ return new class extends Migration
             $table->string('external_issue_key', 100)->nullable();
             $table->string('workflow_type', 80);
             $table->unsignedInteger('workflow_version');
-            $table->json('config_snapshot');
             $table->string('status')->default('queued');
             $table->string('current_phase', 100);
             $table->char('active_issue_key', 64)->nullable()->unique();

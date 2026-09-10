@@ -20,7 +20,6 @@ use Illuminate\Support\Collection;
  * @property string|null $external_issue_key
  * @property string $workflow_type
  * @property int $workflow_version
- * @property array<string, mixed> $config_snapshot
  * @property DeliveryStatus $status
  * @property string $current_phase
  * @property string|null $active_issue_key
@@ -60,7 +59,6 @@ final class Delivery extends Model
     protected function casts(): array
     {
         return [
-            'config_snapshot' => 'array',
             'status' => DeliveryStatus::class,
             'completion_details' => 'array',
             'failure_details' => 'array',

@@ -43,7 +43,7 @@ function ledgerDelivery(object $test, string $issueId = 'linear-1'): Delivery
 function ledgerOrbitConfig(): array
 {
     return [
-        'type' => 'orbit', 'version' => 1, 'repository' => '/home/nckrtl/orbit',
+        'type' => 'orbit', 'repository' => '/home/nckrtl/orbit',
         'worktreeRoot' => '/fast/worktrees/orbit', 'herdrSession' => 'orbit',
         'concurrency' => 3, 'defaultFlow' => 'discovery',
     ];
