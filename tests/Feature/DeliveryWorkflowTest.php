@@ -32,6 +32,9 @@ final class WorkflowFakeHerdrRuntime implements HerdrRuntime
     /** @var list<string> */
     public array $calls = [];
 
+    /** @var list<string> */
+    public array $prompts = [];
+
     private int $sequence = 0;
 
     public bool $failStartOnce = false;
@@ -75,6 +78,7 @@ final class WorkflowFakeHerdrRuntime implements HerdrRuntime
     public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers
     {
         $this->calls[] = 'prompt:'.$name;
+        $this->prompts[] = $prompt;
 
         return $this->ids("pane-{$this->sequence}", $name);
     }
@@ -154,7 +158,9 @@ it('starts each phase once and advances two phases idempotently from repeated ev
 
     expect($this->herdr->calls)->toHaveCount(4)
         ->and(AgentDispatch::count())->toBe(1)
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->herdr->prompts[0])->toContain('delivery:submit-shadow-receipt 1 1')
+        ->and(AgentDispatch::sole()->prompt_hash)->toBe(hash('sha256', $this->herdr->prompts[0]));
 
     config()->set('herdr.orchestration.enabled', true);
     $dispatch = AgentDispatch::sole();

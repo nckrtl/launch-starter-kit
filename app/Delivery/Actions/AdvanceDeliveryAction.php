@@ -83,15 +83,22 @@ final readonly class AdvanceDeliveryAction
         });
 
         $dispatch = $phaseRun->agentDispatches()->firstOrFail();
+        $prompt = $this->renderPrompt($phase->prompt, $phaseRun, $dispatch);
+        $promptHash = hash('sha256', $prompt);
+
+        if (! hash_equals($dispatch->prompt_hash, $promptHash)) {
+            $dispatch->prompt_hash = $promptHash;
+            $dispatch->save();
+        }
 
         if ($dispatch->status === AgentDispatchStatus::Ambiguous) {
-            $this->reconcileAmbiguous($delivery, $dispatch, $phase->prompt, $config);
+            $this->reconcileAmbiguous($delivery, $dispatch, $prompt, $config);
 
             return false;
         }
 
         if ($dispatch->status === AgentDispatchStatus::Pending) {
-            $this->startAgent($delivery, $dispatch, $phase->prompt, $config);
+            $this->startAgent($delivery, $dispatch, $prompt, $config);
 
             return false;
         }
@@ -266,5 +273,24 @@ final readonly class AdvanceDeliveryAction
             'error_code' => $code,
             'error_message' => $exception->getMessage(),
         ])->save();
+    }
+
+    private function renderPrompt(string $instructions, PhaseRun $phaseRun, AgentDispatch $dispatch): string
+    {
+        $command = sprintf(
+            '%s %s delivery:submit-shadow-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $phaseRun->id,
+            $dispatch->id,
+        );
+
+        return implode("\n", [
+            $instructions,
+            '',
+            "Delivery {$phaseRun->delivery_id}; dispatch {$dispatch->id}; phase {$phaseRun->phase_name}; attempt {$phaseRun->attempt}.",
+            'Run this from the current worktree:',
+            $command,
+        ]);
     }
 }

@@ -25,12 +25,12 @@ final readonly class ShadowWorkflow implements DeliveryWorkflow
             'herdr_test' => new Phase(
                 name: 'herdr_test',
                 agentRole: 'test',
-                prompt: 'Do not change source files. Write the requested harmless orchestration receipt and then stop.',
+                prompt: 'Do not change source files. Run the exact harmless receipt command below and then stop.',
             ),
             'herdr_confirm' => new Phase(
                 name: 'herdr_confirm',
                 agentRole: 'test-reviewer',
-                prompt: 'Do not change source files. Confirm the harmless orchestration receipt contract and then stop.',
+                prompt: 'Do not change source files. Run the exact harmless receipt command below to confirm the contract and then stop.',
             ),
             default => throw new InvalidArgumentException("Unknown shadow workflow phase [{$name}]."),
         };
