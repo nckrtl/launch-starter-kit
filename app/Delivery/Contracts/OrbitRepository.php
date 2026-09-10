@@ -10,6 +10,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 
 interface OrbitRepository
 {
@@ -18,6 +19,13 @@ interface OrbitRepository
     public function prepareWorktree(OrbitProjectConfig $config, string $issueKey): PreparedWorktree;
 
     public function checkCandidate(OrbitProjectConfig $config, PreparedWorktree $worktree): CandidateCheck;
+
+    public function verifyPlanningHandoff(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        CandidateCheck $candidate,
+        PreparedIssueSnapshot $snapshot,
+    ): VerifiedOrbitPlanningRepository;
 
     public function writeIssueSnapshot(
         OrbitProjectConfig $config,

@@ -535,6 +535,22 @@ checks at its own dispatch boundary. A later cutover will route the existing
 driver entry point through the same start service after those authorization and
 eligibility adapters exist.
 
+The next shadow boundary is `PrepareOrbitPlanningHandoff`. It reloads the
+delivery and live project config, acquires the same per-issue controller lock,
+and verifies the exact registered issue worktree, exact lowercase issue branch,
+candidate and tree, clean and conflict-free state, discovery flow, startup
+quality receipt, and retained issue snapshot. Only after those repository
+checks does it fetch Linear again and compare the current schema-2 contract. It
+returns the fresh normalized issue payload and all verified repository bindings
+in a readonly handoff.
+
+This handoff is deliberately non-runnable. It does not create an agent dispatch,
+queue advancement, call Herdr, change workflow state, or mutate Linear. An
+eligible `Todo` issue can produce the handoff, but the handoff remains marked
+non-dispatchable. Live planning still needs a separate Linear transition to `In
+Progress`, a read-back, and the same final verification immediately before the
+prompt is submitted.
+
 ### Project registry boundary
 
 The shared-knowledge project registry is currently file-backed. Its stable ID

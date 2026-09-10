@@ -231,7 +231,7 @@ final readonly class OrbitIssueSnapshotFactory
     private function contractHash(array $issue): string
     {
         $labels = array_map(
-            static fn (array $label): string => $label['name'] === 'proof:incus' ? 'incus' : $label['name'],
+            static fn (array $label): string => str_replace('proof:incus', 'incus', $label['name']),
             $issue['labels']['nodes'],
         );
         $labels = array_values(array_unique($labels));

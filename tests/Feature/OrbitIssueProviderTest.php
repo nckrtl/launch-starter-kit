@@ -1,6 +1,7 @@
 <?php
 
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
 use Illuminate\Support\Facades\Process;
 
@@ -120,6 +121,77 @@ it('fetches one normalized issue through the fixed read-only Hermes RPC boundary
             && ! str_contains($input['document'], 'mutation');
     });
 });
+
+it('matches the installed controller contract for equivalent issue collections', function () {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $baseline = $factory->make(providerResponse(), providerIssueId(), 'ORB-234', providerViewerId());
+    $equivalent = $factory->make(providerResponse([
+        'url' => 'https://linear.app/orbit/issue/ORB-234/current',
+        'updatedAt' => '2026-09-11T12:00:00.000Z',
+        'state' => [
+            'id' => '44444444-5555-4666-8777-888888888888',
+            'name' => 'In Progress',
+            'type' => 'started',
+        ],
+        'labels' => [
+            'nodes' => [
+                ['name' => 'apps:cli'],
+                ['name' => 'incus'],
+                ['name' => 'apps:cli'],
+            ],
+            'pageInfo' => ['hasNextPage' => false],
+        ],
+        'attachments' => [
+            'nodes' => [
+                ['title' => 'Alpha', 'url' => 'https://example.test/alpha'],
+                ['title' => 'Zeta', 'url' => 'https://example.test/zeta'],
+            ],
+            'pageInfo' => ['hasNextPage' => false],
+        ],
+        'inverseRelations' => [
+            'nodes' => [[
+                'type' => 'blocks',
+                'issue' => ['identifier' => 'ORB-9', 'state' => ['type' => 'completed']],
+            ]],
+            'pageInfo' => ['hasNextPage' => false],
+        ],
+    ]), providerIssueId(), 'ORB-234', providerViewerId());
+
+    $substring = $factory->make(providerResponse([
+        'labels' => [
+            'nodes' => [['name' => 'scope:proof:incus:required']],
+            'pageInfo' => ['hasNextPage' => false],
+        ],
+    ]), providerIssueId(), 'ORB-234', providerViewerId());
+    $normalizedSubstring = $factory->make(providerResponse([
+        'labels' => [
+            'nodes' => [['name' => 'scope:incus:required']],
+            'pageInfo' => ['hasNextPage' => false],
+        ],
+    ]), providerIssueId(), 'ORB-234', providerViewerId());
+
+    expect($equivalent->contractHash)->toBe($baseline->contractHash)
+        ->and($substring->contractHash)->toBe($normalizedSubstring->contractHash);
+});
+
+it('changes the controller contract hash for planning-relevant issue fields', function (array $overrides) {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $baseline = $factory->make(providerResponse(), providerIssueId(), 'ORB-234', providerViewerId());
+    $changed = $factory->make(providerResponse($overrides), providerIssueId(), 'ORB-234', providerViewerId());
+
+    expect($changed->contractHash)->not->toBe($baseline->contractHash);
+})->with([
+    'title' => [['title' => 'A changed title']],
+    'description' => [['description' => "## Outcome\n\nA changed outcome."]],
+    'labels' => [['labels' => [
+        'nodes' => [['name' => 'apps:gateway']],
+        'pageInfo' => ['hasNextPage' => false],
+    ]]],
+    'attachments' => [['attachments' => [
+        'nodes' => [['title' => 'Changed', 'url' => 'https://example.test/changed']],
+        'pageInfo' => ['hasNextPage' => false],
+    ]]],
+]);
 
 it('rejects an issue response with different stable identity', function (array $overrides) {
     fakeProviderResponse(providerResponse($overrides));

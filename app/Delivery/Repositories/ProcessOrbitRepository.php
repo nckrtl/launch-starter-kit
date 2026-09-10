@@ -11,6 +11,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Str;
@@ -289,28 +290,94 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             throw new OrbitRepositoryFailed('The checked candidate Git metadata is invalid.');
         }
 
-        $receiptPath = realpath($reportedReceipt);
-        $expectedDirectory = $common.'/orbit-checks/'.$worktree->headSha;
-
-        if ($receiptPath === false || is_link($reportedReceipt) || ! is_file($receiptPath)
-            || basename($receiptPath) !== 'result.json'
-            || dirname(dirname($receiptPath)) !== $expectedDirectory) {
-            throw new OrbitRepositoryFailed('Orbit candidate check returned an invalid receipt path.');
-        }
-
-        $contents = file_get_contents($receiptPath);
-
-        try {
-            $receipt = $contents === false ? null : json_decode($contents, true, flags: JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
-            $receipt = null;
-        }
-
-        if (! is_array($receipt) || ! $this->validCandidateReceipt($receipt, $worktree, $treeSha, $path)) {
-            throw new OrbitRepositoryFailed('Orbit candidate check returned an invalid receipt.');
-        }
+        $receiptPath = $this->validatedCandidateReceiptPath($reportedReceipt, $worktree, $treeSha, $path, $common);
 
         return new CandidateCheck($receiptPath, $worktree->headSha, $treeSha);
+    }
+
+    public function verifyPlanningHandoff(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        CandidateCheck $candidate,
+        PreparedIssueSnapshot $snapshot,
+    ): VerifiedOrbitPlanningRepository {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree->path);
+        $configuredCommon = $repository === false ? false : realpath($repository.'/.git');
+        $flow = $repository === false ? false : realpath($repository.'/bin/loop-flow');
+
+        if ($repository === false || $root === false || $path === false || $path !== $worktree->path
+            || $configuredCommon === false || ! is_dir($configuredCommon) || is_link($repository.'/.git')
+            || $flow === false || ! is_executable($flow)
+            || ! str_starts_with($path, $root.'/')
+            || preg_match('/^ORB-[0-9]+$/', $snapshot->issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $worktree->headSha) !== 1
+            || $candidate->candidateSha !== $worktree->headSha
+            || preg_match('/^[a-f0-9]{40}$/', $candidate->treeSha) !== 1) {
+            throw new OrbitRepositoryFailed('The Orbit planning candidate metadata is invalid.');
+        }
+
+        try {
+            $inventory = Process::path($repository)->timeout(10)->run(['git', 'worktree', 'list', '--porcelain']);
+            $status = Process::path($path)->timeout(10)->run(['git', 'status', '--porcelain']);
+            $conflicts = Process::path($path)->timeout(10)->run(['git', 'diff', '--name-only', '--diff-filter=U']);
+            $head = Process::path($path)->timeout(10)->run(['git', 'rev-parse', 'HEAD']);
+            $tree = Process::path($path)->timeout(10)->run(['git', 'rev-parse', 'HEAD^{tree}']);
+            $common = Process::path($path)->timeout(10)->run([
+                'git', 'rev-parse', '--path-format=absolute', '--git-common-dir',
+            ]);
+            $selectedFlow = Process::path($repository)->timeout(10)->run([$flow, 'status', '--worktree='.$path]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The Orbit planning candidate could not be inspected.', 0, $exception);
+        }
+
+        if ($inventory->failed() || ! $this->hasExactIssueWorktree($inventory->output(), $path, Str::lower($snapshot->issueKey))) {
+            throw new OrbitRepositoryFailed('The registered Orbit issue worktree changed before planning preparation.');
+        }
+
+        if ($status->failed() || trim($status->output()) !== '') {
+            throw new OrbitRepositoryFailed('The Orbit issue worktree is dirty before planning preparation.');
+        }
+
+        if ($conflicts->failed() || trim($conflicts->output()) !== '') {
+            throw new OrbitRepositoryFailed('The Orbit issue worktree has unresolved conflicts before planning preparation.');
+        }
+
+        if ($head->failed() || trim($head->output()) !== $candidate->candidateSha
+            || $tree->failed() || trim($tree->output()) !== $candidate->treeSha) {
+            throw new OrbitRepositoryFailed('The Orbit planning candidate no longer matches its recorded Git state.');
+        }
+
+        $currentCommon = $common->failed() ? false : realpath(trim($common->output()));
+
+        if ($currentCommon === false || $currentCommon !== $configuredCommon) {
+            throw new OrbitRepositoryFailed('The Orbit issue worktree no longer belongs to the configured repository.');
+        }
+
+        if ($selectedFlow->failed() || trim($selectedFlow->output()) !== 'discovery') {
+            throw new OrbitRepositoryFailed('Orbit planning preparation requires the discovery flow.');
+        }
+
+        $receiptPath = $this->validatedCandidateReceiptPath(
+            $candidate->receiptPath,
+            $worktree,
+            $candidate->treeSha,
+            $path,
+            $configuredCommon,
+        );
+        $this->verifyIssueSnapshot($config, $worktree, $snapshot);
+
+        return new VerifiedOrbitPlanningRepository(
+            worktreePath: $path,
+            branch: Str::lower($snapshot->issueKey),
+            candidateSha: $candidate->candidateSha,
+            treeSha: $candidate->treeSha,
+            flow: 'discovery',
+            qualityReceiptPath: $receiptPath,
+            snapshotPath: $snapshot->path,
+            snapshotContentsHash: $snapshot->contentsHash,
+        );
     }
 
     public function writeIssueSnapshot(
@@ -389,6 +456,61 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             || ($payload['identifier'] ?? null) !== $snapshot->issueKey) {
             throw new OrbitRepositoryFailed('The retained Orbit issue snapshot no longer matches its ledger record.');
         }
+    }
+
+    private function validatedCandidateReceiptPath(
+        string $reportedReceipt,
+        PreparedWorktree $worktree,
+        string $treeSha,
+        string $path,
+        string $common,
+    ): string {
+        $receiptPath = realpath($reportedReceipt);
+        $expectedDirectory = $common.'/orbit-checks/'.$worktree->headSha;
+
+        if ($receiptPath === false || $receiptPath !== $reportedReceipt
+            || is_link($reportedReceipt) || ! is_file($receiptPath)
+            || basename($receiptPath) !== 'result.json'
+            || dirname(dirname($receiptPath)) !== $expectedDirectory) {
+            throw new OrbitRepositoryFailed('Orbit candidate check returned an invalid receipt path.');
+        }
+
+        $contents = file_get_contents($receiptPath);
+
+        try {
+            $receipt = $contents === false ? null : json_decode($contents, true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            $receipt = null;
+        }
+
+        if (! is_array($receipt) || ! $this->validCandidateReceipt($receipt, $worktree, $treeSha, $path)) {
+            throw new OrbitRepositoryFailed('Orbit candidate check returned an invalid receipt.');
+        }
+
+        return $receiptPath;
+    }
+
+    private function hasExactIssueWorktree(string $output, string $path, string $branch): bool
+    {
+        $records = preg_split('/\R\R+/', trim($output)) ?: [];
+        $matches = [];
+
+        foreach ($records as $record) {
+            $values = [];
+
+            foreach (preg_split('/\R/', $record) ?: [] as $line) {
+                [$key, $value] = array_pad(explode(' ', $line, 2), 2, '');
+                $values[$key] = $value;
+            }
+
+            if (($values['worktree'] ?? null) === $path || ($values['branch'] ?? null) === 'refs/heads/'.$branch) {
+                $matches[] = $values;
+            }
+        }
+
+        return count($matches) === 1
+            && ($matches[0]['worktree'] ?? null) === $path
+            && ($matches[0]['branch'] ?? null) === 'refs/heads/'.$branch;
     }
 
     /** @param array<mixed, mixed> $receipt */
