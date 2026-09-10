@@ -167,16 +167,24 @@ final readonly class AdvanceDeliveryAction
             throw $exception;
         }
 
+        try {
+            $pane = $this->herdr->splitPane($opened->paneId, (string) $delivery->worktree_path);
+        } catch (Throwable $exception) {
+            $this->markAmbiguous($dispatch, 'herdr_pane_split_ambiguous', $exception);
+
+            throw $exception;
+        }
+
         $dispatch->forceFill([
             'herdr_session' => $config->herdrSession,
-            'herdr_workspace_id' => $opened->workspaceId,
-            'herdr_tab_id' => $opened->tabId,
-            'herdr_pane_id' => $opened->paneId,
-            'herdr_terminal_id' => $opened->terminalId,
+            'herdr_workspace_id' => $pane->workspaceId,
+            'herdr_tab_id' => $pane->tabId,
+            'herdr_pane_id' => $pane->paneId,
+            'herdr_terminal_id' => $pane->terminalId,
         ])->save();
 
         try {
-            $started = $this->herdr->startAgent($opened->paneId, (string) $dispatch->herdr_agent_name);
+            $started = $this->herdr->startAgent($pane->paneId, (string) $dispatch->herdr_agent_name);
         } catch (Throwable $exception) {
             $this->markAmbiguous($dispatch, 'herdr_start_ambiguous', $exception);
 

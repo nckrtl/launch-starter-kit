@@ -36,9 +36,16 @@ final class WorkflowFakeHerdrRuntime implements HerdrRuntime
 
     public bool $failStartOnce = false;
 
+    public bool $reuseWorktree = false;
+
     public function openWorktree(string $repositoryPath, string $worktreePath): OpenedHerdrWorktree
     {
         $this->calls[] = 'open:'.$repositoryPath.':'.$worktreePath;
+
+        if ($this->reuseWorktree) {
+            return new OpenedHerdrWorktree('workspace-root', 'tab-root', 'pane-root', 'terminal-root', true);
+        }
+
         $this->sequence++;
 
         return new OpenedHerdrWorktree("workspace-{$this->sequence}", "tab-{$this->sequence}", "pane-{$this->sequence}", "terminal-{$this->sequence}", false);
@@ -47,8 +54,9 @@ final class WorkflowFakeHerdrRuntime implements HerdrRuntime
     public function splitPane(string $paneId, string $workingDirectory): HerdrAgentIdentifiers
     {
         $this->calls[] = 'split:'.$paneId;
+        $this->sequence++;
 
-        return $this->ids($paneId, '');
+        return $this->ids("pane-{$this->sequence}", '');
     }
 
     public function startAgent(string $paneId, string $name): HerdrAgentIdentifiers
@@ -144,7 +152,7 @@ it('starts each phase once and advances two phases idempotently from repeated ev
     $job->handle($action);
     $job->handle($action);
 
-    expect($this->herdr->calls)->toHaveCount(3)
+    expect($this->herdr->calls)->toHaveCount(4)
         ->and(AgentDispatch::count())->toBe(1)
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
 
@@ -206,6 +214,24 @@ it('uses the latest project config when an active delivery advances', function (
     (new AdvanceDelivery($this->delivery->id))->handle(app(AdvanceDeliveryAction::class));
 
     expect(AgentDispatch::sole()->herdr_session)->toBe('orbit-updated');
+});
+
+it('starts an agent in a fresh pane when Herdr reuses an open worktree', function () {
+    Queue::fake();
+    $this->herdr->reuseWorktree = true;
+
+    (new AdvanceDelivery($this->delivery->id))->handle(app(AdvanceDeliveryAction::class));
+
+    $dispatch = AgentDispatch::sole();
+
+    expect($this->herdr->calls)->toBe([
+        'open:/home/nckrtl/orbit:/fast/worktrees/orbit/orb-77',
+        'split:pane-root',
+        'start:commander-1-herdr_test-1',
+        'prompt:commander-1-herdr_test-1',
+    ])->and($dispatch->herdr_pane_id)->toBe('pane-1')
+        ->and($dispatch->herdr_pane_id)->not->toBe('pane-root')
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting);
 });
 
 it('rejects corrupt live config before calling Herdr', function () {
