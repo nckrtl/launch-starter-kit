@@ -4,6 +4,7 @@ import { createInertiaApp } from "@inertiajs/react";
 import { initializeTheme } from "@/hooks/use-appearance";
 
 createInertiaApp({
+    progress: { color: "#ffffff" },
     title: (title) =>
         title
             ? `${title} - ${import.meta.env.VITE_APP_NAME || "Laravel"}`

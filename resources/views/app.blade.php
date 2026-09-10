@@ -4,8 +4,7 @@
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
 
-        <link rel="icon" type="image/svg+xml" href="/favicon.svg">
-        <link rel="icon" type="image/x-icon" href="/favicon.ico">
+        <link rel="icon" type="image/svg+xml" href="/commander-icon.svg">
 
         {{-- Points AI agents at the setup guide instead of making them parse this page. --}}
         <link rel="alternate" type="text/markdown" href="/create.md" title="Create a new project with Launch">

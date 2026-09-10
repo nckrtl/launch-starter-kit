@@ -13,15 +13,16 @@ use Illuminate\Support\Facades\Log;
 final class HerdrListen extends Command
 {
     protected $signature = 'herdr:listen
-        {--dry-run : Log transitions instead of recording and posting them}
+        {--dry-run : Log transitions instead of recording and sending them}
         {--timeout= : Stop after this many seconds}';
 
-    protected $description = 'Follow the Herdr session and post agent-status changes to Slack';
+    protected $description = 'Follow the Herdr session and send agent-status changes directly to Tom';
 
     public function handle(TransitionRecorder $recorder): int
     {
         $socket = config('herdr.socket');
-        $channel = config('herdr.slack_channel');
+        $webhookUrl = config('herdr.webhook_url');
+        $webhookSecret = config('herdr.webhook_secret');
         $dryRun = (bool) $this->option('dry-run');
         $timeout = $this->option('timeout');
         $statuses = config('herdr.notify_statuses');
@@ -33,8 +34,11 @@ final class HerdrListen extends Command
             return self::FAILURE;
         }
 
-        if (! $dryRun && (! is_string($channel) || $channel === '')) {
-            $this->error('HERDR_SLACK_CHANNEL is not configured.');
+        if (! $dryRun && (
+            ! is_string($webhookUrl) || $webhookUrl === ''
+            || ! is_string($webhookSecret) || $webhookSecret === ''
+        )) {
+            $this->error('HERDR_TOM_WEBHOOK_URL and HERDR_TOM_WEBHOOK_SECRET must be configured.');
 
             return self::FAILURE;
         }

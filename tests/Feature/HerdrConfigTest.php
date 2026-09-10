@@ -42,8 +42,8 @@ function herdrConfigWithNotifyStatuses(?string $value): array
     }
 }
 
-it('notifies idle, done, and blocked by default', function () {
-    expect(herdrConfigWithNotifyStatuses(null)['notify_statuses'])->toBe(['idle', 'done', 'blocked']);
+it('notifies idle and done by default', function () {
+    expect(herdrConfigWithNotifyStatuses(null)['notify_statuses'])->toBe(['idle', 'done']);
 });
 
 it('reads HERDR_NOTIFY_STATUSES as a comma-separated list, trimmed, without empty entries', function () {

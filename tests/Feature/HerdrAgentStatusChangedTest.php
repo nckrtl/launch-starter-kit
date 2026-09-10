@@ -19,8 +19,8 @@ it('posts a done transition as idle and keeps the raw status on the event', func
 
     $message = (new HerdrAgentStatusChanged($event))->toSlack(new AnonymousNotifiable);
 
-    expect($message->text)->toBe('Herdr: orb15-impl (ORB-15, w7:p1) is now idle')
-        ->and($message->toArray())->toBe(['text' => 'Herdr: orb15-impl (ORB-15, w7:p1) is now idle'])
+    expect($message->text)->toBe('Herdr: orb15-impl just went idle')
+        ->and($message->toArray())->toBe(['text' => 'Herdr: orb15-impl just went idle'])
         ->and($event->to_status)->toBe('done');
 });
 
@@ -37,10 +37,10 @@ it('posts a status without a label verbatim', function () {
     ]);
 
     expect((new HerdrAgentStatusChanged($event))->toSlack(new AnonymousNotifiable)->text)
-        ->toBe('Herdr: orb15-impl (ORB-15, w7:p1) is now idle');
+        ->toBe('Herdr: orb15-impl just went idle');
 });
 
-it('falls back to the pane id and workspace id', function () {
+it('falls back to the pane id', function () {
     $event = new HerdrEvent([
         'occurred_at' => now(),
         'workspace_id' => 'w7',
@@ -53,7 +53,7 @@ it('falls back to the pane id and workspace id', function () {
     ]);
 
     expect((new HerdrAgentStatusChanged($event))->toSlack(new AnonymousNotifiable)->text)
-        ->toBe('Herdr: w7:p1 (w7, w7:p1) is now blocked');
+        ->toBe('Herdr: w7:p1 just went blocked');
 });
 
 it('is delivered through the Slack channel', function () {

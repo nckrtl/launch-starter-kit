@@ -6,10 +6,10 @@ use App\Herdr\SocketClient;
 use App\Herdr\StatusTracker;
 use App\Herdr\TransitionRecorder;
 use App\Models\HerdrEvent;
-use App\Notifications\HerdrAgentStatusChanged;
 use Illuminate\Foundation\Testing\RefreshDatabase;
-use Illuminate\Notifications\AnonymousNotifiable;
+use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Notification;
 use Tests\Support\FakeHerdrServer;
 
@@ -45,10 +45,15 @@ beforeEach(function () {
     config([
         'herdr.socket' => $this->server->socketPath,
         'herdr.slack_channel' => 'C0TESTCHAN',
+        'herdr.webhook_url' => 'https://agents.example.test/webhooks/orbit-herdr',
+        'herdr.webhook_secret' => 'test-secret',
         'herdr.notify_statuses' => ['idle', 'done', 'blocked'],
         'herdr.debounce_seconds' => 0,
     ]);
 
+    Http::fake([
+        'agents.example.test/webhooks/orbit-herdr' => Http::response(['status' => 'accepted'], 202),
+    ]);
     Notification::fake();
 });
 
@@ -56,7 +61,7 @@ afterEach(function () {
     $this->server->stop();
 });
 
-it('records and notifies exactly the transition into idle', function () {
+it('records and sends exactly the transition into idle', function () {
     $log = [];
     $socket = $this->server->socketPath;
 
@@ -84,12 +89,12 @@ it('records and notifies exactly the transition into idle', function () {
         ->and($event->to_status)->toBe('idle')
         ->and($event->notified_at)->not->toBeNull();
 
-    Notification::assertSentOnDemandTimes(HerdrAgentStatusChanged::class, 1);
-    Notification::assertSentOnDemand(
-        HerdrAgentStatusChanged::class,
-        fn (HerdrAgentStatusChanged $notification, array $channels, AnonymousNotifiable $notifiable): bool => $notifiable->routes['slack'] === 'C0TESTCHAN'
-            && $notification->event->is($event),
-    );
+    Http::assertSent(fn (Request $request): bool => $request->url() === 'https://agents.example.test/webhooks/orbit-herdr'
+        && $request['event_id'] === $event->id
+        && $request['workspace_label'] === 'ORB-15'
+        && $request['pane_id'] === 'w1:p1'
+        && $request['to_status'] === 'idle');
+    Notification::assertNothingSent();
 
     $requests = $this->server->requests();
 
@@ -198,6 +203,17 @@ it('forgets a pane that exited and keeps the subscription', function () {
     Notification::assertNothingSent();
 });
 
+it('requires the direct Tom webhook outside dry run', function () {
+    config(['herdr.webhook_url' => null]);
+    $this->withoutMockingConsoleOutput();
+
+    expect(Artisan::call('herdr:listen', ['--timeout' => 0]))->toBe(1)
+        ->and(Artisan::output())->toContain('HERDR_TOM_WEBHOOK');
+
+    Http::assertNothingSent();
+    Notification::assertNothingSent();
+});
+
 it('logs instead of recording or notifying in a dry run', function () {
     $this->withoutMockingConsoleOutput();
 
@@ -207,9 +223,9 @@ it('logs instead of recording or notifying in a dry run', function () {
     expect($exitCode)->toBe(0)
         ->and($output)->toContain('subscribed to 2 panes')
         ->toContain('orb15-impl (ORB-15, w1:p1): working -> idle')
-        ->toContain('dry run: would post orb15-impl (ORB-15, w1:p1) is now idle')
+        ->toContain('dry run: would send Herdr: orb15-impl just went idle')
         ->toContain('orb15-review (ORB-15, w1:p2): idle -> working')
-        ->not->toContain('is now working')
+        ->not->toContain('just went working')
         ->and(HerdrEvent::count())->toBe(0);
 
     Notification::assertNothingSent();

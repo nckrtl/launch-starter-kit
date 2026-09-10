@@ -3,23 +3,16 @@
 namespace App\Herdr;
 
 use App\Models\HerdrEvent;
-use App\Notifications\HerdrAgentStatusChanged;
-use Illuminate\Support\Facades\Notification;
-use LogicException;
 
 /**
- * Stores a transition as a HerdrEvent and posts it to Slack.
+ * Stores a transition and sends a compact authenticated wake event to Tom.
  */
 final readonly class TransitionRecorder
 {
+    public function __construct(private TomWebhookClient $webhook) {}
+
     public function record(Transition $transition, Roster $roster): HerdrEvent
     {
-        $channel = config('herdr.slack_channel');
-
-        if (! is_string($channel) || $channel === '') {
-            throw new LogicException('HERDR_SLACK_CHANNEL is not configured.');
-        }
-
         $workspaceId = $roster->workspaceId($transition->paneId) ?? '';
 
         $event = HerdrEvent::create([
@@ -33,7 +26,7 @@ final readonly class TransitionRecorder
             'to_status' => $transition->to,
         ]);
 
-        Notification::route('slack', $channel)->notify(new HerdrAgentStatusChanged($event));
+        $this->webhook->send($event);
 
         $event->notified_at = now();
         $event->save();

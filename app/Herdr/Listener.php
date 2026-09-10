@@ -2,11 +2,12 @@
 
 namespace App\Herdr;
 
+use App\Notifications\HerdrAgentStatusChanged;
 use Closure;
 use Throwable;
 
 /**
- * Follows the Herdr session over its socket and announces agent-status transitions.
+ * Follows the Herdr session over its socket and sends agent-status transitions to Tom.
  */
 final class Listener
 {
@@ -143,17 +144,22 @@ final class Listener
     private function flush(Roster $roster): void
     {
         foreach ($this->tracker->due(microtime(true)) as $transition) {
+            $message = HerdrAgentStatusChanged::text(
+                $roster->agentName($transition->paneId) ?? $transition->paneId,
+                $transition->to,
+            );
+
             if ($this->dryRun) {
-                $this->log(sprintf('dry run: would post %s is now %s', $roster->describe($transition->paneId), $transition->to));
+                $this->log('dry run: would send '.$message);
 
                 continue;
             }
 
             try {
                 $this->recorder->record($transition, $roster);
-                $this->log(sprintf('posted %s is now %s', $roster->describe($transition->paneId), $transition->to));
+                $this->log('sent '.$message);
             } catch (Throwable $exception) {
-                $this->log(sprintf('posting %s failed: %s', $transition->describe(), $exception->getMessage()));
+                $this->log(sprintf('sending %s failed: %s', $transition->describe(), $exception->getMessage()));
             }
         }
     }

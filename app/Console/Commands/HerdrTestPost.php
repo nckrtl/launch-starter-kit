@@ -2,36 +2,41 @@
 
 namespace App\Console\Commands;
 
-use App\Notifications\HerdrBridgeOnline;
+use App\Herdr\TomWebhookClient;
+use App\Models\HerdrEvent;
 use Illuminate\Console\Command;
-use Illuminate\Support\Facades\Notification;
 use Throwable;
 
 final class HerdrTestPost extends Command
 {
     protected $signature = 'herdr:test-post';
 
-    protected $description = 'Post "Commander: Herdr bridge online" to the configured Slack channel';
+    protected $description = 'Send the latest recorded Herdr event directly to Tom';
 
-    public function handle(): int
+    public function handle(TomWebhookClient $webhook): int
     {
-        $channel = config('herdr.slack_channel');
+        $event = HerdrEvent::query()->latest('id')->first();
 
-        if (! is_string($channel) || $channel === '') {
-            $this->error('HERDR_SLACK_CHANNEL is not configured.');
+        if ($event === null) {
+            $this->error('No recorded Herdr event is available to send.');
 
             return self::FAILURE;
         }
 
         try {
-            Notification::route('slack', $channel)->notify(new HerdrBridgeOnline);
+            $webhook->send($event);
+
+            if ($event->notified_at === null) {
+                $event->notified_at = now();
+                $event->save();
+            }
         } catch (Throwable $exception) {
             $this->error(sprintf('ok: false (%s)', $exception->getMessage()));
 
             return self::FAILURE;
         }
 
-        $this->info("ok: true (channel {$channel})");
+        $this->info("ok: true (event {$event->id})");
 
         return self::SUCCESS;
     }

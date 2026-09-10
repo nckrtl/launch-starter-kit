@@ -15,15 +15,17 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Slack channel
+    | Tom webhook
     |--------------------------------------------------------------------------
     |
-    | Channel ID that receives agent-status notifications. Falls back to the
-    | default Slack notification channel.
+    | Authenticated Hermes webhook that receives compact Herdr state changes.
+    | The secret signs a replay-protected HMAC V2 request.
     |
     */
 
-    'slack_channel' => env('HERDR_SLACK_CHANNEL', env('SLACK_BOT_USER_DEFAULT_CHANNEL')),
+    'webhook_url' => env('HERDR_TOM_WEBHOOK_URL'),
+
+    'webhook_secret' => env('HERDR_TOM_WEBHOOK_SECRET'),
 
     /*
     |--------------------------------------------------------------------------
@@ -37,7 +39,7 @@ return [
     */
 
     'notify_statuses' => array_values(array_filter(
-        array_map('trim', explode(',', (string) env('HERDR_NOTIFY_STATUSES', 'idle,done,blocked'))),
+        array_map('trim', explode(',', (string) env('HERDR_NOTIFY_STATUSES', 'idle,done'))),
         fn (string $status): bool => $status !== '',
     )),
 
