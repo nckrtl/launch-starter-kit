@@ -2,6 +2,7 @@
 
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\StartShadowDelivery;
+use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Mcp\Servers\CommanderServer;
@@ -35,7 +36,7 @@ beforeEach(function () {
         'linear-234',
         'ORB-234',
         '/fast/worktrees/orbit/orb-234',
-        str_repeat('a', 40),
+        new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );
 });
 
@@ -70,19 +71,21 @@ it('returns the authoritative delivery without private payloads or config', func
                 'completed_at' => null,
                 'failed_at' => null,
             ],
-            'current_phase_run' => null,
+            'current_phase_run' => [
+                'id' => 1,
+                'phase' => 'herdr_test',
+                'attempt' => 1,
+                'status' => 'pending',
+                'dispatch_status' => null,
+                'agent_name' => null,
+            ],
             'wait' => null,
         ]);
 });
 
 it('returns the current phase and Herdr wait reason', function () {
-    $phase = PhaseRun::query()->create([
-        'delivery_id' => $this->delivery->id,
-        'phase_name' => 'herdr_test',
-        'attempt' => 1,
-        'status' => PhaseRunStatus::Waiting,
-        'started_at' => now(),
-    ]);
+    $phase = PhaseRun::sole();
+    $phase->forceFill(['status' => PhaseRunStatus::Waiting, 'started_at' => now()])->save();
     $dispatch = AgentDispatch::query()->create([
         'phase_run_id' => $phase->id,
         'agent_role' => 'tester',
@@ -115,13 +118,8 @@ it('returns empty and populated deterministic timelines', function () {
         ->assertOk()
         ->assertStructuredContent(['delivery_id' => $this->delivery->id, 'timeline' => []]);
 
-    $phase = PhaseRun::query()->create([
-        'delivery_id' => $this->delivery->id,
-        'phase_name' => 'herdr_test',
-        'attempt' => 1,
-        'status' => PhaseRunStatus::Running,
-        'started_at' => now(),
-    ]);
+    $phase = PhaseRun::sole();
+    $phase->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
 
     CommanderServer::tool(GetDeliveryTimeline::class, ['delivery_id' => $this->delivery->id])
         ->assertOk()

@@ -67,6 +67,12 @@ final readonly class AdvanceDeliveryAction
                 ['status' => PhaseRunStatus::Running, 'started_at' => now()],
             );
 
+            if ($phaseRun->status === PhaseRunStatus::Pending) {
+                $phaseRun->status = PhaseRunStatus::Running;
+                $phaseRun->started_at = now();
+                $phaseRun->save();
+            }
+
             AgentDispatch::query()->firstOrCreate(
                 ['phase_run_id' => $phaseRun->id, 'agent_role' => $phase->agentRole],
                 [

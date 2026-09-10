@@ -4,6 +4,7 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Jobs\AdvanceDelivery;
 use App\Models\Delivery;
+use App\Models\PhaseRun;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\DB;
@@ -18,11 +19,22 @@ beforeEach(function () {
     $this->repository = storage_path('framework/testing/shadow-command-repository-'.bin2hex(random_bytes(4)));
     $this->worktreeRoot = storage_path('framework/testing/shadow-command-worktrees-'.bin2hex(random_bytes(4)));
     $this->worktree = $this->worktreeRoot.'/orb-234';
+    $this->headSha = str_repeat('a', 40);
+    $this->treeSha = str_repeat('b', 40);
+    $this->commonDirectory = $this->repository.'/.git';
+    $this->candidateReceipt = $this->commonDirectory.'/orbit-checks/'.$this->headSha.'/review-test/result.json';
     File::makeDirectory($this->projectsPath, 0755, true);
     File::makeDirectory($this->repository.'/bin', 0755, true);
     File::makeDirectory($this->worktree, 0755, true);
+    File::makeDirectory(dirname($this->candidateReceipt), 0755, true);
     File::put($this->repository.'/bin/worktree-create', "#!/usr/bin/env bash\n");
+    File::put($this->repository.'/bin/review-check', "#!/usr/bin/env python3\n");
+    File::put($this->candidateReceipt, json_encode(
+        shadowCandidateReceipt($this->worktree, $this->headSha, $this->treeSha),
+        JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR,
+    ));
     chmod($this->repository.'/bin/worktree-create', 0755);
+    chmod($this->repository.'/bin/review-check', 0755);
     config()->set('commander.projects_path', $this->projectsPath);
     config()->set('herdr.orchestration.enabled', true);
     app(SharedKnowledgeProjectRepository::class)->create('orbit', ['name' => 'Orbit', 'status' => 'active']);
@@ -31,7 +43,10 @@ beforeEach(function () {
     Queue::fake();
     Process::fake(['*' => Process::sequence()
         ->push($this->worktree."\n")
-        ->push(str_repeat('a', 40)."\n")])
+        ->push($this->headSha."\n")
+        ->push("Candidate gate PASSED at {$this->headSha}; receipt: {$this->candidateReceipt}\n")
+        ->push($this->treeSha."\n")
+        ->push($this->commonDirectory."\n")])
         ->preventStrayProcesses();
 });
 
@@ -63,6 +78,33 @@ function runShadowCommand(string $project, string $issueId, string $issueKey): a
     ];
 }
 
+/** @return array<string, mixed> */
+function shadowCandidateReceipt(string $worktree, string $headSha, string $treeSha): array
+{
+    $checks = [];
+
+    foreach (['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'] as $project) {
+        foreach ([
+            ['composer', 'validate', '--strict'],
+            ['composer', 'check'],
+            ['composer', 'test:affected'],
+        ] as $command) {
+            $checks[] = ['project' => $project, 'command' => $command, 'exit_code' => 0];
+        }
+    }
+
+    return [
+        'schema' => 1,
+        'role' => 'builder',
+        'candidate' => $headSha,
+        'tree' => $treeSha,
+        'worktree' => $worktree,
+        'checks' => $checks,
+        'passed' => true,
+        'unchanged' => true,
+    ];
+}
+
 it('prepares and records an Orbit worktree before queueing advancement', function () {
     $this->artisan('delivery:start-shadow', runShadowCommand('orbit', 'linear-234', 'ORB-234'))
         ->expectsOutput('Shadow delivery 1 queued for ORB-234 in project orbit.')
@@ -73,13 +115,29 @@ it('prepares and records an Orbit worktree before queueing advancement', functio
     expect($delivery->external_issue_id)->toBe('linear-234')
         ->and($delivery->external_issue_key)->toBe('ORB-234')
         ->and($delivery->worktree_path)->toBe(realpath($this->worktree))
-        ->and($delivery->candidate_sha)->toBe(str_repeat('a', 40));
+        ->and($delivery->candidate_sha)->toBe($this->headSha)
+        ->and(PhaseRun::sole()->input)->toBe([
+            'candidate_check' => [
+                'receipt_path' => realpath($this->candidateReceipt),
+                'candidate_sha' => $this->headSha,
+                'tree_sha' => $this->treeSha,
+            ],
+        ]);
 
     Queue::assertPushed(AdvanceDelivery::class, fn (AdvanceDelivery $job): bool => $job->deliveryId === $delivery->id);
     Process::assertRan(fn ($process): bool => $process->command === [realpath($this->repository.'/bin/worktree-create'), 'ORB-234', '--flow=discovery']
         && $process->path === realpath($this->repository)
         && $process->timeout === 300);
     Process::assertRan(fn ($process): bool => $process->command === ['git', 'rev-parse', 'HEAD']
+        && $process->path === realpath($this->worktree)
+        && $process->timeout === 10);
+    Process::assertRan(fn ($process): bool => $process->command === ['composer', 'check']
+        && $process->path === realpath($this->worktree)
+        && $process->timeout === 3600);
+    Process::assertRan(fn ($process): bool => $process->command === ['git', 'rev-parse', 'HEAD^{tree}']
+        && $process->path === realpath($this->worktree)
+        && $process->timeout === 10);
+    Process::assertRan(fn ($process): bool => $process->command === ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir']
         && $process->path === realpath($this->worktree)
         && $process->timeout === 10);
 });
@@ -214,6 +272,76 @@ it('refuses a malformed Git head from the prepared worktree', function () {
     Queue::assertNothingPushed();
 });
 
+it('refuses a failed Orbit candidate check', function () {
+    Process::fake(['*' => Process::sequence()
+        ->push($this->worktree."\n")
+        ->push($this->headSha."\n")
+        ->push(Process::result(errorOutput: 'checks failed', exitCode: 1))])
+        ->preventStrayProcesses();
+
+    $this->artisan('delivery:start-shadow', runShadowCommand('orbit', 'linear-234', 'ORB-234'))
+        ->expectsOutput('Orbit candidate check failed: checks failed')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('normalizes an Orbit candidate check launch failure', function () {
+    $calls = 0;
+    $worktree = $this->worktree;
+    $headSha = $this->headSha;
+
+    Process::fake(function () use (&$calls, $worktree, $headSha) {
+        return match ($calls++) {
+            0 => Process::result(output: $worktree."\n"),
+            1 => Process::result(output: $headSha."\n"),
+            default => throw new RuntimeException('check launch failed'),
+        };
+    })->preventStrayProcesses();
+
+    $this->artisan('delivery:start-shadow', runShadowCommand('orbit', 'linear-234', 'ORB-234'))
+        ->expectsOutput('The Orbit candidate check could not run.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('refuses an invalid Orbit candidate receipt', function () {
+    File::put($this->candidateReceipt, json_encode([
+        ...shadowCandidateReceipt($this->worktree, $this->headSha, $this->treeSha),
+        'unchanged' => false,
+    ], JSON_THROW_ON_ERROR));
+
+    $this->artisan('delivery:start-shadow', runShadowCommand('orbit', 'linear-234', 'ORB-234'))
+        ->expectsOutput('Orbit candidate check returned an invalid receipt.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('refuses a candidate receipt outside the repository check directory', function () {
+    $outside = $this->repository.'/outside/result.json';
+    File::makeDirectory(dirname($outside), 0755, true);
+    File::put($outside, File::get($this->candidateReceipt));
+    Process::fake(['*' => Process::sequence()
+        ->push($this->worktree."\n")
+        ->push($this->headSha."\n")
+        ->push("Candidate gate PASSED at {$this->headSha}; receipt: {$outside}\n")
+        ->push($this->treeSha."\n")
+        ->push($this->commonDirectory."\n")])
+        ->preventStrayProcesses();
+
+    $this->artisan('delivery:start-shadow', runShadowCommand('orbit', 'linear-234', 'ORB-234'))
+        ->expectsOutput('Orbit candidate check returned an invalid receipt path.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
 it('refuses a duplicate active delivery without resolving Git again', function () {
     $arguments = runShadowCommand('orbit', 'linear-234', 'ORB-234');
     $this->artisan('delivery:start-shadow', $arguments)->assertSuccessful();
@@ -225,5 +353,5 @@ it('refuses a duplicate active delivery without resolving Git again', function (
 
     expect(Delivery::count())->toBe(1);
     Queue::assertNothingPushed();
-    Process::assertRanTimes(fn () => true, 2);
+    Process::assertRanTimes(fn () => true, 5);
 });

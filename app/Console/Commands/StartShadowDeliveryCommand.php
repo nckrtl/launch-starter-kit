@@ -96,13 +96,14 @@ final class StartShadowDeliveryCommand extends Command
 
         try {
             $worktree = $repository->prepareWorktree($config, $input['issue_key']);
+            $candidateCheck = $repository->checkCandidate($config, $worktree);
         } catch (OrbitRepositoryFailed $exception) {
             $this->error($exception->getMessage());
 
             return self::FAILURE;
         }
 
-        $delivery = $start->handle($project, $input['issue_id'], $input['issue_key'], $worktree->path, $worktree->headSha);
+        $delivery = $start->handle($project, $input['issue_id'], $input['issue_key'], $worktree->path, $candidateCheck);
 
         AdvanceDelivery::dispatch($delivery->id)->afterCommit();
 

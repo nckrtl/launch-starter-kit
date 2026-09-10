@@ -6,6 +6,7 @@ use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\OpenedHerdrWorktree;
 use App\Delivery\Enums\AgentDispatchStatus;
@@ -108,7 +109,7 @@ beforeEach(function () {
         'linear-workflow-1',
         'ORB-77',
         '/fast/worktrees/orbit/orb-77',
-        str_repeat('a', 40),
+        new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );
     $this->herdr = new WorkflowFakeHerdrRuntime;
     app()->instance(HerdrRuntime::class, $this->herdr);

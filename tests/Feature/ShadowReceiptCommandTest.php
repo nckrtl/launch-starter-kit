@@ -2,6 +2,7 @@
 
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\StartShadowDelivery;
+use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
@@ -35,15 +36,10 @@ beforeEach(function () {
         'linear-receipt-1',
         'ORB-234',
         $this->worktree,
-        str_repeat('a', 40),
+        new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );
-    $this->phaseRun = PhaseRun::query()->create([
-        'delivery_id' => $this->delivery->id,
-        'phase_name' => 'herdr_test',
-        'attempt' => 1,
-        'status' => PhaseRunStatus::Running,
-        'started_at' => now(),
-    ]);
+    $this->phaseRun = PhaseRun::sole();
+    $this->phaseRun->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
     $this->dispatch = AgentDispatch::query()->create([
         'phase_run_id' => $this->phaseRun->id,
         'agent_role' => 'test',

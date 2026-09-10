@@ -2,6 +2,7 @@
 
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\StartShadowDelivery;
+use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -38,7 +39,7 @@ function ledgerDelivery(object $test, string $issueId = 'linear-1'): Delivery
         $issueId,
         'ORB-1',
         '/fast/worktrees/orbit/orb-1',
-        str_repeat('a', 40),
+        new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );
 }
 
@@ -82,10 +83,8 @@ it('enforces one active delivery per project issue while retaining terminal hist
 
 it('casts ledger state and enforces phase, dispatch, receipt, and provider-event uniqueness', function () {
     $delivery = ledgerDelivery($this);
-    $phase = PhaseRun::create([
-        'delivery_id' => $delivery->getKey(), 'phase_name' => 'herdr_test', 'attempt' => 1,
-        'status' => PhaseRunStatus::Running, 'input' => ['safe' => true], 'started_at' => now(),
-    ]);
+    $phase = PhaseRun::sole();
+    $phase->forceFill(['status' => PhaseRunStatus::Running, 'input' => ['safe' => true], 'started_at' => now()])->save();
     $dispatch = AgentDispatch::create([
         'phase_run_id' => $phase->getKey(), 'agent_role' => 'test', 'idempotency_key' => str_repeat('b', 64),
         'prompt_name' => 'test', 'prompt_version' => 1, 'prompt_hash' => str_repeat('c', 64),
@@ -118,10 +117,8 @@ it('casts ledger state and enforces phase, dispatch, receipt, and provider-event
 it('builds a deterministic read-only delivery timeline', function () {
     $delivery = ledgerDelivery($this);
     $at = now()->startOfSecond();
-    $phase = PhaseRun::create([
-        'delivery_id' => $delivery->getKey(), 'phase_name' => 'herdr_test', 'attempt' => 1,
-        'status' => PhaseRunStatus::Completed, 'started_at' => $at, 'finished_at' => $at,
-    ]);
+    $phase = PhaseRun::sole();
+    $phase->forceFill(['status' => PhaseRunStatus::Completed, 'started_at' => $at, 'finished_at' => $at])->save();
     AgentDispatch::create([
         'phase_run_id' => $phase->getKey(), 'agent_role' => 'test', 'idempotency_key' => str_repeat('1', 64),
         'prompt_name' => 'test', 'prompt_version' => 1, 'prompt_hash' => str_repeat('2', 64),
