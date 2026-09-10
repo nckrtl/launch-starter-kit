@@ -36,9 +36,9 @@ final class WorkflowFakeHerdrRuntime implements HerdrRuntime
 
     public bool $failStartOnce = false;
 
-    public function openWorktree(string $path): OpenedHerdrWorktree
+    public function openWorktree(string $repositoryPath, string $worktreePath): OpenedHerdrWorktree
     {
-        $this->calls[] = 'open:'.$path;
+        $this->calls[] = 'open:'.$repositoryPath.':'.$worktreePath;
         $this->sequence++;
 
         return new OpenedHerdrWorktree("workspace-{$this->sequence}", "tab-{$this->sequence}", "pane-{$this->sequence}", "terminal-{$this->sequence}", false);

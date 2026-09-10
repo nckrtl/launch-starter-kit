@@ -160,7 +160,7 @@ final readonly class AdvanceDeliveryAction
         }
 
         try {
-            $opened = $this->herdr->openWorktree((string) $delivery->worktree_path);
+            $opened = $this->herdr->openWorktree($config->repository, (string) $delivery->worktree_path);
         } catch (Throwable $exception) {
             $this->markAmbiguous($dispatch, 'herdr_worktree_open_ambiguous', $exception);
 

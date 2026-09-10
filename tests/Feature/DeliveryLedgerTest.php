@@ -14,8 +14,10 @@ use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Database\QueryException;
+use Illuminate\Database\Schema\Blueprint;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\File;
+use Illuminate\Support\Facades\Schema;
 
 uses(RefreshDatabase::class);
 
@@ -48,6 +50,20 @@ function ledgerOrbitConfig(): array
         'concurrency' => 3, 'defaultFlow' => 'discovery',
     ];
 }
+
+it('removes a legacy config snapshot column through the forward migration', function () {
+    Schema::table('deliveries', function (Blueprint $table) {
+        $table->json('config_snapshot')->nullable();
+    });
+
+    expect(Schema::hasColumn('deliveries', 'config_snapshot'))->toBeTrue();
+
+    $migration = require database_path('migrations/2026_09_10_212944_remove_config_snapshot_from_deliveries_table.php');
+    $migration->up();
+
+    expect(Schema::hasColumn('deliveries', 'config_snapshot'))->toBeFalse()
+        ->and(ledgerDelivery($this)->exists)->toBeTrue();
+});
 
 it('enforces one active delivery per project issue while retaining terminal history', function () {
     $first = ledgerDelivery($this);

@@ -129,13 +129,14 @@ final class SocketClient
         while (($response = $this->nextLine($stream, $buffer, $deadline - microtime(true))) !== null) {
             if (array_key_exists('error', $response)) {
                 $error = Payload::assoc($response['error']);
+                $errorCode = Payload::string($error['code'] ?? null);
 
                 throw new RequestFailed(sprintf(
                     '%s failed: %s (%s)',
                     $method,
                     Payload::string($error['message'] ?? null) ?? 'unknown error',
-                    Payload::string($error['code'] ?? null) ?? 'unknown',
-                ));
+                    $errorCode ?? 'unknown',
+                ), $errorCode);
             }
 
             if (($response['id'] ?? null) === $id) {

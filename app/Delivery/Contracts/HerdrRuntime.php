@@ -9,7 +9,7 @@ use App\Delivery\Data\OpenedHerdrWorktree;
 
 interface HerdrRuntime
 {
-    public function openWorktree(string $path): OpenedHerdrWorktree;
+    public function openWorktree(string $repositoryPath, string $worktreePath): OpenedHerdrWorktree;
 
     public function splitPane(string $paneId, string $workingDirectory): HerdrAgentIdentifiers;
 

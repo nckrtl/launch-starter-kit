@@ -8,15 +8,21 @@ use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\OpenedHerdrWorktree;
 use InvalidArgumentException;
+use Throwable;
 
 final readonly class SocketHerdrRuntime implements HerdrRuntime
 {
+    private const int PROMPT_READY_ATTEMPTS = 41;
+
+    private const int PROMPT_RETRY_DELAY_MILLISECONDS = 250;
+
     public function __construct(private SocketClient $client) {}
 
-    public function openWorktree(string $path): OpenedHerdrWorktree
+    public function openWorktree(string $repositoryPath, string $worktreePath): OpenedHerdrWorktree
     {
         $result = $this->client->request('worktree.open', [
-            'path' => $path,
+            'cwd' => $repositoryPath,
+            'path' => $worktreePath,
             'focus' => false,
             'trust_repository' => false,
         ]);
@@ -63,7 +69,14 @@ final readonly class SocketHerdrRuntime implements HerdrRuntime
 
     public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers
     {
-        $result = $this->client->request('agent.prompt', ['target' => $name, 'text' => $prompt]);
+        $result = retry(
+            self::PROMPT_READY_ATTEMPTS,
+            fn (int $_attempt): array => $this->client->request('agent.prompt', ['target' => $name, 'text' => $prompt]),
+            self::PROMPT_RETRY_DELAY_MILLISECONDS,
+            static fn (Throwable $exception): bool => $exception instanceof RequestFailed
+                && $exception->errorCode === 'agent_not_ready',
+        );
+
         $this->assertType($result, 'agent_prompted');
 
         return $this->identifiers(Payload::assoc($result['agent'] ?? null), $name);

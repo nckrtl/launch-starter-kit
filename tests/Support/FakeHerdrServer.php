@@ -25,7 +25,7 @@ final class FakeHerdrServer
     ) {}
 
     /**
-     * @param  array{agents: list<array<string, mixed>>, workspaces: list<array<string, mixed>>, events: list<array<string, mixed>>, later_agents?: list<array<string, mixed>>, rpc?: array<string, array<string, mixed>>}  $scenario
+     * @param  array{agents: list<array<string, mixed>>, workspaces: list<array<string, mixed>>, events: list<array<string, mixed>>, later_agents?: list<array<string, mixed>>, rpc?: array<string, array<string, mixed>>, rpc_sequences?: array<string, list<array{result?: array<string, mixed>, error?: array{code: string, message: string}}>>}  $scenario
      */
     public static function start(array $scenario): self
     {
@@ -100,6 +100,7 @@ final class FakeHerdrServer
         $peers = [];
         $buffers = [];
         $agentListCalls = 0;
+        $rpcCalls = [];
 
         while (true) {
             $read = [$server, ...array_values($peers)];
@@ -137,7 +138,7 @@ final class FakeHerdrServer
                     $line = substr($buffers[(int) $stream], 0, $newline + 1);
                     $buffers[(int) $stream] = substr($buffers[(int) $stream], $newline + 1);
 
-                    self::answer($stream, $line, $scenario, $directory, $agentListCalls);
+                    self::answer($stream, $line, $scenario, $directory, $agentListCalls, $rpcCalls);
                 }
             }
         }
@@ -146,8 +147,9 @@ final class FakeHerdrServer
     /**
      * @param  resource  $peer
      * @param  array<string, mixed>  $scenario
+     * @param  array<string, int>  $rpcCalls
      */
-    private static function answer($peer, string $line, array $scenario, string $directory, int &$agentListCalls): void
+    private static function answer($peer, string $line, array $scenario, string $directory, int &$agentListCalls, array &$rpcCalls): void
     {
         file_put_contents($directory.'/requests.log', $line, FILE_APPEND);
         $request = json_decode($line, true);
@@ -155,17 +157,25 @@ final class FakeHerdrServer
         $method = $request['method'] ?? '';
 
         $configured = is_array($scenario['rpc'][$method] ?? null) ? $scenario['rpc'][$method] : null;
+        $sequence = is_array($scenario['rpc_sequences'][$method] ?? null) ? $scenario['rpc_sequences'][$method] : null;
 
-        $reply = $configured !== null ? ['id' => $id, 'result' => $configured] : match ($method) {
-            'ping' => ['id' => $id, 'result' => ['type' => 'pong', 'version' => 'fake', 'protocol' => 20]],
-            'agent.list' => ['id' => $id, 'result' => [
-                'type' => 'agent_list',
-                'agents' => $agentListCalls++ === 0 ? $scenario['agents'] : ($scenario['later_agents'] ?? $scenario['agents']),
-            ]],
-            'workspace.list' => ['id' => $id, 'result' => ['type' => 'workspace_list', 'workspaces' => $scenario['workspaces']]],
-            'events.subscribe' => ['id' => $id, 'result' => ['type' => 'subscription_started']],
-            default => ['id' => $id, 'error' => ['code' => 'unknown_method', 'message' => "unknown method {$method}"]],
-        };
+        if ($sequence !== null && $sequence !== []) {
+            $call = $rpcCalls[$method] ?? 0;
+            $rpcCalls[$method] = $call + 1;
+            $sequenced = $sequence[min($call, count($sequence) - 1)];
+            $reply = ['id' => $id, ...$sequenced];
+        } else {
+            $reply = $configured !== null ? ['id' => $id, 'result' => $configured] : match ($method) {
+                'ping' => ['id' => $id, 'result' => ['type' => 'pong', 'version' => 'fake', 'protocol' => 20]],
+                'agent.list' => ['id' => $id, 'result' => [
+                    'type' => 'agent_list',
+                    'agents' => $agentListCalls++ === 0 ? $scenario['agents'] : ($scenario['later_agents'] ?? $scenario['agents']),
+                ]],
+                'workspace.list' => ['id' => $id, 'result' => ['type' => 'workspace_list', 'workspaces' => $scenario['workspaces']]],
+                'events.subscribe' => ['id' => $id, 'result' => ['type' => 'subscription_started']],
+                default => ['id' => $id, 'error' => ['code' => 'unknown_method', 'message' => "unknown method {$method}"]],
+            };
+        }
 
         fwrite($peer, json_encode($reply)."\n");
 
