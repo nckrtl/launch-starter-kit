@@ -13,6 +13,7 @@ beforeEach(function () {
     $this->worktreeRoot = $this->base.'/worktrees';
     $this->worktreePath = $this->worktreeRoot.'/orb-234';
     File::makeDirectory($this->repositoryPath, 0755, true);
+    File::makeDirectory($this->repositoryPath.'/.git', 0755, true);
     File::makeDirectory($this->worktreePath.'/.loop', 0755, true);
     $this->config = new OrbitProjectConfig(
         type: OrbitProjectConfig::TYPE,
@@ -48,6 +49,61 @@ function repositoryIssueSnapshot(): OrbitIssueSnapshot
     );
 }
 
+it('acquires and releases the private legacy controller lock', function () {
+    $repository = app(ProcessOrbitRepository::class);
+    $reservation = $repository->reserveDelivery($this->config, 'ORB-234');
+
+    expect($reservation->path)->toBe($this->repositoryPath.'/.git/orbit-delivery/v1/orb-234/controller.lock')
+        ->and(is_file($reservation->path))->toBeTrue()
+        ->and(fileperms($reservation->path) & 0777)->toBe(0600);
+
+    expect(fn () => $repository->reserveDelivery($this->config, 'ORB-234'))
+        ->toThrow(OrbitRepositoryFailed::class, 'Another Orbit delivery controller currently owns this issue');
+
+    $reservation->release();
+    $next = $repository->reserveDelivery($this->config, 'ORB-234');
+    $next->release();
+
+    expect(File::exists($reservation->path))->toBeTrue();
+});
+
+it('rejects existing legacy controller journals', function (string $journal) {
+    $directory = $this->repositoryPath.'/.git/orbit-delivery/v1/orb-234';
+    $lockPath = $directory.'/controller.lock';
+    File::makeDirectory($directory, 0700, true);
+    File::put($lockPath, 'legacy-lock');
+    chmod($lockPath, 0664);
+    File::put($directory.'/'.$journal, '{}');
+
+    expect(fn () => app(ProcessOrbitRepository::class)->reserveDelivery($this->config, 'ORB-234'))
+        ->toThrow(OrbitRepositoryFailed::class, 'already has a legacy Orbit controller journal')
+        ->and(File::get($lockPath))->toBe('legacy-lock')
+        ->and(fileperms($lockPath) & 0777)->toBe(0664);
+})->with([
+    'state journal' => 'state.json',
+    'orphan worker marker' => 'worker.json',
+]);
+
+it('rejects a symlinked legacy controller directory', function () {
+    $outside = $this->base.'/outside-controller';
+    File::makeDirectory($outside, 0700);
+    symlink($outside, $this->repositoryPath.'/.git/orbit-delivery');
+
+    expect(fn () => app(ProcessOrbitRepository::class)->reserveDelivery($this->config, 'ORB-234'))
+        ->toThrow(OrbitRepositoryFailed::class, 'reservation directory is unsafe');
+});
+
+it('rejects a symlinked legacy controller lock', function () {
+    $directory = $this->repositoryPath.'/.git/orbit-delivery/v1/orb-234';
+    $outside = $this->base.'/outside.lock';
+    File::makeDirectory($directory, 0700, true);
+    File::put($outside, '');
+    symlink($outside, $directory.'/controller.lock');
+
+    expect(fn () => app(ProcessOrbitRepository::class)->reserveDelivery($this->config, 'ORB-234'))
+        ->toThrow(OrbitRepositoryFailed::class, 'reservation lock is unsafe');
+});
+
 it('atomically publishes a private normalized issue snapshot', function () {
     $prepared = app(ProcessOrbitRepository::class)->writeIssueSnapshot(
         $this->config,
@@ -61,12 +117,24 @@ it('atomically publishes a private normalized issue snapshot', function () {
         ->and($prepared->provider)->toBe('linear')
         ->and($prepared->path)->toBe($this->worktreePath.'/.loop/issue.json')
         ->and($prepared->contentsHash)->toBe(hash('sha256', $contents))
-        ->and($prepared->contractSchema)->toBe(1)
+        ->and($prepared->contractSchema)->toBe(2)
         ->and($prepared->contractHash)->toBe(str_repeat('b', 64))
         ->and($prepared->issueId)->toBe($this->snapshot->issueId)
         ->and($prepared->issueKey)->toBe('ORB-234')
         ->and(json_decode($contents, true, flags: JSON_THROW_ON_ERROR))->toBe($this->snapshot->payload)
         ->and(fileperms($prepared->path) & 0777)->toBe(0600);
+});
+
+it('verifies the exact retained bytes before dispatch', function () {
+    $repository = app(ProcessOrbitRepository::class);
+    $prepared = $repository->writeIssueSnapshot($this->config, $this->worktree, $this->snapshot);
+
+    $repository->verifyIssueSnapshot($this->config, $this->worktree, $prepared);
+
+    File::append($prepared->path, "\n");
+
+    expect(fn () => $repository->verifyIssueSnapshot($this->config, $this->worktree, $prepared))
+        ->toThrow(OrbitRepositoryFailed::class, 'no longer matches its ledger record');
 });
 
 it('reuses semantically identical retained bytes without rewriting them', function () {

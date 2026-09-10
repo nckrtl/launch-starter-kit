@@ -5,11 +5,13 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Delivery\Actions\StartShadowDelivery;
+use App\Delivery\Actions\VerifyOrbitIssueSnapshot;
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Enums\ProjectOrchestrationState;
+use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Jobs\AdvanceDelivery;
@@ -37,6 +39,7 @@ final class StartShadowDeliveryCommand extends Command
         ProjectConfigRegistry $configs,
         OrbitIssueProvider $issues,
         OrbitRepository $repository,
+        VerifyOrbitIssueSnapshot $verifyIssue,
         StartShadowDelivery $start,
     ): int {
         if (! config('herdr.orchestration.enabled', false)) {
@@ -89,34 +92,53 @@ final class StartShadowDeliveryCommand extends Command
             return self::FAILURE;
         }
 
-        if (Delivery::query()
-            ->whereBelongsTo($project)
-            ->where('external_issue_provider', 'linear')
-            ->where('external_issue_id', $input['issue_id'])
-            ->active()
-            ->exists()) {
+        if ($this->hasActiveDelivery($project, $input['issue_id'])) {
             $this->error("An active delivery already exists for [{$input['issue_key']}].");
 
             return self::FAILURE;
         }
 
+        $reservation = null;
+
         try {
+            $reservation = $repository->reserveDelivery($config, $input['issue_key']);
+
+            if ($this->hasActiveDelivery($project, $input['issue_id'])) {
+                $this->error("An active delivery already exists for [{$input['issue_key']}].");
+
+                return self::FAILURE;
+            }
+
             $issue = $issues->fetch($input['issue_id'], $input['issue_key']);
             $worktree = $repository->prepareWorktree($config, $input['issue_key']);
             $candidateCheck = $repository->checkCandidate($config, $worktree);
             $issueSnapshot = $repository->writeIssueSnapshot($config, $worktree, $issue);
-        } catch (OrbitIssueProviderFailed|OrbitRepositoryFailed $exception) {
+            $currentIssue = $issues->fetch($input['issue_id'], $input['issue_key']);
+            $verifiedIssue = $verifyIssue->handle($config, $worktree, $issueSnapshot, $currentIssue);
+            $delivery = $start->handle($project, $verifiedIssue, $worktree->path, $candidateCheck);
+        } catch (OrbitIssueContractChanged|OrbitIssueProviderFailed|OrbitRepositoryFailed $exception) {
             $this->error($exception->getMessage());
 
             return self::FAILURE;
+        } finally {
+            $reservation?->release();
         }
-
-        $delivery = $start->handle($project, $issueSnapshot, $worktree->path, $candidateCheck);
 
         AdvanceDelivery::dispatch($delivery->id)->afterCommit();
 
         $this->info("Shadow delivery {$delivery->id} queued for {$input['issue_key']} in project {$input['project']}.");
 
         return self::SUCCESS;
+    }
+
+    /** @phpstan-impure */
+    private function hasActiveDelivery(ProjectOrchestration $project, string $issueId): bool
+    {
+        return Delivery::query()
+            ->whereBelongsTo($project)
+            ->where('external_issue_provider', 'linear')
+            ->where('external_issue_id', $issueId)
+            ->active()
+            ->exists();
     }
 }

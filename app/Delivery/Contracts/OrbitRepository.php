@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Delivery\Contracts;
 
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
@@ -12,6 +13,8 @@ use App\Delivery\Data\PreparedWorktree;
 
 interface OrbitRepository
 {
+    public function reserveDelivery(OrbitProjectConfig $config, string $issueKey): OrbitDeliveryReservation;
+
     public function prepareWorktree(OrbitProjectConfig $config, string $issueKey): PreparedWorktree;
 
     public function checkCandidate(OrbitProjectConfig $config, PreparedWorktree $worktree): CandidateCheck;
@@ -21,4 +24,10 @@ interface OrbitRepository
         PreparedWorktree $worktree,
         OrbitIssueSnapshot $snapshot,
     ): PreparedIssueSnapshot;
+
+    public function verifyIssueSnapshot(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        PreparedIssueSnapshot $snapshot,
+    ): void;
 }

@@ -243,19 +243,39 @@ final readonly class OrbitIssueSnapshotFactory
         );
         sort($attachments);
 
+        $contents = $this->pythonJson([
+            'attachments' => $attachments,
+            'description' => $issue['description'],
+            'id' => $issue['id'],
+            'labels' => $labels,
+            'title' => $issue['title'],
+        ]);
+
+        return hash('sha256', $contents);
+    }
+
+    private function pythonJson(mixed $value): string
+    {
+        if (is_array($value)) {
+            if (array_is_list($value)) {
+                return '['.implode(', ', array_map($this->pythonJson(...), $value)).']';
+            }
+
+            ksort($value);
+            $items = [];
+
+            foreach ($value as $key => $item) {
+                $items[] = $this->pythonJson((string) $key).': '.$this->pythonJson($item);
+            }
+
+            return '{'.implode(', ', $items).'}';
+        }
+
         try {
-            $contents = json_encode([
-                'attachments' => $attachments,
-                'description' => $issue['description'],
-                'id' => $issue['id'],
-                'labels' => $labels,
-                'title' => $issue['title'],
-            ], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+            return json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         } catch (JsonException $exception) {
             throw new OrbitIssueProviderFailed('The Linear issue response could not be hashed.', 0, $exception);
         }
-
-        return hash('sha256', $contents);
     }
 
     /**

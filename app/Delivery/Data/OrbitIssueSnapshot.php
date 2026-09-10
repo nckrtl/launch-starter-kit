@@ -10,7 +10,7 @@ final readonly class OrbitIssueSnapshot
 
     public const string PROVIDER = 'linear';
 
-    public const int CONTRACT_SCHEMA = 1;
+    public const int CONTRACT_SCHEMA = 2;
 
     /** @param array<string, mixed> $payload */
     public function __construct(

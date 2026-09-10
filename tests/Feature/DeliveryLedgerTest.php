@@ -36,7 +36,7 @@ function ledgerDelivery(object $test, string $issueId = '11111111-2222-4333-8444
 {
     return app(StartShadowDelivery::class)->handle(
         $test->orchestration,
-        preparedOrbitIssueSnapshot($issueId, 'ORB-1', '/fast/worktrees/orbit/orb-1/.loop/issue.json'),
+        verifiedOrbitIssueSnapshot($issueId, 'ORB-1', '/fast/worktrees/orbit/orb-1/.loop/issue.json'),
         '/fast/worktrees/orbit/orb-1',
         new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );
@@ -83,7 +83,7 @@ it('enforces one active delivery per project issue while retaining terminal hist
 it('rejects prepared issue metadata that is not bound to the delivery worktree', function () {
     expect(fn () => app(StartShadowDelivery::class)->handle(
         $this->orchestration,
-        preparedOrbitIssueSnapshot(
+        verifiedOrbitIssueSnapshot(
             '11111111-2222-4333-8444-555555555555',
             'ORB-1',
             '/fast/worktrees/orbit/different/.loop/issue.json',

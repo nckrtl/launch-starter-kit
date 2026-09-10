@@ -513,9 +513,27 @@ readiness before it creates a worktree.
 
 The shadow slice records `provider=linear`, the Linear UUID, and the issue key,
 but does not take over Linear mutation or routine `bin/loop` dispatch. Tests and
-an internal application service start the harmless delivery. A later cutover
-will route the existing driver entry point through the same start service after
-authorization and eligibility adapters exist.
+an internal application service start the harmless delivery. After the slow
+worktree and candidate checks, Commander fetches the issue again, verifies that
+the retained snapshot bytes are unchanged, and compares the current issue to
+the recorded contract before it creates the delivery. Contract schema 2 uses
+the installed Python controller's JSON serialization and contract fields so the
+two implementations produce the same hash.
+
+Commander also acquires the installed controller's non-blocking per-issue lock
+at `<git-common-dir>/orbit-delivery/v1/<lowercase-issue-key>/controller.lock`
+before the first Linear fetch. It holds the lock through worktree preparation,
+the second fetch, verification, and delivery creation. Any existing `state.json`
+or `worker.json` stops the start, including completed or orphaned legacy state.
+Commander does not delete or modify those legacy files. Once Commander releases
+the lock, the registered issue worktree remains the durable signal that makes a
+later legacy start stop at its existing-worktree check.
+
+This verification timestamp is audit evidence, not reusable authorization for
+a later planning dispatch. Live planning must repeat the provider and candidate
+checks at its own dispatch boundary. A later cutover will route the existing
+driver entry point through the same start service after those authorization and
+eligibility adapters exist.
 
 ### Project registry boundary
 

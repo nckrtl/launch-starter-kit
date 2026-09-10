@@ -6,6 +6,7 @@ namespace App\Delivery\Repositories;
 
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
@@ -25,6 +26,171 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         ['composer', 'check'],
         ['composer', 'test:affected'],
     ];
+
+    public function reserveDelivery(OrbitProjectConfig $config, string $issueKey): OrbitDeliveryReservation
+    {
+        $repository = realpath($config->repository);
+
+        if ($repository === false || ! is_dir($repository)
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1) {
+            throw new OrbitRepositoryFailed('The Orbit delivery reservation is invalid.');
+        }
+
+        $common = realpath($repository.'/.git');
+
+        if ($common === false || ! is_dir($common) || is_link($repository.'/.git')) {
+            throw new OrbitRepositoryFailed('The Orbit Git common directory is unavailable.');
+        }
+
+        $root = $common.'/orbit-delivery';
+        $base = $root.'/v1';
+        $directory = $base.'/'.Str::lower($issueKey);
+
+        $this->ensureReservationDirectory($root);
+        $this->ensureReservationDirectory($base);
+        $this->ensureReservationDirectory($directory);
+
+        $lockPath = $directory.'/controller.lock';
+
+        if (is_link($lockPath) || (file_exists($lockPath) && ! is_file($lockPath))) {
+            throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
+        }
+
+        [$handle, $lockCreated] = $this->openReservationLock($directory, $lockPath);
+
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            throw new OrbitRepositoryFailed('Another Orbit delivery controller currently owns this issue.');
+        }
+
+        if (! $this->isOpenedReservationLock($handle, $lockPath)) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+
+            throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
+        }
+
+        foreach (['state.json', 'worker.json'] as $journal) {
+            $path = $directory.'/'.$journal;
+
+            if (file_exists($path) || is_link($path)) {
+                flock($handle, LOCK_UN);
+                fclose($handle);
+
+                throw new OrbitRepositoryFailed('This issue already has a legacy Orbit controller journal.');
+            }
+        }
+
+        if (! $this->isOpenedReservationLock($handle, $lockPath)
+            || ($lockCreated && ! $this->isPrivateOpenedReservationLock($handle))) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+
+            throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
+        }
+
+        return new OrbitDeliveryReservation($handle, $lockPath);
+    }
+
+    private function ensureReservationDirectory(string $path): void
+    {
+        if (! file_exists($path) && ! is_link($path)) {
+            @mkdir($path, 0700);
+        }
+
+        if (is_link($path) || ! is_dir($path) || realpath($path) !== $path) {
+            throw new OrbitRepositoryFailed('The Orbit delivery reservation directory is unsafe.');
+        }
+    }
+
+    /** @return array{resource, bool} */
+    private function openReservationLock(string $directory, string $lockPath): array
+    {
+        if (file_exists($lockPath)) {
+            $handle = @fopen($lockPath, 'c+');
+
+            if ($handle === false) {
+                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock could not be opened.');
+            }
+
+            return [$handle, false];
+        }
+
+        $temporary = tempnam($directory, '.controller-lock-');
+
+        if ($temporary === false) {
+            throw new OrbitRepositoryFailed('The Orbit delivery reservation lock could not be opened.');
+        }
+
+        try {
+            $handle = @fopen($temporary, 'r+');
+
+            if ($handle === false
+                || ! $this->isOpenedReservationLock($handle, $temporary)
+                || ! $this->isPrivateOpenedReservationLock($handle)) {
+                if (is_resource($handle)) {
+                    fclose($handle);
+                }
+
+                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
+            }
+
+            if (@link($temporary, $lockPath)) {
+                return [$handle, true];
+            }
+
+            fclose($handle);
+
+            if (is_link($lockPath) || ! is_file($lockPath)) {
+                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
+            }
+
+            $handle = @fopen($lockPath, 'c+');
+
+            if ($handle === false) {
+                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock could not be opened.');
+            }
+
+            return [$handle, false];
+        } finally {
+            if (file_exists($temporary)) {
+                unlink($temporary);
+            }
+        }
+    }
+
+    /**
+     * @param  resource  $handle
+     *
+     * @phpstan-impure
+     */
+    private function isPrivateOpenedReservationLock(mixed $handle): bool
+    {
+        $opened = fstat($handle);
+
+        return $opened !== false && ($opened['mode'] & 0777) === 0600;
+    }
+
+    /**
+     * @param  resource  $handle
+     *
+     * @phpstan-impure
+     */
+    private function isOpenedReservationLock(mixed $handle, string $path): bool
+    {
+        clearstatcache(true, $path);
+        $opened = fstat($handle);
+        $pathStat = @lstat($path);
+
+        return $opened !== false
+            && $pathStat !== false
+            && ! is_link($path)
+            && ($opened['mode'] & 0170000) === 0100000
+            && ($pathStat['mode'] & 0170000) === 0100000
+            && $opened['dev'] === $pathStat['dev']
+            && $opened['ino'] === $pathStat['ino'];
+    }
 
     public function prepareWorktree(OrbitProjectConfig $config, string $issueKey): PreparedWorktree
     {
@@ -152,25 +318,14 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         PreparedWorktree $worktree,
         OrbitIssueSnapshot $snapshot,
     ): PreparedIssueSnapshot {
-        $root = realpath($config->worktreeRoot);
-        $path = realpath($worktree->path);
-
         if (($snapshot->payload['id'] ?? null) !== $snapshot->issueId
             || ($snapshot->payload['identifier'] ?? null) !== $snapshot->issueKey
             || preg_match('/^[a-f0-9]{64}$/', $snapshot->contractHash) !== 1) {
             throw new OrbitRepositoryFailed('The Orbit issue snapshot identity is invalid.');
         }
 
-        if ($root === false || $path === false || $path !== $worktree->path
-            || ! str_starts_with($path, $root.'/')) {
-            throw new OrbitRepositoryFailed('The Orbit issue snapshot worktree is invalid.');
-        }
-
-        $loop = $path.'/.loop';
-
-        if (is_link($loop) || ! is_dir($loop) || realpath($loop) !== $loop) {
-            throw new OrbitRepositoryFailed('The Orbit issue snapshot requires a regular .loop directory.');
-        }
+        $target = $this->issueSnapshotTarget($config, $worktree);
+        $loop = dirname($target);
 
         try {
             $contents = json_encode(
@@ -181,7 +336,6 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             throw new OrbitRepositoryFailed('The Orbit issue snapshot could not be encoded.', 0, $exception);
         }
 
-        $target = $loop.'/issue.json';
         $retained = $this->retainedIssueSnapshot($target, $snapshot->payload);
 
         if ($retained === null) {
@@ -203,6 +357,38 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             issueId: $snapshot->issueId,
             issueKey: $snapshot->issueKey,
         );
+    }
+
+    public function verifyIssueSnapshot(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        PreparedIssueSnapshot $snapshot,
+    ): void {
+        $target = $this->issueSnapshotTarget($config, $worktree);
+
+        if ($snapshot->schema !== OrbitIssueSnapshot::SCHEMA
+            || $snapshot->provider !== OrbitIssueSnapshot::PROVIDER
+            || $snapshot->contractSchema !== OrbitIssueSnapshot::CONTRACT_SCHEMA
+            || $snapshot->path !== $target
+            || preg_match('/^[a-f0-9]{64}$/', $snapshot->contentsHash) !== 1
+            || preg_match('/^[a-f0-9]{64}$/', $snapshot->contractHash) !== 1) {
+            throw new OrbitRepositoryFailed('The prepared Orbit issue snapshot metadata is invalid.');
+        }
+
+        $contents = $this->privateIssueSnapshotContents($target);
+
+        try {
+            $payload = json_decode($contents, true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The retained Orbit issue snapshot is invalid.', 0, $exception);
+        }
+
+        if (! hash_equals($snapshot->contentsHash, hash('sha256', $contents))
+            || ! is_array($payload) || array_is_list($payload)
+            || ($payload['id'] ?? null) !== $snapshot->issueId
+            || ($payload['identifier'] ?? null) !== $snapshot->issueKey) {
+            throw new OrbitRepositoryFailed('The retained Orbit issue snapshot no longer matches its ledger record.');
+        }
     }
 
     /** @param array<mixed, mixed> $receipt */
@@ -282,6 +468,46 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         if ($contents === false || ! is_array($existing) || array_is_list($existing)
             || $this->canonicalize($existing) !== $this->canonicalize($payload)) {
             throw new OrbitRepositoryFailed('The existing Orbit issue snapshot conflicts with the fetched issue.');
+        }
+
+        return $contents;
+    }
+
+    private function issueSnapshotTarget(OrbitProjectConfig $config, PreparedWorktree $worktree): string
+    {
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree->path);
+
+        if ($root === false || $path === false || $path !== $worktree->path
+            || ! str_starts_with($path, $root.'/')) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot worktree is invalid.');
+        }
+
+        $loop = $path.'/.loop';
+
+        if (is_link($loop) || ! is_dir($loop) || realpath($loop) !== $loop) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot requires a regular .loop directory.');
+        }
+
+        return $loop.'/issue.json';
+    }
+
+    private function privateIssueSnapshotContents(string $target): string
+    {
+        if (is_link($target) || ! file_exists($target)) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot path is unsafe.');
+        }
+
+        $permissions = fileperms($target);
+
+        if (! is_file($target) || $permissions === false || ($permissions & 0777) !== 0600) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot path is unsafe.');
+        }
+
+        $contents = file_get_contents($target);
+
+        if ($contents === false) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot could not be read.');
         }
 
         return $contents;

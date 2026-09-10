@@ -2,7 +2,10 @@
 
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
+use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Jobs\AdvanceDelivery;
@@ -10,10 +13,13 @@ use App\Models\Delivery;
 use App\Models\PhaseRun;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Facades\Queue;
+
+use function Pest\Laravel\mock;
 
 uses(RefreshDatabase::class);
 
@@ -23,6 +29,8 @@ final class ShadowCommandIssueProvider implements OrbitIssueProvider
     public array $requests = [];
 
     public ?OrbitIssueProviderFailed $failure = null;
+
+    public ?OrbitIssueSnapshot $freshSnapshot = null;
 
     public function __construct(private readonly OrbitIssueSnapshot $snapshot) {}
 
@@ -34,11 +42,14 @@ final class ShadowCommandIssueProvider implements OrbitIssueProvider
             throw $this->failure;
         }
 
-        return $this->snapshot;
+        return count($this->requests) > 1 && $this->freshSnapshot !== null
+            ? $this->freshSnapshot
+            : $this->snapshot;
     }
 }
 
 beforeEach(function () {
+    Carbon::setTestNow('2026-09-11 10:00:00 UTC');
     $this->projectsPath = storage_path('framework/testing/shadow-command-projects-'.bin2hex(random_bytes(4)));
     $this->repository = storage_path('framework/testing/shadow-command-repository-'.bin2hex(random_bytes(4)));
     $this->worktreeRoot = storage_path('framework/testing/shadow-command-worktrees-'.bin2hex(random_bytes(4)));
@@ -82,6 +93,7 @@ beforeEach(function () {
 });
 
 afterEach(function () {
+    Carbon::setTestNow();
     File::deleteDirectory($this->projectsPath);
     File::deleteDirectory($this->repository);
     File::deleteDirectory($this->worktreeRoot);
@@ -162,8 +174,9 @@ it('prepares and records an Orbit worktree before queueing advancement', functio
                 'issue_key' => 'ORB-234',
                 'path' => $issueSnapshot,
                 'contents_sha256' => hash_file('sha256', $issueSnapshot),
-                'contract_schema' => 1,
+                'contract_schema' => 2,
                 'contract_sha256' => str_repeat('e', 64),
+                'verified_at' => '2026-09-11T10:00:00.000000Z',
             ],
             'candidate_check' => [
                 'receipt_path' => realpath($this->candidateReceipt),
@@ -172,6 +185,7 @@ it('prepares and records an Orbit worktree before queueing advancement', functio
             ],
         ])
         ->and($this->issueProvider->requests)->toBe([
+            ['issue_id' => shadowIssueId(), 'issue_key' => 'ORB-234'],
             ['issue_id' => shadowIssueId(), 'issue_key' => 'ORB-234'],
         ]);
 
@@ -252,6 +266,84 @@ it('stops before worktree preparation when the issue snapshot cannot be trusted'
     expect(Delivery::count())->toBe(0);
     Queue::assertNothingPushed();
     Process::assertNothingRan();
+
+    $handle = fopen($this->commonDirectory.'/orbit-delivery/v1/orb-234/controller.lock', 'c+');
+
+    if ($handle === false) {
+        throw new RuntimeException('Could not inspect the released legacy controller lock.');
+    }
+
+    $acquired = flock($handle, LOCK_EX | LOCK_NB);
+
+    if ($acquired) {
+        flock($handle, LOCK_UN);
+    }
+
+    fclose($handle);
+
+    expect($acquired)->toBeTrue();
+});
+
+it('stops before fetching when the legacy controller owns the issue lock', function () {
+    $directory = $this->commonDirectory.'/orbit-delivery/v1/orb-234';
+    $lockPath = $directory.'/controller.lock';
+    File::makeDirectory($directory, 0700, true);
+    $handle = fopen($lockPath, 'c+');
+
+    if ($handle === false || ! flock($handle, LOCK_EX | LOCK_NB)) {
+        throw new RuntimeException('Could not arrange the legacy controller lock.');
+    }
+
+    try {
+        $this->artisan('delivery:start-shadow', runShadowCommand('orbit', shadowIssueId(), 'ORB-234'))
+            ->expectsOutput('Another Orbit delivery controller currently owns this issue.')
+            ->assertFailed();
+    } finally {
+        flock($handle, LOCK_UN);
+        fclose($handle);
+    }
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->requests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+});
+
+it('stops before fetching when a legacy controller journal exists', function (string $journal) {
+    $directory = $this->commonDirectory.'/orbit-delivery/v1/orb-234';
+    File::makeDirectory($directory, 0700, true);
+    File::put($directory.'/'.$journal, '{}');
+
+    $this->artisan('delivery:start-shadow', runShadowCommand('orbit', shadowIssueId(), 'ORB-234'))
+        ->expectsOutput('This issue already has a legacy Orbit controller journal.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->requests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+})->with([
+    'state journal' => 'state.json',
+    'orphan worker marker' => 'worker.json',
+]);
+
+it('does not queue a delivery when the issue contract changes during preparation', function () {
+    $this->issueProvider->freshSnapshot = new OrbitIssueSnapshot(
+        issueId: shadowIssueId(),
+        issueKey: 'ORB-234',
+        payload: ['id' => shadowIssueId(), 'identifier' => 'ORB-234', 'title' => 'Changed issue'],
+        contractHash: str_repeat('f', 64),
+    );
+
+    $this->artisan('delivery:start-shadow', runShadowCommand('orbit', shadowIssueId(), 'ORB-234'))
+        ->expectsOutput('The Orbit issue contract changed before dispatch.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and(File::exists($this->worktree.'/.loop/issue.json'))->toBeTrue()
+        ->and($this->issueProvider->requests)->toHaveCount(2);
+    Queue::assertNothingPushed();
+    Process::assertRanTimes(fn () => true, 5);
 });
 
 it('refuses invalid live project config', function () {
@@ -428,4 +520,39 @@ it('refuses a duplicate active delivery without resolving Git again', function (
     expect(Delivery::count())->toBe(1);
     Queue::assertNothingPushed();
     Process::assertRanTimes(fn () => true, 5);
+});
+
+it('rechecks active delivery ownership after acquiring the controller lock', function () {
+    $repository = mock(OrbitRepository::class);
+    $repository->shouldReceive('reserveDelivery')
+        ->once()
+        ->andReturnUsing(function (): OrbitDeliveryReservation {
+            Delivery::query()->create([
+                'project_orchestration_id' => $this->project->id,
+                'external_issue_provider' => 'linear',
+                'external_issue_id' => shadowIssueId(),
+                'external_issue_key' => 'ORB-234',
+                'workflow_type' => 'shadow',
+                'workflow_version' => 1,
+                'status' => DeliveryStatus::Queued,
+                'current_phase' => 'shadow-test',
+            ]);
+
+            $handle = tmpfile();
+
+            if ($handle === false) {
+                throw new RuntimeException('Could not arrange the competing delivery.');
+            }
+
+            return new OrbitDeliveryReservation($handle, 'temporary-controller.lock');
+        });
+
+    $this->artisan('delivery:start-shadow', runShadowCommand('orbit', shadowIssueId(), 'ORB-234'))
+        ->expectsOutput('An active delivery already exists for [ORB-234].')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(1)
+        ->and($this->issueProvider->requests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
 });

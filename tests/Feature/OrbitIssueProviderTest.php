@@ -100,7 +100,7 @@ it('fetches one normalized issue through the fixed read-only Hermes RPC boundary
             ['title' => 'Alpha', 'url' => 'https://example.test/alpha'],
             ['title' => 'Zeta', 'url' => 'https://example.test/zeta'],
         ])
-        ->and($snapshot->contractHash)->toBe('8a3d6c93e0f559d94cb7eda0942c1f08836caf1118b80eb41f5fbbdb9bb92fe9');
+        ->and($snapshot->contractHash)->toBe('602a5f869b36c0bd223360d68fa4c7e15be4688acefc178ab200f123ea45ff06');
 
     Process::assertRan(function ($process): bool {
         $input = is_string($process->input)

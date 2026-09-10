@@ -6,7 +6,7 @@ namespace App\Delivery\Actions;
 
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitIssueSnapshot;
-use App\Delivery\Data\PreparedIssueSnapshot;
+use App\Delivery\Data\VerifiedIssueSnapshot;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Workflow\ShadowWorkflow;
@@ -20,10 +20,12 @@ final readonly class StartShadowDelivery
 {
     public function handle(
         ProjectOrchestration $project,
-        PreparedIssueSnapshot $issueSnapshot,
+        VerifiedIssueSnapshot $verifiedIssue,
         string $worktreePath,
         CandidateCheck $candidateCheck,
     ): Delivery {
+        $issueSnapshot = $verifiedIssue->snapshot;
+
         if ($issueSnapshot->schema !== OrbitIssueSnapshot::SCHEMA
             || $issueSnapshot->provider !== OrbitIssueSnapshot::PROVIDER
             || $issueSnapshot->contractSchema !== OrbitIssueSnapshot::CONTRACT_SCHEMA
@@ -37,7 +39,7 @@ final readonly class StartShadowDelivery
             throw new InvalidArgumentException('The prepared shadow delivery inputs are inconsistent.');
         }
 
-        return DB::transaction(function () use ($project, $issueSnapshot, $worktreePath, $candidateCheck): Delivery {
+        return DB::transaction(function () use ($project, $verifiedIssue, $issueSnapshot, $worktreePath, $candidateCheck): Delivery {
             $delivery = Delivery::query()->create([
                 'project_orchestration_id' => $project->getKey(),
                 'external_issue_provider' => $issueSnapshot->provider,
@@ -66,6 +68,7 @@ final readonly class StartShadowDelivery
                         'contents_sha256' => $issueSnapshot->contentsHash,
                         'contract_schema' => $issueSnapshot->contractSchema,
                         'contract_sha256' => $issueSnapshot->contractHash,
+                        'verified_at' => $verifiedIssue->verifiedAt->toISOString(),
                     ],
                     'candidate_check' => [
                         'receipt_path' => $candidateCheck->receiptPath,

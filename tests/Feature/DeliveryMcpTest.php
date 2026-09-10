@@ -33,7 +33,7 @@ beforeEach(function () {
     ]);
     $this->delivery = app(StartShadowDelivery::class)->handle(
         $project,
-        preparedOrbitIssueSnapshot('33333333-4444-4555-8666-777777777777', 'ORB-234', '/fast/worktrees/orbit/orb-234/.loop/issue.json'),
+        verifiedOrbitIssueSnapshot('33333333-4444-4555-8666-777777777777', 'ORB-234', '/fast/worktrees/orbit/orb-234/.loop/issue.json'),
         '/fast/worktrees/orbit/orb-234',
         new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );
