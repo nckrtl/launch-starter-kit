@@ -11,9 +11,12 @@ use InvalidArgumentException;
 
 final readonly class ProjectConfigRegistry
 {
-    /** @param array<string, mixed> $config */
-    public function hydrate(array $config): ProjectConfig
+    public function hydrate(mixed $config): ProjectConfig
     {
+        if (! is_array($config)) {
+            throw ValidationException::withMessages(['config' => 'The config field must be a JSON object.']);
+        }
+
         $type = $config['type'] ?? null;
 
         if (! is_string($type) || $type === '') {

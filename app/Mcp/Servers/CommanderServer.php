@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Mcp\Servers;
 
 use App\Mcp\Tools\CreateProject;
+use App\Mcp\Tools\GetDelivery;
+use App\Mcp\Tools\GetDeliveryTimeline;
 use App\Mcp\Tools\GetProject;
 use App\Mcp\Tools\GetProjectConfig;
 use App\Mcp\Tools\GetProjectStatus;
@@ -18,13 +20,15 @@ final class CommanderServer extends Server
 
     protected string $version = '1.0.0';
 
-    protected string $instructions = 'Manage the canonical shared-knowledge project registry. Read a project before changing it and preserve its project ID.';
+    protected string $instructions = 'Read authoritative project and delivery state. Read a project before changing its manifest and preserve its project ID.';
 
     protected array $tools = [
         ListProjects::class,
         GetProject::class,
         GetProjectConfig::class,
         GetProjectStatus::class,
+        GetDelivery::class,
+        GetDeliveryTimeline::class,
         CreateProject::class,
         UpdateProject::class,
     ];
