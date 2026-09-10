@@ -2,6 +2,10 @@
 
 namespace App\Providers;
 
+use App\Delivery\Config\ProjectConfigRegistry;
+use App\Delivery\Contracts\HerdrRuntime;
+use App\Herdr\SocketClient;
+use App\Herdr\SocketHerdrRuntime;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Support\Facades\Vite;
 use Illuminate\Support\ServiceProvider;
@@ -14,7 +18,16 @@ class AppServiceProvider extends ServiceProvider
     #[\Override]
     public function register(): void
     {
-        //
+        $this->app->singleton(ProjectConfigRegistry::class);
+        $this->app->bind(HerdrRuntime::class, function (): SocketHerdrRuntime {
+            $path = config('herdr.socket');
+
+            if (! is_string($path) || $path === '') {
+                throw new \RuntimeException('The Herdr socket is not configured.');
+            }
+
+            return new SocketHerdrRuntime(new SocketClient($path));
+        });
     }
 
     /**

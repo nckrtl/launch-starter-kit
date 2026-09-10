@@ -13,6 +13,14 @@ return [
 
     'socket' => env('HERDR_SOCKET_PATH', '/home/nckrtl/.config/herdr/sessions/orbit/herdr.sock'),
 
+    // Herdr responses do not include the daemon session name, so correlation uses this explicit key.
+    'session' => env('HERDR_SESSION', 'orbit'),
+
+    // Additive raw-event capture. The existing Tom webhook remains active when this is enabled.
+    'orchestration' => [
+        'enabled' => env('HERDR_ORCHESTRATION_ENABLED', false),
+    ],
+
     /*
     |--------------------------------------------------------------------------
     | Tom webhook

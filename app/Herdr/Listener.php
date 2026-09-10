@@ -2,6 +2,7 @@
 
 namespace App\Herdr;
 
+use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Notifications\HerdrAgentStatusChanged;
 use Closure;
 use Throwable;
@@ -31,6 +32,7 @@ final class Listener
         private readonly TransitionRecorder $recorder,
         private readonly Closure $log,
         private readonly bool $dryRun = false,
+        private readonly ?CaptureHerdrEvent $shadow = null,
     ) {}
 
     /**
@@ -103,6 +105,14 @@ final class Listener
 
             $event = str_replace('.', '_', Payload::string($line['event'] ?? null) ?? '');
             $data = Payload::assoc($line['data'] ?? null);
+
+            if (! $this->dryRun && $this->shadow !== null) {
+                try {
+                    $this->shadow->handle($line);
+                } catch (Throwable $exception) {
+                    $this->log('shadow event capture failed: '.$exception->getMessage());
+                }
+            }
 
             if ($event === 'pane_agent_status_changed') {
                 $paneId = Payload::string($data['pane_id'] ?? null);

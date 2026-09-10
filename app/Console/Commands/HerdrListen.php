@@ -2,6 +2,7 @@
 
 namespace App\Console\Commands;
 
+use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Herdr\Debouncer;
 use App\Herdr\Listener;
 use App\Herdr\SocketClient;
@@ -18,7 +19,7 @@ final class HerdrListen extends Command
 
     protected $description = 'Follow the Herdr session and send agent-status changes directly to Tom';
 
-    public function handle(TransitionRecorder $recorder): int
+    public function handle(TransitionRecorder $recorder, CaptureHerdrEvent $shadow): int
     {
         $socket = config('herdr.socket');
         $webhookUrl = config('herdr.webhook_url');
@@ -57,6 +58,7 @@ final class HerdrListen extends Command
             recorder: $recorder,
             log: $log,
             dryRun: $dryRun,
+            shadow: $shadow,
         );
 
         $log(sprintf('listening on %s%s', $socket, $dryRun ? ' (dry run)' : ''));

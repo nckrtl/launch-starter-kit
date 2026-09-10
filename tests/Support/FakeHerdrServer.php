@@ -6,7 +6,7 @@ use RuntimeException;
 
 /**
  * A stand-in for the Herdr socket server: newline-delimited JSON on a Unix socket,
- * answering agent.list, workspace.list, ping, and events.subscribe from a scenario file
+ * answering monitoring and orchestration methods from a scenario file
  * and pushing the scenario's events after each subscription acknowledgement.
  *
  * Like Herdr it serves many connections at once, so a request is answered while a
@@ -25,7 +25,7 @@ final class FakeHerdrServer
     ) {}
 
     /**
-     * @param  array{agents: list<array<string, mixed>>, workspaces: list<array<string, mixed>>, events: list<array<string, mixed>>, later_agents?: list<array<string, mixed>>}  $scenario
+     * @param  array{agents: list<array<string, mixed>>, workspaces: list<array<string, mixed>>, events: list<array<string, mixed>>, later_agents?: list<array<string, mixed>>, rpc?: array<string, array<string, mixed>>}  $scenario
      */
     public static function start(array $scenario): self
     {
@@ -154,7 +154,9 @@ final class FakeHerdrServer
         $id = $request['id'] ?? '';
         $method = $request['method'] ?? '';
 
-        $reply = match ($method) {
+        $configured = is_array($scenario['rpc'][$method] ?? null) ? $scenario['rpc'][$method] : null;
+
+        $reply = $configured !== null ? ['id' => $id, 'result' => $configured] : match ($method) {
             'ping' => ['id' => $id, 'result' => ['type' => 'pong', 'version' => 'fake', 'protocol' => 20]],
             'agent.list' => ['id' => $id, 'result' => [
                 'type' => 'agent_list',

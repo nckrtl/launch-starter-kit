@@ -1,10 +1,12 @@
 <?php
 
+use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Herdr\Debouncer;
 use App\Herdr\Listener;
 use App\Herdr\SocketClient;
 use App\Herdr\StatusTracker;
 use App\Herdr\TransitionRecorder;
+use App\Models\ExternalEvent;
 use App\Models\HerdrEvent;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Client\Request;
@@ -107,6 +109,28 @@ it('records and sends exactly the transition into idle', function () {
             ['type' => 'pane.agent_status_changed', 'pane_id' => 'w1:p2'],
         ])
         ->and(implode("\n", $log))->toContain('w1:p1')->toContain('w1:p2')->toContain('working -> idle');
+});
+
+it('captures every raw envelope in shadow mode while preserving the Tom webhook', function () {
+    config(['herdr.orchestration.enabled' => true, 'herdr.session' => 'orbit']);
+    $socket = $this->server->socketPath;
+
+    $listener = new Listener(
+        client: fn (): SocketClient => new SocketClient($socket),
+        tracker: new StatusTracker(['idle', 'done', 'blocked'], new Debouncer(0.0)),
+        recorder: app(TransitionRecorder::class),
+        log: fn (string $line) => null,
+        shadow: app(CaptureHerdrEvent::class),
+    );
+
+    $listener->run(timeout: 1.0);
+
+    expect(ExternalEvent::count())->toBe(2)
+        ->and(ExternalEvent::query()->oldest('id')->firstOrFail()->payload)->toBe(herdrScenario()['events'][0])
+        ->and(ExternalEvent::query()->pluck('provider_event_id')->all())->toBe([null, null])
+        ->and(HerdrEvent::count())->toBe(1);
+
+    Http::assertSentCount(1);
 });
 
 it('opens a new subscription that includes a pane created after the first one', function () {
