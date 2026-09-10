@@ -561,6 +561,18 @@ and unchanged planning contract. This primitive is not yet wired to a delivery
 or dispatch, so it cannot mutate Linear until the durable live-planning stage
 explicitly invokes it.
 
+The live ledger identity is `orbit-feature` version 1, with `planning` as its
+initial phase. `StartOrbitDelivery` validates an enabled discovery-mode Orbit
+config and records the same verified issue snapshot,
+candidate receipt, worktree, branch, candidate, and tree used by shadow
+preparation. It creates no dispatch, job, Herdr process, or Linear mutation.
+It leaves the delivery in the explicit non-runnable `preparing` status, which
+the generic advancement action ignores. The existing shadow start remains
+unchanged. This gives the live planning path
+its own real `Delivery` and `PhaseRun` instead of adding a second planning-only
+ledger beside the workflow kernel. Activation waits for Commander-owned
+planning receipt validation and the durable prompt stage.
+
 ### Project registry boundary
 
 The shared-knowledge project registry is currently file-backed. Its stable ID

@@ -17,6 +17,7 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanningHandoffFailed;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\ShadowWorkflow;
 use App\Models\Delivery;
 use Illuminate\Validation\ValidationException;
@@ -100,13 +101,20 @@ final readonly class PrepareOrbitPlanningHandoff
         $candidateSha = $delivery->candidate_sha;
         $issueId = $delivery->external_issue_id;
         $issueKey = $delivery->external_issue_key;
+        $validWorkflow = $phase !== null && (
+            ($delivery->workflow_type === ShadowWorkflow::TYPE
+                && $delivery->workflow_version === ShadowWorkflow::VERSION
+                && $phase->phase_name === 'herdr_test')
+            || ($delivery->workflow_type === OrbitFeatureWorkflow::TYPE
+                && $delivery->workflow_version === OrbitFeatureWorkflow::VERSION
+                && $delivery->branch === strtolower((string) $issueKey)
+                && $phase->phase_name === OrbitFeatureWorkflow::INITIAL_PHASE)
+        );
 
-        if ($phase === null || $phase->phase_name !== 'herdr_test' || $phase->attempt !== 1
+        if ($phase === null || ! $validWorkflow || $phase->attempt !== 1
             || ! is_array($snapshot) || array_is_list($snapshot)
             || ! is_array($candidate) || array_is_list($candidate)
             || ! is_string($worktreePath) || ! is_string($candidateSha)
-            || $delivery->workflow_type !== ShadowWorkflow::TYPE
-            || $delivery->workflow_version !== ShadowWorkflow::VERSION
             || $delivery->external_issue_provider !== OrbitIssueSnapshot::PROVIDER
             || ! is_string($issueKey)) {
             throw new OrbitPlanningHandoffFailed('The delivery has no valid Orbit preparation record.');

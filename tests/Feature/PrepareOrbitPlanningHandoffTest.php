@@ -2,6 +2,7 @@
 
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\PrepareOrbitPlanningHandoff;
+use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitIssueProvider;
@@ -9,6 +10,7 @@ use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\VerifiedIssueSnapshot;
+use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
@@ -99,7 +101,7 @@ beforeEach(function () {
         $this->repositoryPath,
         $this->worktreeRoot,
     ));
-    $prepared = new PreparedIssueSnapshot(
+    $this->prepared = new PreparedIssueSnapshot(
         schema: OrbitIssueSnapshot::SCHEMA,
         provider: OrbitIssueSnapshot::PROVIDER,
         path: realpath($this->snapshotPath),
@@ -109,11 +111,12 @@ beforeEach(function () {
         issueId: $this->issueId,
         issueKey: 'ORB-234',
     );
+    $this->candidateCheck = new CandidateCheck(realpath($this->receiptPath), $this->headSha, $this->treeSha);
     $this->delivery = app(StartShadowDelivery::class)->handle(
         $this->project,
-        new VerifiedIssueSnapshot($prepared, now()->toImmutable()),
+        new VerifiedIssueSnapshot($this->prepared, now()->toImmutable()),
         realpath($this->worktreePath),
-        new CandidateCheck(realpath($this->receiptPath), $this->headSha, $this->treeSha),
+        $this->candidateCheck,
     );
 
     $freshPayload = planningHandoffIssue($this->issueId, [
@@ -308,6 +311,51 @@ it('accepts an eligible Todo snapshot as evidence but never marks it dispatchabl
 
     expect($handoff->issue['state']['name'])->toBe('Todo')
         ->and($handoff->dispatchable)->toBeFalse()
+        ->and(AgentDispatch::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('prepares the same non-runnable handoff for the live Orbit workflow ledger', function () {
+    $this->delivery->status = DeliveryStatus::Completed;
+    $this->delivery->completed_at = now();
+    $this->delivery->save();
+    $live = app(StartOrbitDelivery::class)->handle(
+        $this->project,
+        new VerifiedIssueSnapshot($this->prepared, now()->toImmutable()),
+        realpath($this->worktreePath),
+        $this->candidateCheck,
+    );
+
+    $handoff = app(PrepareOrbitPlanningHandoff::class)->handle($live->id);
+
+    expect($handoff->deliveryId)->toBe($live->id)
+        ->and($handoff->phase)->toBe('planning')
+        ->and($handoff->issueKey)->toBe('ORB-234')
+        ->and($handoff->worktreePath)->toBe($this->worktreePath)
+        ->and($handoff->contractHash)->toBe($this->contractHash)
+        ->and($handoff->dispatchable)->toBeFalse()
+        ->and(AgentDispatch::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('rejects live Orbit ledger branch drift before repository or Linear work', function () {
+    $this->delivery->status = DeliveryStatus::Completed;
+    $this->delivery->completed_at = now();
+    $this->delivery->save();
+    $live = app(StartOrbitDelivery::class)->handle(
+        $this->project,
+        new VerifiedIssueSnapshot($this->prepared, now()->toImmutable()),
+        realpath($this->worktreePath),
+        $this->candidateCheck,
+    );
+    $live->branch = 'orb-999';
+    $live->save();
+
+    expect(fn () => app(PrepareOrbitPlanningHandoff::class)->handle($live->id))
+        ->toThrow(OrbitPlanningHandoffFailed::class, 'no valid Orbit preparation record');
+
+    expect($this->provider->requests)->toBe([])
+        ->and($this->log->events)->toBe([])
         ->and(AgentDispatch::count())->toBe(0);
     Queue::assertNothingPushed();
 });

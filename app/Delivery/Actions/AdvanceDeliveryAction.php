@@ -36,6 +36,7 @@ final readonly class AdvanceDeliveryAction
         $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($deliveryId);
 
         if ($delivery->status->isTerminal()
+            || $delivery->status === DeliveryStatus::Preparing
             || $delivery->status === DeliveryStatus::Paused
             || $delivery->status === DeliveryStatus::Blocked
             || $delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled) {
