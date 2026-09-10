@@ -6,9 +6,11 @@ namespace App\Console\Commands;
 
 use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Config\ProjectConfigRegistry;
+use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Enums\ProjectOrchestrationState;
+use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Jobs\AdvanceDelivery;
 use App\Models\Delivery;
@@ -31,8 +33,12 @@ final class StartShadowDeliveryCommand extends Command
 {
     use ConfirmableTrait;
 
-    public function handle(ProjectConfigRegistry $configs, OrbitRepository $repository, StartShadowDelivery $start): int
-    {
+    public function handle(
+        ProjectConfigRegistry $configs,
+        OrbitIssueProvider $issues,
+        OrbitRepository $repository,
+        StartShadowDelivery $start,
+    ): int {
         if (! config('herdr.orchestration.enabled', false)) {
             $this->error('Herdr orchestration shadow mode is disabled.');
 
@@ -49,8 +55,8 @@ final class StartShadowDeliveryCommand extends Command
             'issue_key' => $this->argument('issue-key'),
         ], [
             'project' => ['required', 'string', 'max:80', 'regex:/^[a-z0-9]+(?:-[a-z0-9]+)*$/'],
-            'issue_id' => ['required', 'string', 'max:100'],
-            'issue_key' => ['required', 'string', 'max:100', 'regex:/^[A-Z][A-Z0-9]*-[0-9]+$/'],
+            'issue_id' => ['required', 'uuid'],
+            'issue_key' => ['required', 'string', 'max:100', 'regex:/^ORB-[0-9]+$/'],
         ]);
 
         if ($validator->fails()) {
@@ -95,15 +101,17 @@ final class StartShadowDeliveryCommand extends Command
         }
 
         try {
+            $issue = $issues->fetch($input['issue_id'], $input['issue_key']);
             $worktree = $repository->prepareWorktree($config, $input['issue_key']);
             $candidateCheck = $repository->checkCandidate($config, $worktree);
-        } catch (OrbitRepositoryFailed $exception) {
+            $issueSnapshot = $repository->writeIssueSnapshot($config, $worktree, $issue);
+        } catch (OrbitIssueProviderFailed|OrbitRepositoryFailed $exception) {
             $this->error($exception->getMessage());
 
             return self::FAILURE;
         }
 
-        $delivery = $start->handle($project, $input['issue_id'], $input['issue_key'], $worktree->path, $candidateCheck);
+        $delivery = $start->handle($project, $issueSnapshot, $worktree->path, $candidateCheck);
 
         AdvanceDelivery::dispatch($delivery->id)->afterCommit();
 

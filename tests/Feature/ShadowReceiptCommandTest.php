@@ -33,8 +33,7 @@ beforeEach(function () {
     ]);
     $this->delivery = app(StartShadowDelivery::class)->handle(
         $project,
-        'linear-receipt-1',
-        'ORB-234',
+        preparedOrbitIssueSnapshot('44444444-5555-4666-8777-888888888888', 'ORB-234', $this->worktree.'/.loop/issue.json'),
         $this->worktree,
         new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );

@@ -32,12 +32,11 @@ beforeEach(function () {
 
 afterEach(fn () => File::deleteDirectory($this->projectsPath));
 
-function ledgerDelivery(object $test, string $issueId = 'linear-1'): Delivery
+function ledgerDelivery(object $test, string $issueId = '11111111-2222-4333-8444-555555555555'): Delivery
 {
     return app(StartShadowDelivery::class)->handle(
         $test->orchestration,
-        $issueId,
-        'ORB-1',
+        preparedOrbitIssueSnapshot($issueId, 'ORB-1', '/fast/worktrees/orbit/orb-1/.loop/issue.json'),
         '/fast/worktrees/orbit/orb-1',
         new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );
@@ -79,6 +78,21 @@ it('enforces one active delivery per project issue while retaining terminal hist
     expect($first->fresh()->active_issue_key)->toBeNull()
         ->and($second->active_issue_key)->not->toBeNull()
         ->and(Delivery::active()->count())->toBe(1);
+});
+
+it('rejects prepared issue metadata that is not bound to the delivery worktree', function () {
+    expect(fn () => app(StartShadowDelivery::class)->handle(
+        $this->orchestration,
+        preparedOrbitIssueSnapshot(
+            '11111111-2222-4333-8444-555555555555',
+            'ORB-1',
+            '/fast/worktrees/orbit/different/.loop/issue.json',
+        ),
+        '/fast/worktrees/orbit/orb-1',
+        new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
+    ))->toThrow(InvalidArgumentException::class, 'prepared shadow delivery inputs are inconsistent');
+
+    expect(Delivery::count())->toBe(0);
 });
 
 it('casts ledger state and enforces phase, dispatch, receipt, and provider-event uniqueness', function () {

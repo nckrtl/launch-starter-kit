@@ -6,7 +6,9 @@ namespace App\Delivery\Repositories;
 
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use Illuminate\Support\Facades\Process;
@@ -145,6 +147,64 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         return new CandidateCheck($receiptPath, $worktree->headSha, $treeSha);
     }
 
+    public function writeIssueSnapshot(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        OrbitIssueSnapshot $snapshot,
+    ): PreparedIssueSnapshot {
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree->path);
+
+        if (($snapshot->payload['id'] ?? null) !== $snapshot->issueId
+            || ($snapshot->payload['identifier'] ?? null) !== $snapshot->issueKey
+            || preg_match('/^[a-f0-9]{64}$/', $snapshot->contractHash) !== 1) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot identity is invalid.');
+        }
+
+        if ($root === false || $path === false || $path !== $worktree->path
+            || ! str_starts_with($path, $root.'/')) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot worktree is invalid.');
+        }
+
+        $loop = $path.'/.loop';
+
+        if (is_link($loop) || ! is_dir($loop) || realpath($loop) !== $loop) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot requires a regular .loop directory.');
+        }
+
+        try {
+            $contents = json_encode(
+                $snapshot->payload,
+                JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+            )."\n";
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot could not be encoded.', 0, $exception);
+        }
+
+        $target = $loop.'/issue.json';
+        $retained = $this->retainedIssueSnapshot($target, $snapshot->payload);
+
+        if ($retained === null) {
+            $this->publishIssueSnapshot($loop, $target, $contents);
+            $retained = $this->retainedIssueSnapshot($target, $snapshot->payload);
+        }
+
+        if ($retained === null) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot could not be retained.');
+        }
+
+        return new PreparedIssueSnapshot(
+            schema: OrbitIssueSnapshot::SCHEMA,
+            provider: OrbitIssueSnapshot::PROVIDER,
+            path: $target,
+            contentsHash: hash('sha256', $retained),
+            contractSchema: OrbitIssueSnapshot::CONTRACT_SCHEMA,
+            contractHash: $snapshot->contractHash,
+            issueId: $snapshot->issueId,
+            issueKey: $snapshot->issueKey,
+        );
+    }
+
     /** @param array<mixed, mixed> $receipt */
     private function validCandidateReceipt(array $receipt, PreparedWorktree $worktree, string $treeSha, string $path): bool
     {
@@ -192,5 +252,91 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         sort($expected);
 
         return $actual === $expected;
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function retainedIssueSnapshot(string $target, array $payload): ?string
+    {
+        if (is_link($target)) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot path is unsafe.');
+        }
+
+        if (! file_exists($target)) {
+            return null;
+        }
+
+        $permissions = fileperms($target);
+
+        if (! is_file($target) || $permissions === false || ($permissions & 0777) !== 0600) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot path is unsafe.');
+        }
+
+        $contents = file_get_contents($target);
+
+        try {
+            $existing = $contents === false ? null : json_decode($contents, true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            $existing = null;
+        }
+
+        if ($contents === false || ! is_array($existing) || array_is_list($existing)
+            || $this->canonicalize($existing) !== $this->canonicalize($payload)) {
+            throw new OrbitRepositoryFailed('The existing Orbit issue snapshot conflicts with the fetched issue.');
+        }
+
+        return $contents;
+    }
+
+    private function publishIssueSnapshot(string $loop, string $target, string $contents): void
+    {
+        $temporary = tempnam($loop, '.issue-');
+
+        if ($temporary === false) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot could not be staged.');
+        }
+
+        try {
+            if (file_put_contents($temporary, $contents, LOCK_EX) !== strlen($contents)
+                || ! chmod($temporary, 0600)) {
+                throw new OrbitRepositoryFailed('The Orbit issue snapshot could not be staged.');
+            }
+
+            if (is_link($loop) || realpath($loop) !== $loop) {
+                throw new OrbitRepositoryFailed('The Orbit issue snapshot directory changed during publication.');
+            }
+
+            @link($temporary, $target);
+        } finally {
+            if (file_exists($temporary)) {
+                unlink($temporary);
+            }
+        }
+    }
+
+    private function canonicalize(mixed $value): mixed
+    {
+        if (! is_array($value)) {
+            return $value;
+        }
+
+        if (array_is_list($value)) {
+            $normalized = array_map(fn (mixed $item): mixed => $this->canonicalize($item), $value);
+            usort($normalized, fn (mixed $left, mixed $right): int => $this->canonicalJson($left) <=> $this->canonicalJson($right));
+
+            return $normalized;
+        }
+
+        ksort($value);
+
+        return array_map(fn (mixed $item): mixed => $this->canonicalize($item), $value);
+    }
+
+    private function canonicalJson(mixed $value): string
+    {
+        try {
+            return json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The Orbit issue snapshot could not be compared.', 0, $exception);
+        }
     }
 }

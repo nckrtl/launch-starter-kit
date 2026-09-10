@@ -106,8 +106,7 @@ beforeEach(function () {
     $orchestration = app(ConfigureProjectOrchestration::class)->handle('orbit-workflow', workflowOrbitConfig());
     $this->delivery = app(StartShadowDelivery::class)->handle(
         $orchestration,
-        'linear-workflow-1',
-        'ORB-77',
+        preparedOrbitIssueSnapshot('22222222-3333-4444-8555-666666666666', 'ORB-77', '/fast/worktrees/orbit/orb-77/.loop/issue.json'),
         '/fast/worktrees/orbit/orb-77',
         new CandidateCheck('/checks/result.json', str_repeat('a', 40), str_repeat('b', 40)),
     );

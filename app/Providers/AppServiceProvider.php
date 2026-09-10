@@ -3,7 +3,9 @@
 namespace App\Providers;
 
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\IssueProviders\SshOrbitIssueProvider;
 use App\Delivery\Repositories\ProcessOrbitRepository;
 use App\Herdr\SocketClient;
 use App\Herdr\SocketHerdrRuntime;
@@ -20,6 +22,7 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->bind(OrbitRepository::class, ProcessOrbitRepository::class);
+        $this->app->bind(OrbitIssueProvider::class, SshOrbitIssueProvider::class);
 
         $this->app->bind(HerdrRuntime::class, function (): SocketHerdrRuntime {
             $path = config('herdr.socket');
