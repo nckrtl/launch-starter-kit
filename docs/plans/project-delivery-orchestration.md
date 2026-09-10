@@ -551,6 +551,16 @@ non-dispatchable. Live planning still needs a separate Linear transition to `In
 Progress`, a read-back, and the same final verification immediately before the
 prompt is submitted.
 
+The Linear transition is now isolated behind `OrbitIssueTransitioner`; the
+read-only `OrbitIssueProvider` contract remains unchanged. The SSH adapter
+resolves exactly one team state named `In Progress`, sends only that state
+mutation through the installed Hermes controller RPC, and always performs an
+authoritative read-back. A lost or failed mutation response is accepted only
+when the read-back proves the exact state ID, name, type, unchanged ownership,
+and unchanged planning contract. This primitive is not yet wired to a delivery
+or dispatch, so it cannot mutate Linear until the durable live-planning stage
+explicitly invokes it.
+
 ### Project registry boundary
 
 The shared-knowledge project registry is currently file-backed. Its stable ID
