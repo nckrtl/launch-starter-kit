@@ -30,6 +30,7 @@
         "larastan/larastan": "^3.9",
         "laravel/boost": "^2.4",
         "laravel/pail": "^1.2.5",
+        "laravel/pao": "^1.1",
         "laravel/pint": "^1.27",
         "mockery/mockery": "^1.6",
         "nckrtl/laravel-toolbar": "^0.3.1",

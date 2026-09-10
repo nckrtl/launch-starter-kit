@@ -1,6 +1,6 @@
 # Project delivery orchestration
 
-Status: proposed implementation plan
+Status: discovery complete; first implementation slice ready
 
 Continuation thread: `codex://threads/01a08cc2-0105-74b1-aeb0-be013aa73267`
 
@@ -446,6 +446,126 @@ The implementation thread should confirm these facts from the current systems:
 
 These checks may refine names and adapters. They should not change the ownership
 boundaries or create a second workflow engine.
+
+## Discovery findings
+
+Discovery was completed against Commander, Herdr 0.9.0, Orbit's accepted
+delivery contracts, and the installed Orbit delivery controller on 2026-09-10.
+
+### Herdr control and correlation
+
+Herdr's bundled schema reports protocol 22. Commander can continue to use its
+newline-delimited JSON socket client and add typed adapters for these methods:
+
+- `worktree.open` opens the repository-created checkout and returns the
+  workspace, tab, root pane, worktree, and `already_open` state;
+- `pane.split` returns the new pane;
+- `agent.start` returns agent data including the workspace, tab, pane, terminal,
+  name, agent session, status, revision, and state-change sequence; and
+- `agent.prompt` returns the resulting agent data after submission.
+
+Commander must call Orbit's `bin/worktree-create` before `worktree.open`.
+Herdr's own `worktree.create` must not replace the repository adapter.
+
+The current Orbit controller uses deterministic agent names, records a dispatch
+before startup, and stops when startup is ambiguous or a retained worker is
+missing. Preserve those rules. A timeout does not prove that `agent.start` or
+`agent.prompt` failed before creating external state.
+
+Herdr event envelopes contain `event` and `data`, but no provider event ID. For
+Herdr, `external_events.provider_event_id` is therefore nullable and the local
+event row is the ingestion identity. Provider IDs remain uniquely constrained
+when a provider supplies one. Repeated Herdr events may produce separate raw
+event rows, but the unique dispatch settlement and transactional phase
+transition must make advancement idempotent. The listener may enrich a
+correlated event with the agent's `state_change_seq`; it must not claim that
+value was present in the original event.
+
+### Orbit repository contracts
+
+`bin/worktree-create ISSUE --flow=discovery` requires an uppercase Linear key,
+a clean primary checkout on `main`, and a fast-forwardable `origin/main`. It
+creates or reuses the issue branch and registered worktree, initializes the
+ignored `.loop` workspace, bootstraps dependencies and compatible caches, queues
+newer cache maintenance without waiting, and prints the worktree path on its
+last output line.
+
+Orbit's current controller receipts are immutable JSON objects keyed by a
+random dispatch ID. Schema 1 records the issue key, dispatch, agent, phase,
+result, candidate SHA, handoff, artifact SHA, Builder gate receipt when
+required, and creation time. Planning receipts validate the saved plan
+artifact. Implementation and review receipts validate the exact candidate,
+artifact, clean worktree, complete pull request body, and Builder gate.
+`bin/review-check` writes the candidate-bound Builder receipt below the Git
+common directory. `.loop/runtime` contains mutable session, dispatch, prompt,
+and receipt files and is excluded from published candidate artifacts.
+
+Stages 1 through 4 use a harmless test receipt and do not wrap the full Orbit
+preparation or review loop yet. Stage 5 will add typed wrappers around these
+existing contracts.
+
+### Delivery identity and start event
+
+Orbit uses Linear's UUID as the stable external issue ID and an uppercase key
+such as `ORB-234` as its human-facing key. The current start event is an explicit
+`bin/loop ORB-234` invocation after Tom has selected eligible work. The existing
+controller verifies Tom's delegation, issue state, blockers, children, and
+readiness before it creates a worktree.
+
+The shadow slice records `provider=linear`, the Linear UUID, and the issue key,
+but does not take over Linear mutation or routine `bin/loop` dispatch. Tests and
+an internal application service start the harmless delivery. A later cutover
+will route the existing driver entry point through the same start service after
+authorization and eligibility adapters exist.
+
+### Project registry boundary
+
+The shared-knowledge project registry is currently file-backed. Its stable ID
+is the validated lowercase directory slug, and no database-backed project model
+exists. `project_orchestrations.manifest_project_id` is therefore a unique
+string validated against `SharedKnowledgeProjectRepository`, not a foreign key.
+A future project model can add a foreign key without changing delivery identity
+or copying human-facing manifest data into Commander.
+
+### Tom webhook compatibility
+
+The current listener writes a derived `HerdrEvent`, sends Tom a synchronous
+HMAC-signed request with a 10-second timeout and three 250-millisecond retries,
+then records `notified_at`. A final failure leaves the event unnotified and is
+logged by the listener; no queue retry currently replays it. The request uses
+the local Herdr event ID for `X-Request-ID` deduplication.
+
+During shadow mode, keep this path enabled by default and make orchestration
+capture additive. Correlation or queueing failure must not suppress the existing
+Tom notification. The new raw `external_events` ledger is authoritative for
+workflow processing; `herdr_events` remains the compatibility record until
+shadow-mode parity permits cutover.
+
+### First-slice construction order
+
+Implement the reviewable slice in this order:
+
+1. Add configuration DTOs, upcasting, the cast, registry, orchestration record,
+   and read-only MCP tools.
+2. Add portable ledger migrations, string-backed enums, relationships, database
+   constraints, and a deterministic timeline query.
+3. Add a small test workflow and `AdvanceDelivery` with a cache lock, database
+   transaction, explicit after-commit dispatch, bounded retries, and durable
+   idempotency keys.
+4. Extend the Herdr fake with `worktree.open`, `pane.split`, `agent.start`, and
+   `agent.prompt`; persist their returned identifiers before waiting.
+5. Capture and correlate settled events in shadow mode, validate the harmless
+   versioned receipt, and prove repeated jobs and events advance only once.
+6. Expose delivery, timeline, current wait, and resource state through thin
+   read-only MCP tools. Do not add a delivery UI in this slice.
+
+Use separate interfaces only at external boundaries such as Herdr and receipt
+or repository verification. Internal workflow services remain small concrete
+classes. Queue work must not wait for an agent, and its timeout must remain below
+the configured database queue `retry_after` value of 90 seconds. Because test
+queues are synchronous and test cache uses the array store, database uniqueness
+is the final idempotency defense; a shared-store concurrency test is required
+before claiming cross-process lock coverage.
 
 ## Explicit non-goals for the first slice
 
