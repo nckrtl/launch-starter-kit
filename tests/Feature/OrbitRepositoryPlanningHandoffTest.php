@@ -321,9 +321,9 @@ it('rejects planning candidates outside the docs-only descendant boundary', func
     'tracked loop artifact' => [['candidate_loop' => ".loop/plan.md\n"]],
 ]);
 
-it('verifies a saved planning artifact and its pending verdict through Orbit plan-lint', function () {
+it('verifies a saved planning artifact and its expected verdict through Orbit plan-lint', function (string $verdict) {
     $artifactSha = str_repeat('d', 40);
-    $plan = "Plan format: 1\nIssue: ORB-234\nFlow: discovery\nReview verdict: PENDING\n";
+    $plan = "Plan format: 1\nIssue: ORB-234\nFlow: discovery\nReview verdict: {$verdict}\n";
     $validator = realpath($this->repositoryPath.'/bin/plan-lint');
 
     Process::fake(function ($process) use ($artifactSha, $plan, $validator) {
@@ -347,12 +347,13 @@ it('verifies a saved planning artifact and its pending verdict through Orbit pla
         $this->worktree,
         'ORB-234',
         $artifactSha,
+        $verdict,
     );
 
     expect($verified->artifactSha)->toBe($artifactSha)
         ->and($verified->planContentsHash)->toBe(hash('sha256', $plan));
     Process::assertRanTimes(fn () => true, 8);
-});
+})->with(['pending' => 'PENDING', 'pass' => 'PASS', 'fix' => 'FIX']);
 
 it('rejects a failed Orbit plan-lint verification', function () {
     $artifactSha = str_repeat('d', 40);
@@ -377,6 +378,7 @@ it('rejects a failed Orbit plan-lint verification', function () {
         $this->worktree,
         'ORB-234',
         $artifactSha,
+        'PENDING',
     ))->toThrow(OrbitRepositoryFailed::class, 'stale plan receipt');
 
     Process::assertNotRan(fn ($process): bool => $process->command[0] === 'git');
@@ -407,6 +409,7 @@ it('rejects a saved planning artifact without an exact pending verdict', functio
         $this->worktree,
         'ORB-234',
         $artifactSha,
+        'PENDING',
     ))->toThrow(OrbitRepositoryFailed::class, 'must have a PENDING review verdict');
 });
 
@@ -439,6 +442,7 @@ it('rejects a planning artifact whose sole parent is not the submitted candidate
         $this->worktree,
         'ORB-234',
         $artifactSha,
+        'PENDING',
     ))->toThrow(OrbitRepositoryFailed::class, 'not bound to the exact candidate');
 });
 
@@ -473,5 +477,6 @@ it('rejects a planning artifact that changes the candidate product tree', functi
         $this->worktree,
         'ORB-234',
         $artifactSha,
+        'PENDING',
     ))->toThrow(OrbitRepositoryFailed::class, 'not bound to the exact candidate');
 });

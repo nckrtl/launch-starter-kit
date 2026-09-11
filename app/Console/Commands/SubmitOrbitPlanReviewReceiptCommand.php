@@ -4,14 +4,15 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
-use App\Delivery\Actions\CaptureOrbitPlanningReceipt;
+use App\Delivery\Actions\CaptureOrbitPlanReviewReceipt;
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Enums\AgentDispatchStatus;
+use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
-use App\Delivery\Exceptions\OrbitPlanningReceiptFailed;
+use App\Delivery\Exceptions\OrbitPlanReviewReceiptFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Models\PhaseRun;
@@ -23,19 +24,19 @@ use Illuminate\Validation\ValidationException;
 use InvalidArgumentException;
 use RuntimeException;
 
-#[Signature('delivery:submit-orbit-receipt
-    {phase-run : Planning phase run ID from the Commander prompt}
+#[Signature('delivery:submit-orbit-plan-review-receipt
+    {phase-run : Plan-review phase run ID from the Commander prompt}
     {dispatch : Agent dispatch ID from the Commander prompt}
-    {--result= : Planning result: ready or blocked}
+    {--result= : Review result: pass, fix, or blocked}
     {--handoff= : Complete handoff file inside the worktree .loop directory}
-    {--artifact= : Full saved artifact SHA; required for ready}')]
-#[Description('Validate and capture a planning receipt for a live Orbit delivery')]
-final class SubmitOrbitPlanningReceiptCommand extends Command
+    {--artifact= : Full reviewed artifact SHA; required for pass or fix}')]
+#[Description('Validate and capture an independent Orbit plan-review receipt')]
+final class SubmitOrbitPlanReviewReceiptCommand extends Command
 {
     public function handle(
         ProjectConfigRegistry $configs,
         OrbitRepository $repository,
-        CaptureOrbitPlanningReceipt $capture,
+        CaptureOrbitPlanReviewReceipt $capture,
     ): int {
         $phaseRunId = $this->positiveIntegerArgument('phase-run');
         $dispatchId = $this->positiveIntegerArgument('dispatch');
@@ -54,30 +55,35 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
         if ($phaseRun === null || $dispatch === null || $phaseRun->agentDispatches->count() !== 1
             || $phaseRun->delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
             || $phaseRun->delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
-            || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::INITIAL_PHASE
-            || $phaseRun->phase_name !== OrbitFeatureWorkflow::INITIAL_PHASE
+            || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::PLAN_REVIEW_PHASE
+            || ($phaseRun->delivery->status !== DeliveryStatus::WaitingForAgent
+                && ! ($phaseRun->delivery->status === DeliveryStatus::Preparing
+                    && $dispatch->status === AgentDispatchStatus::Starting
+                    && $dispatch->error_code === 'herdr_prompt_attempted'))
+            || $phaseRun->phase_name !== OrbitFeatureWorkflow::PLAN_REVIEW_PHASE
+            || $phaseRun->attempt !== 1
             || $phaseRun->status !== PhaseRunStatus::Running
+            || $dispatch->agent_role !== OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE
             || (! ($dispatch->status === AgentDispatchStatus::Starting
                 && $dispatch->error_code === 'herdr_prompt_attempted')
                 && ! in_array($dispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true))) {
-            $this->error('The planning phase run and dispatch do not match an active Orbit worker.');
+            $this->error('The plan-review phase run and dispatch do not match an active Orbit reviewer.');
 
             return self::FAILURE;
         }
 
         $result = $this->option('result');
-        $handoffOption = $this->option('handoff');
         $artifact = $this->option('artifact');
 
-        if (! is_string($result) || ! in_array($result, ['ready', 'blocked'], true)) {
-            $this->error('The planning result must be ready or blocked.');
+        if (! is_string($result) || ! in_array($result, ['pass', 'fix', 'blocked'], true)) {
+            $this->error('The plan-review result must be pass, fix, or blocked.');
 
             return self::FAILURE;
         }
 
-        if (($result === 'ready' && (! is_string($artifact) || preg_match('/^[a-f0-9]{40}$/', $artifact) !== 1))
+        if (($result !== 'blocked' && (! is_string($artifact) || preg_match('/^[a-f0-9]{40}$/', $artifact) !== 1))
             || ($result === 'blocked' && $artifact !== null)) {
-            $this->error('Ready requires one full artifact SHA; blocked must not include an artifact.');
+            $this->error('Pass or fix requires one full artifact SHA; blocked must not include an artifact.');
 
             return self::FAILURE;
         }
@@ -92,7 +98,7 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
             return self::FAILURE;
         }
 
-        $handoff = $this->readHandoff($worktree, $handoffOption);
+        $handoff = $this->readHandoff($worktree, $this->option('handoff'));
 
         if ($handoff === null) {
             return self::FAILURE;
@@ -108,8 +114,8 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
 
         $headSha = trim($head->output());
 
-        if ($head->failed() || preg_match('/^[a-f0-9]{40}$/', $headSha) !== 1) {
-            $this->error('The worktree HEAD is not a valid planning candidate.');
+        if ($head->failed() || $headSha !== $phaseRun->delivery->candidate_sha) {
+            $this->error('The reviewer changed the candidate or reviewed another head.');
 
             return self::FAILURE;
         }
@@ -121,18 +127,17 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
                 throw new InvalidArgumentException('The delivery does not use Orbit project configuration.');
             }
 
-            $verifiedArtifact = $result === 'ready'
-                ? $repository->verifyPlanningArtifact(
+            $verifiedArtifact = $result === 'blocked'
+                ? null
+                : $repository->verifyPlanningArtifact(
                     $config,
                     new PreparedWorktree($worktree, $headSha),
                     (string) $phaseRun->delivery->external_issue_key,
                     (string) $artifact,
-                    'PENDING',
-                )
-                : null;
-
+                    strtoupper($result),
+                );
             $receipt = $capture->handle($phaseRun, $dispatch, [
-                'kind' => 'orbit_planning',
+                'kind' => 'orbit_plan_review',
                 'schema_version' => 1,
                 'delivery_id' => $phaseRun->delivery_id,
                 'dispatch_id' => $dispatch->id,
@@ -147,16 +152,16 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
                 'artifact_sha' => $verifiedArtifact?->artifactSha,
                 'plan_sha256' => $verifiedArtifact?->planContentsHash,
             ]);
-        } catch (InvalidArgumentException|ValidationException|OrbitRepositoryFailed|OrbitPlanningReceiptFailed $exception) {
+        } catch (InvalidArgumentException|ValidationException|OrbitRepositoryFailed|OrbitPlanReviewReceiptFailed $exception) {
             $this->error($exception->getMessage());
 
             return self::FAILURE;
         }
 
         if ($receipt->wasRecentlyCreated) {
-            $this->info("Orbit planning receipt {$receipt->id} captured for phase run {$phaseRun->id}.");
+            $this->info("Orbit plan-review receipt {$receipt->id} captured for phase run {$phaseRun->id}.");
         } else {
-            $this->info("Orbit planning receipt {$receipt->id} was already captured.");
+            $this->info("Orbit plan-review receipt {$receipt->id} was already captured.");
         }
 
         return self::SUCCESS;

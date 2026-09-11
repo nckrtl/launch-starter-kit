@@ -82,6 +82,7 @@ final class PlanningAdvancementRepository implements OrbitRepository
         PreparedWorktree $worktree,
         string $issueKey,
         string $artifactSha,
+        string $expectedVerdict,
     ): VerifiedOrbitPlanningArtifact {
         throw new LogicException('Not used by this test.');
     }
@@ -275,7 +276,7 @@ it('atomically consumes a ready planning receipt into one independent plan-revie
         ->and($this->repository->verifications)->toBe(1)
         ->and($this->issues->fetches)->toBe(1)
         ->and($this->repository->reservationIsHeld())->toBeFalse();
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('waits harmlessly for receipt and settlement in either order', function () {
@@ -288,7 +289,7 @@ it('waits harmlessly for receipt and settlement in either order', function () {
         ->and($this->repository->reservations)->toBe(0);
 
     $this->planner->forceFill(['status' => AgentDispatchStatus::Settled, 'settled_at' => now()])->save();
-    expect($action->handle($this->delivery->id))->toBeFalse();
+    expect($action->handle($this->delivery->id))->toBeTrue();
     expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE);
 });
 
@@ -299,7 +300,7 @@ it('waits harmlessly when settlement arrives before its receipt', function () {
     expect($this->repository->reservations)->toBe(0);
 
     capturePlanningAdvancementReceipt($this);
-    expect($action->handle($this->delivery->id))->toBeFalse();
+    expect($action->handle($this->delivery->id))->toBeTrue();
     expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE);
 });
 

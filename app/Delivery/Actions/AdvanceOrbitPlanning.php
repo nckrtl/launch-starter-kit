@@ -15,11 +15,11 @@ use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
-use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanningAdvancementFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPlanningReceiptValidator;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -34,6 +34,7 @@ final readonly class AdvanceOrbitPlanning
         private ResolveOrbitDeliveryPreparation $preparations,
         private OrbitRepository $repository,
         private OrbitIssueProvider $issues,
+        private OrbitPlanningReceiptValidator $planningReceipts,
     ) {}
 
     public function handle(int $deliveryId): bool
@@ -104,12 +105,17 @@ final readonly class AdvanceOrbitPlanning
             );
             $this->assertVerifiedOutcome($receipt, $verified);
 
-            $this->commitTransition($delivery->id, $phase->id, $dispatch->id, $receipt->id, $config, $verified);
+            return $this->commitTransition(
+                $delivery->id,
+                $phase->id,
+                $dispatch->id,
+                $receipt->id,
+                $config,
+                $verified,
+            );
         } finally {
             $reservation->release();
         }
-
-        return false;
     }
 
     private function isOrbitDelivery(Delivery $delivery): bool
@@ -151,7 +157,7 @@ final readonly class AdvanceOrbitPlanning
         $result = $receipt->payload['result'] ?? null;
 
         if ($planningDispatch->status !== AgentDispatchStatus::Settled
-            || ! $this->receiptMatchesLedger($delivery, $planning, $planningDispatch, $receipt)
+            || ! $this->planningReceipts->matches($delivery, $planning, $planningDispatch, $receipt)
             || $planning->finished_at === null
             || $planning->output !== ['receipt_id' => $receipt->id, 'result' => $result]
             || $delivery->candidate_sha !== $receipt->payload['candidate_sha']) {
@@ -256,7 +262,7 @@ final readonly class AdvanceOrbitPlanning
             return null;
         }
 
-        if ($receipts->count() !== 1 || ! $this->receiptMatchesLedger($delivery, $phase, $dispatch, $receipt)) {
+        if ($receipts->count() !== 1 || ! $this->planningReceipts->matches($delivery, $phase, $dispatch, $receipt)) {
             throw new OrbitPlanningAdvancementFailed('The planning receipt does not match the settled dispatch.');
         }
 
@@ -297,12 +303,12 @@ final readonly class AdvanceOrbitPlanning
         int $receiptId,
         OrbitProjectConfig $config,
         VerifiedOrbitPlanningOutcome $verified,
-    ): void {
-        DB::transaction(function () use ($deliveryId, $phaseId, $dispatchId, $receiptId, $config, $verified): void {
+    ): bool {
+        return DB::transaction(function () use ($deliveryId, $phaseId, $dispatchId, $receiptId, $config, $verified): bool {
             $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
 
             if ($this->alreadyHandled($delivery)) {
-                return;
+                return false;
             }
 
             $project = ProjectOrchestration::query()
@@ -326,7 +332,7 @@ final readonly class AdvanceOrbitPlanning
                 || $dispatch->status !== AgentDispatchStatus::Settled
                 || $receipt->phase_run_id !== $phase->id
                 || $receipt->kind !== 'orbit_planning'
-                || ! $this->receiptMatchesLedger($delivery, $phase, $dispatch, $receipt)) {
+                || ! $this->planningReceipts->matches($delivery, $phase, $dispatch, $receipt)) {
                 throw new OrbitPlanningAdvancementFailed('The planning ledger changed during advancement.');
             }
 
@@ -359,7 +365,7 @@ final readonly class AdvanceOrbitPlanning
                 ];
                 $delivery->save();
 
-                return;
+                return false;
             }
 
             if ($result !== 'ready' || $verified->artifactSha === null || $verified->planContentsHash === null) {
@@ -424,6 +430,8 @@ final readonly class AdvanceOrbitPlanning
             $delivery->status = DeliveryStatus::Queued;
             $delivery->failure_details = null;
             $delivery->save();
+
+            return true;
         });
     }
 
@@ -437,48 +445,5 @@ final readonly class AdvanceOrbitPlanning
         }
 
         return $value;
-    }
-
-    private function receiptMatchesLedger(
-        Delivery $delivery,
-        PhaseRun $phase,
-        AgentDispatch $dispatch,
-        Receipt $receipt,
-    ): bool {
-        $payload = $receipt->payload;
-        $allowed = [
-            'kind', 'schema_version', 'delivery_id', 'dispatch_id', 'issue_key', 'phase', 'attempt',
-            'result', 'worktree', 'candidate_sha', 'handoff_path', 'handoff', 'artifact_sha', 'plan_sha256',
-        ];
-        $result = $payload['result'] ?? null;
-        $artifactMatches = $result === 'blocked'
-            ? ($payload['artifact_sha'] ?? null) === null && ($payload['plan_sha256'] ?? null) === null
-            : is_string($payload['artifact_sha'] ?? null)
-                && preg_match('/^[a-f0-9]{40}$/', $payload['artifact_sha']) === 1
-                && is_string($payload['plan_sha256'] ?? null)
-                && preg_match('/^[a-f0-9]{64}$/', $payload['plan_sha256']) === 1;
-
-        return array_diff(array_keys($payload), $allowed) === []
-            && count($payload) === count($allowed)
-            && $receipt->schema_version === 1
-            && $receipt->validation_status === ReceiptValidationStatus::Valid
-            && hash_equals($receipt->payload_hash, hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)))
-            && $receipt->candidate_sha === ($payload['candidate_sha'] ?? null)
-            && ($payload['kind'] ?? null) === 'orbit_planning'
-            && ($payload['schema_version'] ?? null) === 1
-            && ($payload['delivery_id'] ?? null) === $delivery->id
-            && ($payload['dispatch_id'] ?? null) === $dispatch->id
-            && ($payload['issue_key'] ?? null) === $delivery->external_issue_key
-            && ($payload['phase'] ?? null) === $phase->phase_name
-            && ($payload['attempt'] ?? null) === $phase->attempt
-            && in_array($result, ['ready', 'blocked'], true)
-            && ($payload['worktree'] ?? null) === $delivery->worktree_path
-            && is_string($payload['candidate_sha'] ?? null)
-            && preg_match('/^[a-f0-9]{40}$/', $payload['candidate_sha']) === 1
-            && is_string($payload['handoff_path'] ?? null)
-            && str_starts_with($payload['handoff_path'], '.loop/')
-            && is_string($payload['handoff'] ?? null)
-            && trim($payload['handoff']) !== ''
-            && $artifactMatches;
     }
 }

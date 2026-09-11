@@ -387,6 +387,7 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         PreparedWorktree $worktree,
         string $issueKey,
         string $artifactSha,
+        string $expectedVerdict,
     ): VerifiedOrbitPlanningArtifact {
         $repository = realpath($config->repository);
         $root = realpath($config->worktreeRoot);
@@ -398,7 +399,8 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             || ! str_starts_with($path, $root.'/')
             || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
             || preg_match('/^[a-f0-9]{40}$/', $worktree->headSha) !== 1
-            || preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1) {
+            || preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1
+            || ! in_array($expectedVerdict, ['PENDING', 'PASS', 'FIX'], true)) {
             throw new OrbitRepositoryFailed('The Orbit planning artifact metadata is invalid.');
         }
 
@@ -461,8 +463,8 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         $contents = $plan->output();
         $lines = preg_split('/\R/', $contents) ?: [];
 
-        if ($plan->failed() || ! in_array('Review verdict: PENDING', $lines, true)) {
-            throw new OrbitRepositoryFailed('The saved Orbit planning artifact must have a PENDING review verdict.');
+        if ($plan->failed() || ! in_array("Review verdict: {$expectedVerdict}", $lines, true)) {
+            throw new OrbitRepositoryFailed("The saved Orbit planning artifact must have a {$expectedVerdict} review verdict.");
         }
 
         return new VerifiedOrbitPlanningArtifact($artifactSha, hash('sha256', $contents));
@@ -551,6 +553,7 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             new PreparedWorktree($path, $candidateSha),
             $snapshot->issueKey,
             $artifactSha,
+            'PENDING',
         );
 
         return new VerifiedOrbitPlanningOutcome(

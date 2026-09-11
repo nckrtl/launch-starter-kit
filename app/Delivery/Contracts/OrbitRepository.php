@@ -34,6 +34,7 @@ interface OrbitRepository
         PreparedWorktree $worktree,
         string $issueKey,
         string $artifactSha,
+        string $expectedVerdict,
     ): VerifiedOrbitPlanningArtifact;
 
     public function verifyPlanningOutcome(

@@ -114,6 +114,7 @@ final class PlanningDispatchRepository implements OrbitRepository
         PreparedWorktree $worktree,
         string $issueKey,
         string $artifactSha,
+        string $expectedVerdict,
     ): VerifiedOrbitPlanningArtifact {
         throw new LogicException('Not used by this test.');
     }
