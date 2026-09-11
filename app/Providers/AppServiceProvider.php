@@ -3,11 +3,13 @@
 namespace App\Providers;
 
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
 use App\Delivery\IssueProviders\SshOrbitIssueTransitioner;
 use App\Delivery\PullRequests\SshOrbitPullRequestPublisher;
@@ -29,7 +31,9 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitRepository::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitImplementationRepository::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitIssueProvider::class, SshOrbitIssueProvider::class);
+        $this->app->bind(OrbitActiveIssueProvider::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitIssueTransitioner::class, SshOrbitIssueTransitioner::class);
+        $this->app->bind(OrbitReviewIssueTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitPullRequestPublisher::class, SshOrbitPullRequestPublisher::class);
 
         $this->app->bind(HerdrRuntime::class, function (): SocketHerdrRuntime {

@@ -20,6 +20,7 @@ return [
             'tom' => '/Users/nckrtl/.hermes/profiles/tom',
         ],
         'tom_linear_viewer_id' => env('COMMANDER_HERMES_TOM_LINEAR_VIEWER_ID', '4fa61558-9052-45f7-8a7c-49e0b891d4bf'),
+        'nick_linear_user_id' => env('COMMANDER_HERMES_NICK_LINEAR_USER_ID', '691cb14c-60d5-415a-a5c7-a7c19fe83424'),
         'timeout' => (int) env('COMMANDER_HERMES_TIMEOUT', 5),
         'cache_seconds' => (int) env('COMMANDER_HERMES_CACHE_SECONDS', 15),
     ],

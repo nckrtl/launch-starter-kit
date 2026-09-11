@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Delivery\IssueProviders;
 
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
@@ -11,7 +12,7 @@ use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitIssueProvider implements OrbitIssueProvider
+final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
 {
     private const string QUERY = <<<'GRAPHQL'
 query LoopIssue($id: String!) {
@@ -33,6 +34,26 @@ GRAPHQL;
     public function __construct(private OrbitIssueSnapshotFactory $snapshots) {}
 
     public function fetch(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        [$response, $viewerId] = $this->request($issueId, $issueKey);
+
+        return $this->snapshots->make($response, $issueId, $issueKey, $viewerId);
+    }
+
+    public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        [$response, $viewerId] = $this->request($issueId, $issueKey);
+        $assigneeId = config('commander.hermes.nick_linear_user_id');
+
+        if (! is_string($assigneeId) || ! $this->isUuid($assigneeId)) {
+            throw new OrbitIssueProviderFailed('The Hermes Orbit active issue provider is not configured.');
+        }
+
+        return $this->snapshots->makeActive($response, $issueId, $issueKey, $viewerId, $assigneeId);
+    }
+
+    /** @return array{array<mixed, mixed>, string} */
+    private function request(string $issueId, string $issueKey): array
     {
         $target = config('commander.hermes.ssh_target');
         $profile = config('commander.hermes.profiles.tom');
@@ -71,7 +92,11 @@ GRAPHQL;
             throw new OrbitIssueProviderFailed('The Hermes Orbit issue provider returned invalid JSON.', 0, $exception);
         }
 
-        return $this->snapshots->make($response, $issueId, $issueKey, $viewerId);
+        if (! is_array($response)) {
+            throw new OrbitIssueProviderFailed('The Hermes Orbit issue provider returned invalid JSON.');
+        }
+
+        return [$response, $viewerId];
     }
 
     private function isUuid(string $value): bool

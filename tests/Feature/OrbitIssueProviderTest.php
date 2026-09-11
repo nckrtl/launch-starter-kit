@@ -1,5 +1,6 @@
 <?php
 
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
@@ -84,6 +85,7 @@ beforeEach(function () {
     config()->set('commander.hermes.ssh_target', 'tom@mini');
     config()->set('commander.hermes.profiles.tom', '/Users/tom/.hermes/profiles/tom');
     config()->set('commander.hermes.tom_linear_viewer_id', providerViewerId());
+    config()->set('commander.hermes.nick_linear_user_id', '691cb14c-60d5-415a-a5c7-a7c19fe83424');
 });
 
 it('fetches one normalized issue through the fixed read-only Hermes RPC boundary', function () {
@@ -224,6 +226,47 @@ it('requires Todo or In Progress state', function () {
 
     expect(fn () => app(SshOrbitIssueProvider::class)->fetch(providerIssueId(), 'ORB-234'))
         ->toThrow(OrbitIssueProviderFailed::class, 'The Orbit issue is not eligible');
+});
+
+it('reads an active In Review issue with the exact temporary PR-author assignment', function () {
+    fakeProviderResponse(providerResponse([
+        'state' => [
+            'id' => '66666666-7777-4888-8999-aaaaaaaaaaaa',
+            'name' => 'In Review',
+            'type' => 'started',
+        ],
+        'assignee' => ['id' => '691cb14c-60d5-415a-a5c7-a7c19fe83424'],
+    ]));
+
+    $snapshot = app(OrbitActiveIssueProvider::class)->fetchActive(providerIssueId(), 'ORB-234');
+
+    expect($snapshot->payload['state']['name'])->toBe('In Review')
+        ->and($snapshot->payload['assignee'])->toBe([
+            'id' => '691cb14c-60d5-415a-a5c7-a7c19fe83424',
+        ]);
+});
+
+it('keeps new-delivery issue reads restricted while active reads reject unexpected ownership', function () {
+    $inReview = [
+        'state' => [
+            'id' => '66666666-7777-4888-8999-aaaaaaaaaaaa',
+            'name' => 'In Review',
+            'type' => 'started',
+        ],
+        'assignee' => ['id' => '691cb14c-60d5-415a-a5c7-a7c19fe83424'],
+    ];
+    fakeProviderResponse(providerResponse($inReview));
+
+    expect(fn () => app(SshOrbitIssueProvider::class)->fetch(providerIssueId(), 'ORB-234'))
+        ->toThrow(OrbitIssueProviderFailed::class, 'not eligible');
+
+    fakeProviderResponse(providerResponse([
+        ...$inReview,
+        'assignee' => ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ]));
+
+    expect(fn () => app(OrbitActiveIssueProvider::class)->fetchActive(providerIssueId(), 'ORB-234'))
+        ->toThrow(OrbitIssueProviderFailed::class, 'active Orbit issue');
 });
 
 it('rejects a readiness hold', function () {

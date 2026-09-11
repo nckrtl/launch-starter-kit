@@ -1,13 +1,15 @@
 <?php
 
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
+use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use Illuminate\Support\Facades\Process;
 
-final class TransitionReadBackIssueProvider implements OrbitIssueProvider
+final class TransitionReadBackIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
 {
     /** @var list<array{issue_id: string, issue_key: string}> */
     public array $requests = [];
@@ -26,12 +28,18 @@ final class TransitionReadBackIssueProvider implements OrbitIssueProvider
 
         return $this->snapshot;
     }
+
+    public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        return $this->fetch($issueId, $issueKey);
+    }
 }
 
 beforeEach(function () {
     config()->set('commander.hermes.ssh_target', 'tom@mini');
     config()->set('commander.hermes.profiles.tom', '/Users/tom/.hermes/profiles/tom');
     config()->set('commander.hermes.tom_linear_viewer_id', transitionViewerId());
+    config()->set('commander.hermes.nick_linear_user_id', transitionNickId());
     $this->contractHash = str_repeat('a', 64);
 });
 
@@ -45,6 +53,11 @@ function transitionViewerId(): string
     return '4fa61558-9052-45f7-8a7c-49e0b891d4bf';
 }
 
+function transitionNickId(): string
+{
+    return '691cb14c-60d5-415a-a5c7-a7c19fe83424';
+}
+
 /** @param array<string, mixed> $overrides */
 function transitionSnapshot(string $state = 'Todo', ?string $contractHash = null, array $overrides = []): OrbitIssueSnapshot
 {
@@ -55,9 +68,23 @@ function transitionSnapshot(string $state = 'Todo', ?string $contractHash = null
         'url' => 'https://linear.app/orbit/issue/ORB-234',
         'description' => "## Outcome\n\nMove it.",
         'updatedAt' => '2026-09-11T10:00:00.000Z',
-        'state' => $state === 'In Progress'
-            ? ['id' => '44444444-5555-4666-8777-888888888888', 'name' => 'In Progress', 'type' => 'started']
-            : ['id' => '55555555-6666-4777-8888-999999999999', 'name' => 'Todo', 'type' => 'unstarted'],
+        'state' => match ($state) {
+            'In Progress' => [
+                'id' => '44444444-5555-4666-8777-888888888888',
+                'name' => 'In Progress',
+                'type' => 'started',
+            ],
+            'In Review' => [
+                'id' => '66666666-7777-4888-8999-aaaaaaaaaaaa',
+                'name' => 'In Review',
+                'type' => 'started',
+            ],
+            default => [
+                'id' => '55555555-6666-4777-8888-999999999999',
+                'name' => 'Todo',
+                'type' => 'unstarted',
+            ],
+        },
         'assignee' => null,
         'delegate' => ['id' => transitionViewerId()],
         'team' => [
@@ -65,6 +92,7 @@ function transitionSnapshot(string $state = 'Todo', ?string $contractHash = null
             'states' => ['nodes' => [
                 ['id' => '55555555-6666-4777-8888-999999999999', 'name' => 'Todo'],
                 ['id' => '44444444-5555-4666-8777-888888888888', 'name' => 'In Progress'],
+                ['id' => '66666666-7777-4888-8999-aaaaaaaaaaaa', 'name' => 'In Review'],
             ]],
         ],
         'labels' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
@@ -86,9 +114,110 @@ function bindTransitionReadBack(OrbitIssueSnapshot $snapshot): TransitionReadBac
 {
     $provider = new TransitionReadBackIssueProvider($snapshot);
     app()->instance(OrbitIssueProvider::class, $provider);
+    app()->instance(OrbitActiveIssueProvider::class, $provider);
 
     return $provider;
 }
+
+it('moves an active issue to In Review and clears the temporary Nick assignment', function () {
+    $current = transitionSnapshot('In Progress', overrides: [
+        'assignee' => ['id' => transitionNickId()],
+    ]);
+    $readBack = transitionSnapshot('In Review');
+    $provider = bindTransitionReadBack($readBack);
+    Process::fake(['*' => Process::result(output: '{"data":{"issueUpdate":{"success":true}}}')])
+        ->preventStrayProcesses();
+
+    $result = app(OrbitReviewIssueTransitioner::class)->transitionToInReview(
+        $current,
+        $this->contractHash,
+    );
+
+    expect($result)->toBe($readBack)
+        ->and($provider->requests)->toHaveCount(1);
+
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input) && ($input['variables'] ?? null) === [
+            'id' => transitionIssueId(),
+            'input' => [
+                'stateId' => '66666666-7777-4888-8999-aaaaaaaaaaaa',
+                'assigneeId' => null,
+            ],
+        ];
+    });
+});
+
+it('reconciles a lost In Review mutation response through exact active read-back', function () {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review'));
+    Process::fake(fn () => throw new RuntimeException('SSH response lost'))
+        ->preventStrayProcesses();
+
+    $result = app(OrbitReviewIssueTransitioner::class)->transitionToInReview(
+        transitionSnapshot('In Progress'),
+        $this->contractHash,
+    );
+
+    expect($result->payload['state']['name'])->toBe('In Review')
+        ->and($result->payload['assignee'])->toBeNull()
+        ->and($provider->requests)->toHaveCount(1);
+});
+
+it('repairs a Nick assignment without repeating an already completed In Review transition', function () {
+    $current = transitionSnapshot('In Review', overrides: [
+        'assignee' => ['id' => transitionNickId()],
+    ]);
+    bindTransitionReadBack(transitionSnapshot('In Review'));
+    Process::fake(['*' => Process::result(output: '{"data":{"issueUpdate":{"success":true}}}')])
+        ->preventStrayProcesses();
+
+    app(OrbitReviewIssueTransitioner::class)->transitionToInReview($current, $this->contractHash);
+
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input)
+            && ($input['variables']['input']['stateId'] ?? null) === '66666666-7777-4888-8999-aaaaaaaaaaaa'
+            && array_key_exists('assigneeId', $input['variables']['input'] ?? [])
+            && $input['variables']['input']['assigneeId'] === null;
+    });
+});
+
+it('does not mutate an issue already in the exact In Review state and ownership', function () {
+    $current = transitionSnapshot('In Review');
+    $provider = bindTransitionReadBack($current);
+    Process::fake()->preventStrayProcesses();
+
+    $result = app(OrbitReviewIssueTransitioner::class)->transitionToInReview(
+        $current,
+        $this->contractHash,
+    );
+
+    expect($result)->toBe($current)
+        ->and($provider->requests)->toHaveCount(1);
+    Process::assertNothingRan();
+});
+
+it('refuses unexpected active issue ownership before an In Review mutation', function () {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review'));
+    Process::fake()->preventStrayProcesses();
+    $current = transitionSnapshot('In Progress', overrides: [
+        'assignee' => ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ]);
+
+    expect(fn () => app(OrbitReviewIssueTransitioner::class)->transitionToInReview(
+        $current,
+        $this->contractHash,
+    ))->toThrow(OrbitIssueTransitionFailed::class, 'input or Hermes configuration is invalid');
+
+    expect($provider->requests)->toBe([]);
+    Process::assertNothingRan();
+});
 
 it('transitions Todo to the exact In Progress state through Hermes and verifies Linear read-back', function () {
     $current = transitionSnapshot();

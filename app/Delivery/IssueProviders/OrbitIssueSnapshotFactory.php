@@ -40,6 +40,38 @@ final readonly class OrbitIssueSnapshotFactory
         string $expectedIssueKey,
         string $expectedViewerId,
     ): OrbitIssueSnapshot {
+        return $this->makeSnapshot(
+            $response,
+            $expectedIssueId,
+            $expectedIssueKey,
+            $expectedViewerId,
+            null,
+        );
+    }
+
+    public function makeActive(
+        mixed $response,
+        string $expectedIssueId,
+        string $expectedIssueKey,
+        string $expectedViewerId,
+        string $expectedAssigneeId,
+    ): OrbitIssueSnapshot {
+        return $this->makeSnapshot(
+            $response,
+            $expectedIssueId,
+            $expectedIssueKey,
+            $expectedViewerId,
+            $expectedAssigneeId,
+        );
+    }
+
+    private function makeSnapshot(
+        mixed $response,
+        string $expectedIssueId,
+        string $expectedIssueKey,
+        string $expectedViewerId,
+        ?string $expectedAssigneeId,
+    ): OrbitIssueSnapshot {
         $root = $this->map($response);
         $data = $this->map($root['data'] ?? null);
         $viewer = $this->map($data['viewer'] ?? null);
@@ -50,15 +82,24 @@ final readonly class OrbitIssueSnapshotFactory
             || ! $this->isUuid($expectedIssueId)
             || preg_match('/^ORB-[0-9]+$/', $expectedIssueKey) !== 1
             || ! $this->isUuid($expectedViewerId)
+            || ($expectedAssigneeId !== null && ! $this->isUuid($expectedAssigneeId))
             || $viewerId !== $expectedViewerId
             || $issue['id'] !== $expectedIssueId
             || $issue['identifier'] !== $expectedIssueKey) {
             throw new OrbitIssueProviderFailed('The Linear issue response does not match the requested Orbit issue.');
         }
 
-        if ($issue['assignee'] !== null
+        $active = $expectedAssigneeId !== null;
+        $validAssignee = $issue['assignee'] === null
+            || ($active && $issue['assignee']['id'] === $expectedAssigneeId);
+        $validState = $active
+            ? in_array($issue['state']['name'], ['In Progress', 'In Review'], true)
+                && $issue['state']['type'] === 'started'
+            : in_array($issue['state']['name'], ['Todo', 'In Progress'], true);
+
+        if (! $validAssignee
             || ($issue['delegate']['id'] ?? null) !== $expectedViewerId
-            || ! in_array($issue['state']['name'], ['Todo', 'In Progress'], true)
+            || ! $validState
             || ($issue['description'] !== null && str_contains($issue['description'], '## Readiness'))
             || $issue['children']['nodes'] !== []
             || $issue['labels']['pageInfo']['hasNextPage']
@@ -67,7 +108,9 @@ final readonly class OrbitIssueSnapshotFactory
             || $issue['inverseRelations']['pageInfo']['hasNextPage']
             || $this->hasUnfinishedBlocker($issue['inverseRelations']['nodes'])) {
             throw new OrbitIssueProviderFailed(
-                'The Orbit issue is not eligible: it must be solely delegated to Tom and be in Todo or In Progress without readiness, children, or unfinished blockers.',
+                $active
+                    ? 'The active Orbit issue must remain delegated to Tom in In Progress or In Review with no unexpected assignee or contract hold.'
+                    : 'The Orbit issue is not eligible: it must be solely delegated to Tom and be in Todo or In Progress without readiness, children, or unfinished blockers.',
             );
         }
 
