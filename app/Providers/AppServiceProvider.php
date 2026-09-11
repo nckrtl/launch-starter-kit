@@ -12,6 +12,7 @@ use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitMergeLineageVerifier;
 use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
+use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
@@ -47,6 +48,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitMainCorrectnessInspector::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitMergeLineageVerifier::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitPrimaryCheckoutReconciler::class, ProcessOrbitRepository::class);
+        $this->app->bind(OrbitProofTopologyCloser::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitReviewIssueTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitPullRequestInspector::class, SshOrbitPullRequestPublisher::class);
         $this->app->bind(OrbitPullRequestLandingGateway::class, SshOrbitPullRequestLandingGateway::class);

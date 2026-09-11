@@ -33,6 +33,7 @@ final readonly class ResolveOrbitDeliveryPreparation
         $input = $phase?->input;
         $snapshot = is_array($input) ? ($input['issue_snapshot'] ?? null) : null;
         $candidate = is_array($input) ? ($input['candidate_check'] ?? null) : null;
+        $flow = is_array($input) ? ($input['flow'] ?? null) : null;
         $worktreePath = $delivery->worktree_path;
         $candidateSha = $delivery->candidate_sha;
         $issueId = $delivery->external_issue_id;
@@ -50,6 +51,8 @@ final readonly class ResolveOrbitDeliveryPreparation
         if ($phase === null || ! $validWorkflow || $phase->attempt !== 1
             || ! is_array($snapshot) || array_is_list($snapshot)
             || ! is_array($candidate) || array_is_list($candidate)
+            || ($delivery->workflow_type === OrbitFeatureWorkflow::TYPE
+                && (! is_string($flow) || ! in_array($flow, ['discovery', 'proof'], true)))
             || ! is_string($worktreePath) || ! is_string($candidateSha)
             || $delivery->external_issue_provider !== OrbitIssueSnapshot::PROVIDER
             || ! is_string($issueKey)) {
@@ -85,6 +88,7 @@ final readonly class ResolveOrbitDeliveryPreparation
             new PreparedWorktree($worktreePath, $candidateCheck->candidateSha),
             $preparedSnapshot,
             $candidateCheck,
+            is_string($flow) ? $flow : 'discovery',
         );
     }
 

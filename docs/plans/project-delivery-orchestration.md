@@ -41,7 +41,12 @@ Commander now owns the durable Orbit path from verified preparation through
 planning, independent plan review and correction, implementation and correction,
 pull request publication and review, deterministic merge, merge-lineage
 verification, primary checkout reconciliation, cache refresh enqueueing, and
-Herdr worktree-workspace shutdown.
+Herdr worktree-workspace shutdown. The landing ledger then records an explicit
+proof-closeout skip for discovery deliveries. Its proof branch calls Orbit's
+trusted `bin/e2e-topology closeout` contract with the retained candidate,
+artifact, merge, and reconciled-main SHAs, keeps the merge reservation during
+retryable failures, and accepts completion only from an exact structured
+receipt.
 
 Workspace shutdown is a persistent landing stage. It targets only the workspace
 ID recorded by the delivery, accepts only ledger-owned idle or done agents,
@@ -50,11 +55,15 @@ checks that no unrelated Herdr workspace, agent, or pane disappeared. It support
 the installed protocol 20 close request and sends the explicit `close_group:
 false` guard on protocol 22 and newer.
 
-The remaining landing slices are proof-topology closeout where required,
-repository-owned worktree removal and branch absence verification, Linear `Done`
-transition with ownership clearing, and the final Commander `Completed`
-transition. The normal `bin/loop ISSUE` entry point still invokes the legacy
-controller; route it through Commander only after those closeout stages pass.
+Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
+repository checks still support only discovery. Before proof is enabled, move
+the potentially hour-long topology operation out of the 540-second landing job
+envelope and bind every prompt and repository check to the delivery's immutable
+flow. The remaining discovery landing slices are repository-owned worktree
+removal and branch absence verification, Linear `Done` transition with
+ownership clearing, and the final Commander `Completed` transition. The normal
+`bin/loop ISSUE` entry point still invokes the legacy controller; route it
+through Commander only after those closeout stages pass.
 
 ## Ownership boundaries
 

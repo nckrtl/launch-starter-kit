@@ -9,12 +9,14 @@ use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitMergeLineageVerifier;
 use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
+use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\OrbitProofCloseout;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
@@ -30,7 +32,7 @@ use Illuminate\Support\Str;
 use JsonException;
 use RuntimeException;
 
-final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitRepository
+final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -249,6 +251,152 @@ final readonly class ProcessOrbitRepository implements OrbitImplementationReposi
             flock($handle, LOCK_UN);
             fclose($handle);
         }
+    }
+
+    public function closeProofTopology(
+        OrbitProjectConfig $config,
+        string $worktree,
+        string $issueKey,
+        string $candidateSha,
+        string $artifactSha,
+        string $mergeCommitSha,
+        string $mainSha,
+    ): OrbitProofCloseout {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree);
+        $common = $repository === false ? false : realpath($repository.'/.git');
+        $scriptPath = $repository === false ? '' : $repository.'/bin/e2e-topology';
+        $script = $repository === false ? false : realpath($scriptPath);
+
+        if ($repository === false || $repository !== $config->repository
+            || $root === false || $root !== $config->worktreeRoot
+            || $path === false || $path !== $worktree
+            || $path !== $root.'/'.Str::lower($issueKey)
+            || $common === false || ! is_dir($common) || is_link($repository.'/.git')
+            || $script === false || $script !== $scriptPath
+            || is_link($scriptPath) || ! is_executable($script)
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $mergeCommitSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $mainSha) !== 1) {
+            throw new OrbitRepositoryFailed('The configured Orbit proof closeout adapter is unavailable.');
+        }
+
+        try {
+            $worktreeCommon = Process::path($path)->timeout(10)->run([
+                'git', 'rev-parse', '--path-format=absolute', '--git-common-dir',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit proof worktree could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        $resolvedWorktreeCommon = $worktreeCommon->failed()
+            ? false
+            : realpath(trim($worktreeCommon->output()));
+
+        if ($resolvedWorktreeCommon === false || $resolvedWorktreeCommon !== $common) {
+            throw new OrbitRepositoryFailed('The Orbit proof worktree no longer belongs to the configured repository.');
+        }
+
+        try {
+            $result = Process::path($repository)->timeout(480)->run([
+                $script,
+                'closeout',
+                $issueKey,
+                '--worktree='.$path,
+                '--candidate='.$candidateSha,
+                '--artifact='.$artifactSha,
+                '--merge='.$mergeCommitSha,
+                '--main-sha='.$mainSha,
+                '--json',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit proof closeout adapter could not run.',
+                previous: $exception,
+            );
+        }
+
+        try {
+            $evidence = json_decode($result->output(), true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed(
+                'Orbit proof closeout failed: '.$details,
+                previous: $exception,
+            );
+        }
+
+        if (! is_array($evidence) || array_is_list($evidence)
+            || array_keys($evidence) !== [
+                'schema',
+                'state',
+                'issue',
+                'attempt_id',
+                'candidate_sha',
+                'artifact_sha',
+                'merge_sha',
+                'main_sha',
+                'generation_id',
+                'error',
+                'recorded_at',
+            ]
+            || ($evidence['schema'] ?? null) !== OrbitProofCloseout::SCHEMA
+            || ! is_string($evidence['state'])
+            || ! is_string($evidence['issue'])
+            || ! is_string($evidence['attempt_id'])
+            || ! is_string($evidence['candidate_sha'])
+            || ! is_string($evidence['artifact_sha'])
+            || ! is_string($evidence['merge_sha'])
+            || ! is_string($evidence['main_sha'])
+            || $evidence['generation_id'] !== null && ! is_string($evidence['generation_id'])
+            || $evidence['error'] !== null && ! is_string($evidence['error'])
+            || ! is_string($evidence['recorded_at'])) {
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit proof closeout returned incomplete evidence: '.$details);
+        }
+
+        try {
+            $closeout = new OrbitProofCloseout(
+                state: $evidence['state'],
+                issueKey: $evidence['issue'],
+                attemptId: $evidence['attempt_id'],
+                candidateSha: $evidence['candidate_sha'],
+                artifactSha: $evidence['artifact_sha'],
+                mergeCommitSha: $evidence['merge_sha'],
+                mainSha: $evidence['main_sha'],
+                generationId: $evidence['generation_id'],
+                error: $evidence['error'],
+                recordedAt: $evidence['recorded_at'],
+            );
+        } catch (\InvalidArgumentException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit proof closeout adapter returned invalid evidence.',
+                previous: $exception,
+            );
+        }
+
+        if ($closeout->issueKey !== $issueKey
+            || $closeout->candidateSha !== $candidateSha
+            || $closeout->artifactSha !== $artifactSha
+            || $closeout->mergeCommitSha !== $mergeCommitSha
+            || $closeout->mainSha !== $mainSha
+            || $result->successful() !== $closeout->complete()) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit proof closeout adapter returned inconsistent evidence.',
+            );
+        }
+
+        return $closeout;
     }
 
     public function request(string $repository): RequestedOrbitMainCacheRefresh

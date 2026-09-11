@@ -65,7 +65,7 @@ final readonly class StartOrbitDelivery
             throw new InvalidArgumentException('The prepared Orbit delivery inputs are inconsistent.');
         }
 
-        return DB::transaction(function () use ($project, $verifiedIssue, $issueSnapshot, $worktreePath, $candidateCheck): Delivery {
+        return DB::transaction(function () use ($project, $verifiedIssue, $issueSnapshot, $worktreePath, $candidateCheck, $config): Delivery {
             $delivery = Delivery::query()->create([
                 'project_orchestration_id' => $project->getKey(),
                 'external_issue_provider' => $issueSnapshot->provider,
@@ -86,6 +86,7 @@ final readonly class StartOrbitDelivery
                 'attempt' => 1,
                 'status' => PhaseRunStatus::Pending,
                 'input' => [
+                    'flow' => $config->defaultFlow,
                     'issue_snapshot' => [
                         'schema' => $issueSnapshot->schema,
                         'provider' => $issueSnapshot->provider,

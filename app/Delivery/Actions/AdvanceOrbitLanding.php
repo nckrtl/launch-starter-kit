@@ -10,6 +10,7 @@ use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitMergeLineageVerifier;
 use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
+use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\ApprovedOrbitPullRequest;
@@ -19,6 +20,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitLandingReservation;
 use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\OrbitProofCloseout;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitMergeLineage;
@@ -54,6 +56,7 @@ final readonly class AdvanceOrbitLanding
         private OrbitPullRequestLandingGateway $pullRequests,
         private OrbitMergeLineageVerifier $merges,
         private OrbitPrimaryCheckoutReconciler $primaryCheckout,
+        private OrbitProofTopologyCloser $proofTopologies,
         private OrbitPullRequestReviewReceiptValidator $reviewReceipts,
         private OrbitPullRequestReviewSourceValidator $sources,
         private QueueOrbitMainCacheRefresh $cacheRefresh,
@@ -293,6 +296,7 @@ final readonly class AdvanceOrbitLanding
                 $phase,
                 $published,
                 $implementation->payload['flow'] ?? null,
+                $implementation->payload['artifact_sha'] ?? null,
             )) {
             throw new OrbitLandingAdvancementFailed(
                 'The retained Orbit landing intent is inconsistent.',
@@ -308,6 +312,7 @@ final readonly class AdvanceOrbitLanding
         PhaseRun $phase,
         array $published,
         mixed $implementationFlow,
+        mixed $artifactSha,
     ): bool {
         if ($delivery->status === DeliveryStatus::ReadyToMerge) {
             return $phase->status === PhaseRunStatus::Pending
@@ -331,6 +336,7 @@ final readonly class AdvanceOrbitLanding
                 'merge_verification',
                 'repository_reconciliation',
                 'workspace_shutdown',
+                'proof_closeout',
                 'reservation_release',
             ], true)
             && $phase->started_at !== null && $phase->finished_at === null;
@@ -348,6 +354,7 @@ final readonly class AdvanceOrbitLanding
                 $published,
                 $stage,
                 $implementationFlow,
+                $artifactSha,
             );
     }
 
@@ -415,18 +422,22 @@ final readonly class AdvanceOrbitLanding
         array $published,
         string $stage,
         string $implementationFlow,
+        mixed $artifactSha,
     ): bool {
         $merge = is_array($output) ? ($output['merge'] ?? null) : null;
         $verification = is_array($output) ? ($output['merge_verification'] ?? null) : null;
         $reconciliation = is_array($output) ? ($output['repository_reconciliation'] ?? null) : null;
         $workspaceShutdown = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
+        $proofCloseout = is_array($output) ? ($output['proof_closeout'] ?? null) : null;
         $preMerge = is_array($output) ? $output : null;
+        $normalizedReconciliation = $this->associativeArray($reconciliation);
 
         if (! is_array($merge) || array_is_list($merge) || ! is_array($preMerge)
             || ! in_array($stage, [
                 'merge_verification',
                 'repository_reconciliation',
                 'workspace_shutdown',
+                'proof_closeout',
                 'reservation_release',
                 'completed',
             ], true)) {
@@ -438,11 +449,13 @@ final readonly class AdvanceOrbitLanding
             $preMerge['merge_verification'],
             $preMerge['repository_reconciliation'],
             $preMerge['workspace_shutdown'],
+            $preMerge['proof_closeout'],
         );
 
         $requiresVerification = $stage !== 'merge_verification';
-        $requiresReconciliation = in_array($stage, ['workspace_shutdown', 'reservation_release', 'completed'], true);
-        $requiresClosedWorkspace = in_array($stage, ['reservation_release', 'completed'], true);
+        $requiresReconciliation = in_array($stage, ['workspace_shutdown', 'proof_closeout', 'reservation_release', 'completed'], true);
+        $requiresClosedWorkspace = in_array($stage, ['proof_closeout', 'reservation_release', 'completed'], true);
+        $requiresProofCloseout = in_array($stage, ['reservation_release', 'completed'], true);
 
         return $this->matchesPreMergeOutput($delivery, $preMerge, $published)
             && $merge === [
@@ -457,13 +470,23 @@ final readonly class AdvanceOrbitLanding
                 ? $this->matchesMergeVerification($merge, $verification, $implementationFlow)
                 : $verification === null)
             && ($requiresReconciliation
-                ? $this->matchesRepositoryReconciliation($preMerge, $merge, $reconciliation)
-                : $reconciliation === null)
+                ? $this->matchesRepositoryReconciliation($preMerge, $merge, $normalizedReconciliation)
+                : $normalizedReconciliation === null)
             && ($requiresClosedWorkspace
                 ? $this->matchesClosedWorkspace($delivery, $workspaceShutdown)
                 : ($stage === 'workspace_shutdown'
                     ? $workspaceShutdown === null || is_array($workspaceShutdown)
-                    : $workspaceShutdown === null));
+                    : $workspaceShutdown === null))
+            && ($requiresProofCloseout
+                ? $this->matchesProofCloseout(
+                    $delivery,
+                    $merge,
+                    $normalizedReconciliation,
+                    $proofCloseout,
+                    $implementationFlow,
+                    $artifactSha,
+                )
+                : $proofCloseout === null);
     }
 
     /** @param array<string, mixed> $merge */
@@ -522,6 +545,66 @@ final readonly class AdvanceOrbitLanding
             && ($closed['worktree_path'] ?? null) === $delivery->worktree_path
             && ($closed['owned_agent_names'] ?? null) === $shutdown['owned_agent_names']
             && is_string($closed['verified_at'] ?? null);
+    }
+
+    /**
+     * @param  array<string, mixed>  $merge
+     * @param  array<string, mixed>|null  $reconciliation
+     */
+    private function matchesProofCloseout(
+        Delivery $delivery,
+        array $merge,
+        ?array $reconciliation,
+        mixed $closeout,
+        string $implementationFlow,
+        mixed $artifactSha,
+    ): bool {
+        if ($implementationFlow === 'discovery') {
+            return $closeout === [
+                'schema' => 1,
+                'flow' => 'discovery',
+                'required' => false,
+            ];
+        }
+
+        $record = is_array($closeout) ? ($closeout['record'] ?? null) : null;
+
+        return $implementationFlow === 'proof'
+            && is_string($artifactSha)
+            && preg_match('/^[a-f0-9]{40}$/', $artifactSha) === 1
+            && is_array($closeout) && ! array_is_list($closeout)
+            && count($closeout) === 4
+            && ($closeout['schema'] ?? null) === 1
+            && ($closeout['flow'] ?? null) === 'proof'
+            && ($closeout['required'] ?? null) === true
+            && is_array($record) && ! array_is_list($record)
+            && array_keys($record) === [
+                'schema',
+                'state',
+                'issue',
+                'attempt_id',
+                'candidate_sha',
+                'artifact_sha',
+                'merge_sha',
+                'main_sha',
+                'generation_id',
+                'error',
+                'recorded_at',
+            ]
+            && ($record['schema'] ?? null) === OrbitProofCloseout::SCHEMA
+            && ($record['state'] ?? null) === 'complete'
+            && ($record['issue'] ?? null) === $delivery->external_issue_key
+            && is_string($record['attempt_id'] ?? null)
+            && preg_match('/^[a-f0-9]{32}$/', $record['attempt_id']) === 1
+            && ($record['candidate_sha'] ?? null) === ($merge['candidate_sha'] ?? null)
+            && ($record['artifact_sha'] ?? null) === $artifactSha
+            && ($record['merge_sha'] ?? null) === ($merge['merge_commit_sha'] ?? null)
+            && ($record['main_sha'] ?? null) === ($reconciliation['main_sha'] ?? null)
+            && is_string($record['generation_id'] ?? null)
+            && preg_match('/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/', $record['generation_id']) === 1
+            && ($record['error'] ?? null) === null
+            && is_string($record['recorded_at'] ?? null)
+            && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $record['recorded_at']) === 1;
     }
 
     private function verifyImplementation(
@@ -804,6 +887,16 @@ final readonly class AdvanceOrbitLanding
             $this->recordWorkspaceShutdown($deliveryId, $phaseId);
         }
 
+        $phase = PhaseRun::query()->findOrFail($phaseId);
+
+        if ($phase->current_block === 'proof_closeout') {
+            $delay = $this->closeProofTopology($config, $deliveryId, $phaseId);
+
+            if ($delay !== null) {
+                return $delay;
+            }
+        }
+
         $this->releaseAndFinalize(
             $this->delivery($deliveryId),
             PhaseRun::query()->findOrFail($phaseId),
@@ -820,6 +913,7 @@ final readonly class AdvanceOrbitLanding
         if (in_array($phase->current_block, [
             'repository_reconciliation',
             'workspace_shutdown',
+            'proof_closeout',
             'reservation_release',
         ], true)) {
             return;
@@ -896,7 +990,7 @@ final readonly class AdvanceOrbitLanding
     ): void {
         $phase = PhaseRun::query()->findOrFail($phaseId);
 
-        if (in_array($phase->current_block, ['workspace_shutdown', 'reservation_release'], true)) {
+        if (in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'reservation_release'], true)) {
             return;
         }
 
@@ -934,7 +1028,7 @@ final readonly class AdvanceOrbitLanding
                 'origin_main_sha' => $reconciled->originMainSha,
             ];
 
-            if ($phase !== null && in_array($phase->current_block, ['workspace_shutdown', 'reservation_release'], true)
+            if ($phase !== null && in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'reservation_release'], true)
                 && is_array($output) && ($output['repository_reconciliation'] ?? null) === $evidence) {
                 return;
             }
@@ -967,7 +1061,7 @@ final readonly class AdvanceOrbitLanding
             $output = $phase?->output;
             $shutdown = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
 
-            if ($phase !== null && $phase->current_block === 'reservation_release'
+            if ($phase !== null && in_array($phase->current_block, ['proof_closeout', 'reservation_release'], true)
                 && $this->matchesClosedWorkspace($delivery, $shutdown)) {
                 return;
             }
@@ -979,7 +1073,7 @@ final readonly class AdvanceOrbitLanding
                 );
             }
 
-            $phase->current_block = 'reservation_release';
+            $phase->current_block = 'proof_closeout';
             $phase->save();
             $delivery->failure_details = null;
             $delivery->save();
@@ -1006,6 +1100,193 @@ final readonly class AdvanceOrbitLanding
             ];
             $delivery->save();
         });
+    }
+
+    private function closeProofTopology(
+        OrbitProjectConfig $config,
+        int $deliveryId,
+        int $phaseId,
+    ): ?int {
+        $delivery = $this->delivery($deliveryId);
+        $intent = $this->landingIntent($delivery, $phaseId);
+        $phase = $intent[0] ?? null;
+        $implementation = $intent[2] ?? null;
+        $output = $phase?->output;
+        $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+        $verification = $this->associativeArray(
+            is_array($output) ? ($output['merge_verification'] ?? null) : null,
+        );
+        $reconciliation = $this->associativeArray(
+            is_array($output) ? ($output['repository_reconciliation'] ?? null) : null,
+        );
+        $flow = $verification['flow'] ?? null;
+
+        if ($phase === null || $phase->current_block !== 'proof_closeout'
+            || $implementation === null || $merge === null || $verification === null
+            || $reconciliation === null || ! in_array($flow, ['discovery', 'proof'], true)
+            || ($implementation->payload['flow'] ?? null) !== $flow) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit proof closeout cannot run from its retained landing ledger.',
+            );
+        }
+
+        if ($flow === 'discovery') {
+            $this->recordProofCloseout($deliveryId, $phaseId, [
+                'schema' => 1,
+                'flow' => 'discovery',
+                'required' => false,
+            ]);
+
+            return null;
+        }
+
+        $worktree = $delivery->worktree_path;
+        $issueKey = $delivery->external_issue_key;
+
+        if (! is_string($worktree) || ! is_string($issueKey)) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit proof closeout has invalid delivery bindings.',
+            );
+        }
+
+        $closeout = $this->proofTopologies->closeProofTopology(
+            $config,
+            $worktree,
+            $issueKey,
+            $this->sha($merge, 'candidate_sha'),
+            $this->sha($implementation->payload, 'artifact_sha'),
+            $this->sha($merge, 'merge_commit_sha'),
+            $this->sha($reconciliation, 'main_sha'),
+        );
+
+        if (! $closeout->complete()) {
+            $this->markProofCloseoutWait($deliveryId, $phaseId, $closeout);
+
+            return self::MAINTENANCE_RETRY_SECONDS;
+        }
+
+        $this->recordProofCloseout($deliveryId, $phaseId, [
+            'schema' => 1,
+            'flow' => 'proof',
+            'required' => true,
+            'record' => $closeout->toArray(),
+        ]);
+
+        return null;
+    }
+
+    /** @param array<string, mixed> $evidence */
+    private function recordProofCloseout(int $deliveryId, int $phaseId, array $evidence): void
+    {
+        DB::transaction(function () use ($deliveryId, $phaseId, $evidence): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $intent = $this->landingIntent($delivery, $phaseId);
+            $phase = $intent[0] ?? null;
+            $implementation = $intent[2] ?? null;
+            $output = $phase?->output;
+            $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+            $reconciliation = $this->associativeArray(
+                is_array($output) ? ($output['repository_reconciliation'] ?? null) : null,
+            );
+            $verification = $this->associativeArray(
+                is_array($output) ? ($output['merge_verification'] ?? null) : null,
+            );
+            $flow = $verification['flow'] ?? null;
+            $artifactSha = $implementation?->payload['artifact_sha'] ?? null;
+
+            $retryRecord = $this->associativeArray($evidence['record'] ?? null);
+
+            if ($retryRecord !== null) {
+                $this->assertProofCloseoutRetryIdentity($delivery, $phase, $retryRecord);
+            }
+
+            if ($phase !== null && $phase->current_block === 'reservation_release'
+                && is_array($output) && ($output['proof_closeout'] ?? null) === $evidence) {
+                return;
+            }
+
+            if ($phase === null || $phase->current_block !== 'proof_closeout'
+                || $implementation === null || ! is_array($output)
+                || $merge === null || $reconciliation === null || ! is_string($flow)
+                || ! $this->matchesProofCloseout(
+                    $delivery,
+                    $merge,
+                    $reconciliation,
+                    $evidence,
+                    $flow,
+                    $artifactSha,
+                )
+                || array_key_exists('proof_closeout', $output)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit proof closeout no longer matches its landing ledger.',
+                );
+            }
+
+            $phase->current_block = 'reservation_release';
+            $phase->output = [...$output, 'proof_closeout' => $evidence];
+            $phase->save();
+            $delivery->failure_details = null;
+            $delivery->save();
+        });
+    }
+
+    private function markProofCloseoutWait(
+        int $deliveryId,
+        int $phaseId,
+        OrbitProofCloseout $closeout,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $phaseId, $closeout): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $intent = $this->landingIntent($delivery, $phaseId);
+            $phase = $intent[0] ?? null;
+
+            if ($phase === null || $phase->current_block !== 'proof_closeout') {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit landing ledger changed while recording its proof closeout wait.',
+                );
+            }
+
+            $this->assertProofCloseoutRetryIdentity($delivery, $phase, $closeout->toArray());
+
+            $delivery->failure_details = [
+                'code' => 'landing_proof_closeout_wait',
+                'phase_run_id' => $phase->id,
+                'record' => $closeout->toArray(),
+            ];
+            $delivery->save();
+        });
+    }
+
+    /** @param array<string, mixed> $record */
+    private function assertProofCloseoutRetryIdentity(
+        Delivery $delivery,
+        ?PhaseRun $phase,
+        array $record,
+    ): void {
+        $failure = $delivery->failure_details;
+
+        if (! is_array($failure) || ($failure['code'] ?? null) !== 'landing_proof_closeout_wait') {
+            return;
+        }
+
+        $retained = $failure['record'] ?? null;
+        $identity = [
+            'issue',
+            'attempt_id',
+            'candidate_sha',
+            'artifact_sha',
+            'merge_sha',
+        ];
+
+        if ($phase === null || ($failure['phase_run_id'] ?? null) !== $phase->id
+            || ! is_array($retained) || array_is_list($retained)
+            || collect($identity)->contains(
+                static fn (string $key): bool => ($retained[$key] ?? null) !== ($record[$key] ?? null),
+            )) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit proof closeout retry identity changed.',
+            );
+        }
     }
 
     private function resumeMerge(

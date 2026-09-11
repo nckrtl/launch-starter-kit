@@ -76,6 +76,7 @@ it('records a live Orbit delivery and exact planning preparation without dispatc
         ->and($phase->attempt)->toBe(1)
         ->and($phase->status)->toBe(PhaseRunStatus::Pending)
         ->and($phase->input)->toBe([
+            'flow' => 'discovery',
             'issue_snapshot' => [
                 'schema' => $this->issue->snapshot->schema,
                 'provider' => $this->issue->snapshot->provider,
@@ -131,6 +132,10 @@ it('rejects an ineligible project or worktree binding before writing the live le
         $this->project->update(['state' => ProjectOrchestrationState::Paused]);
     } elseif ($case === 'config type') {
         $this->project->forceFill(['config' => ['type' => 'different']])->save();
+    } elseif ($case === 'proof flow') {
+        $config = $this->project->config;
+        $config['defaultFlow'] = 'proof';
+        $this->project->forceFill(['config' => $config])->save();
     } else {
         $config = $this->project->config;
         $config['worktreeRoot'] = '/fast/worktrees/different';
@@ -148,4 +153,4 @@ it('rejects an ineligible project or worktree binding before writing the live le
         ->and(PhaseRun::count())->toBe(0)
         ->and(AgentDispatch::count())->toBe(0);
     Queue::assertNothingPushed();
-})->with(['paused', 'config type', 'worktree root']);
+})->with(['paused', 'config type', 'proof flow', 'worktree root']);

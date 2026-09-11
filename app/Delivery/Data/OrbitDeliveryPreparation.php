@@ -10,5 +10,6 @@ final readonly class OrbitDeliveryPreparation
         public PreparedWorktree $worktree,
         public PreparedIssueSnapshot $snapshot,
         public CandidateCheck $candidate,
+        public string $flow,
     ) {}
 }

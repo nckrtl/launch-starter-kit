@@ -90,6 +90,7 @@ final readonly class QueueOrbitMainCacheRefresh
                 && ! in_array($phase->current_block, [
                     'repository_reconciliation',
                     'workspace_shutdown',
+                    'proof_closeout',
                     'reservation_release',
                 ], true))
             || ($phase->status === PhaseRunStatus::Completed

@@ -360,11 +360,11 @@ final readonly class OrbitImplementationReceiptValidator
             && str_starts_with($payload['handoff_path'], '.loop/')
             && is_string($payload['handoff'] ?? null)
             && trim($payload['handoff']) !== ''
-            && $this->matchesEvidence($payload);
+            && $this->matchesEvidence($delivery, $payload);
     }
 
     /** @param array<string, mixed> $payload */
-    private function matchesEvidence(array $payload): bool
+    private function matchesEvidence(Delivery $delivery, array $payload): bool
     {
         if (($payload['result'] ?? null) === 'blocked') {
             return ($payload['artifact_sha'] ?? null) === null
@@ -375,7 +375,16 @@ final readonly class OrbitImplementationReceiptValidator
                 && ($payload['flow'] ?? null) === null;
         }
 
-        return is_string($payload['artifact_sha'] ?? null)
+        $planning = $delivery->phaseRuns()
+            ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+            ->where('attempt', 1)
+            ->first();
+        $input = $planning?->input;
+        $flow = is_array($input) ? ($input['flow'] ?? null) : null;
+
+        return is_string($flow)
+            && in_array($flow, ['discovery', 'proof'], true)
+            && is_string($payload['artifact_sha'] ?? null)
             && preg_match('/^[a-f0-9]{40}$/', $payload['artifact_sha']) === 1
             && is_string($payload['gate_receipt_path'] ?? null)
             && trim($payload['gate_receipt_path']) !== ''
@@ -385,7 +394,7 @@ final readonly class OrbitImplementationReceiptValidator
             && trim($payload['pull_request_body']) !== ''
             && is_string($payload['pull_request_body_sha256'] ?? null)
             && hash_equals($payload['pull_request_body_sha256'], hash('sha256', $payload['pull_request_body']))
-            && ($payload['flow'] ?? null) === 'discovery';
+            && ($payload['flow'] ?? null) === $flow;
     }
 
     private function reviewedCandidate(PhaseRun $phase): mixed

@@ -108,7 +108,13 @@ final readonly class OrbitPullRequestReviewReceiptValidator
             && is_string($payload['handoff'] ?? null)
             && trim($payload['handoff']) !== ''
             && $this->matchesInput($delivery, $phase, $dispatch, $retainedTransition)
-            && $this->matchesBody($delivery, $payload, $artifact, $gate);
+            && $this->matchesBody(
+                $delivery,
+                $payload,
+                $artifact,
+                $gate,
+                $sourcePayload['flow'] ?? null,
+            );
     }
 
     /** @param array<string, mixed> $pullRequest */
@@ -171,12 +177,21 @@ final readonly class OrbitPullRequestReviewReceiptValidator
     }
 
     /** @param array<string, mixed> $payload */
-    private function matchesBody(Delivery $delivery, array $payload, string $artifact, string $gate): bool
-    {
+    private function matchesBody(
+        Delivery $delivery,
+        array $payload,
+        string $artifact,
+        string $gate,
+        mixed $flow,
+    ): bool {
         if (($payload['result'] ?? null) !== 'approved') {
             return ($payload['pull_request_body_path'] ?? null) === null
                 && ($payload['pull_request_body'] ?? null) === null
                 && ($payload['pull_request_body_sha256'] ?? null) === null;
+        }
+
+        if (! is_string($flow) || ! in_array($flow, ['discovery', 'proof'], true)) {
+            return false;
         }
 
         $path = $payload['pull_request_body_path'] ?? null;
@@ -186,7 +201,7 @@ final readonly class OrbitPullRequestReviewReceiptValidator
             'Issue: '.$delivery->external_issue_key,
             (string) $delivery->candidate_sha,
             $artifact,
-            'discovery',
+            $flow,
             'Builder gate: passed ('.$gate.')',
         ];
 

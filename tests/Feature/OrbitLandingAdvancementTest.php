@@ -12,6 +12,7 @@ use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitMergeLineageVerifier;
 use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
+use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\ApprovedOrbitPullRequest;
@@ -29,6 +30,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitLandingReservation;
 use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\OrbitProofCloseout;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
@@ -163,6 +165,8 @@ final class LandingImplementationRepository implements OrbitImplementationReposi
 
     public string $expectedReviewedCandidateSha;
 
+    public string $flow = 'discovery';
+
     public function __construct()
     {
         $this->expectedReviewedCandidateSha = str_repeat('a', 40);
@@ -191,7 +195,7 @@ final class LandingImplementationRepository implements OrbitImplementationReposi
             artifactSha: $artifactSha,
             gateReceiptPath: $gateReceiptPath,
             pullRequestBodyHash: hash('sha256', $pullRequestBody),
-            flow: 'discovery',
+            flow: $this->flow,
         );
     }
 }
@@ -292,6 +296,63 @@ final class LandingPrimaryCheckoutReconciler implements OrbitPrimaryCheckoutReco
             mergeCommitSha: $mergeCommitSha,
             mainSha: str_repeat('8', 40),
             originMainSha: str_repeat('8', 40),
+        );
+    }
+}
+
+final class LandingProofTopologyCloser implements OrbitProofTopologyCloser
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public int $failures = 0;
+
+    public string $state = 'complete';
+
+    public string $attemptId = '66666666666666666666666666666666';
+
+    public ?string $generationId = 'generation-42';
+
+    public function closeProofTopology(
+        OrbitProjectConfig $config,
+        string $worktree,
+        string $issueKey,
+        string $candidateSha,
+        string $artifactSha,
+        string $mergeCommitSha,
+        string $mainSha,
+    ): OrbitProofCloseout {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($config->repository)->toBe(test()->repositoryPath)
+            ->and($worktree)->toBe(test()->worktreePath)
+            ->and($issueKey)->toBe('ORB-234')
+            ->and($candidateSha)->toBe(test()->candidateSha)
+            ->and($artifactSha)->toBe(test()->artifactSha)
+            ->and($mergeCommitSha)->toBe(str_repeat('f', 40))
+            ->and($mainSha)->toBe(str_repeat('8', 40))
+            ->and(test()->repository->reservationIsHeld())->toBeTrue();
+        $this->calls++;
+
+        if ($this->failures > 0) {
+            $this->failures--;
+
+            throw new OrbitRepositoryFailed('The proof closeout command was interrupted.');
+        }
+
+        $complete = $this->state === 'complete';
+
+        return new OrbitProofCloseout(
+            state: $this->state,
+            issueKey: $issueKey,
+            attemptId: $this->attemptId,
+            candidateSha: $candidateSha,
+            artifactSha: $artifactSha,
+            mergeCommitSha: $mergeCommitSha,
+            mainSha: $mainSha,
+            generationId: $complete ? $this->generationId : null,
+            error: $complete ? null : 'Snapshot refresh remains pending.',
+            recordedAt: '2026-09-11T15:00:00Z',
         );
     }
 }
@@ -799,6 +860,7 @@ beforeEach(function () {
     $this->gateway = new LandingGateway;
     $this->merges = new LandingMergeLineageVerifier;
     $this->primaryCheckout = new LandingPrimaryCheckoutReconciler;
+    $this->proofTopologies = new LandingProofTopologyCloser;
     $this->herdrWorkspace = new LandingHerdrWorkspace($this->repositoryPath, $this->worktreePath);
     $transactionLevel = DB::transactionLevel();
     $this->repository->transactionLevel = $transactionLevel;
@@ -808,6 +870,7 @@ beforeEach(function () {
     $this->gateway->transactionLevel = $transactionLevel;
     $this->merges->transactionLevel = $transactionLevel;
     $this->primaryCheckout->transactionLevel = $transactionLevel;
+    $this->proofTopologies->transactionLevel = $transactionLevel;
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitImplementationRepository::class, $this->implementations);
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
@@ -815,6 +878,7 @@ beforeEach(function () {
     app()->instance(OrbitPullRequestLandingGateway::class, $this->gateway);
     app()->instance(OrbitMergeLineageVerifier::class, $this->merges);
     app()->instance(OrbitPrimaryCheckoutReconciler::class, $this->primaryCheckout);
+    app()->instance(OrbitProofTopologyCloser::class, $this->proofTopologies);
     app()->instance(HerdrWorkspaceRuntime::class, $this->herdrWorkspace);
     Queue::fake();
 });
@@ -1030,6 +1094,78 @@ function promoteLandingToSecondPullRequestReview(object $test): void
     $test->gateway->expectedReviewId = 902;
 }
 
+function useProofLandingFlow(object $test): void
+{
+    $planning = $test->delivery->phaseRuns()
+        ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+        ->where('attempt', 1)
+        ->sole();
+    $planningInput = $planning->input;
+    $planningInput['flow'] = 'proof';
+    $planning->forceFill(['input' => $planningInput])->save();
+
+    $proofBody = str_replace('Flow: discovery', 'Flow: proof', $test->body);
+    $implementationPayload = $test->implementationReceipt->payload;
+    $implementationPayload['pull_request_body'] = $proofBody;
+    $implementationPayload['pull_request_body_sha256'] = hash('sha256', $proofBody);
+    $implementationPayload['flow'] = 'proof';
+    DB::table('receipts')->where('id', $test->implementationReceipt->id)->update([
+        'payload' => json_encode($implementationPayload, JSON_THROW_ON_ERROR),
+        'payload_hash' => hash('sha256', json_encode($implementationPayload, JSON_THROW_ON_ERROR)),
+    ]);
+    $test->implementationReceipt = Receipt::query()->findOrFail($test->implementationReceipt->id);
+
+    $review = $test->reviewReceipt->phaseRun()->firstOrFail();
+    $reviewInput = $review->input;
+    $reviewInput['implementation_receipt'] = $implementationPayload;
+    $review->forceFill(['input' => $reviewInput])->save();
+    $reviewer = $review->agentDispatches()->sole();
+    $reviewPrompt = app(OrbitFeatureWorkflow::class)->pullRequestReviewPrompt(
+        'ORB-234',
+        $test->worktreePath,
+        $test->delivery->id,
+        $review->id,
+        $reviewer->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-pr-review-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $review->id,
+            $reviewer->id,
+        ),
+        $implementationPayload,
+        $reviewInput['pull_request'],
+    );
+    $reviewer->forceFill(['prompt_hash' => hash('sha256', $reviewPrompt)])->save();
+
+    $reviewPayload = $test->reviewReceipt->payload;
+    $reviewPayload['pull_request_body'] = $proofBody;
+    $reviewPayload['pull_request_body_sha256'] = hash('sha256', $proofBody);
+    DB::table('receipts')->where('id', $test->reviewReceipt->id)->update([
+        'payload' => json_encode($reviewPayload, JSON_THROW_ON_ERROR),
+        'payload_hash' => hash('sha256', json_encode($reviewPayload, JSON_THROW_ON_ERROR)),
+    ]);
+    $test->reviewReceipt = Receipt::query()->findOrFail($test->reviewReceipt->id);
+
+    $published = $test->published;
+    $published['pull_request_body_sha256'] = hash('sha256', $proofBody);
+    $review->forceFill(['output' => [
+        'receipt_id' => $test->reviewReceipt->id,
+        'result' => 'approved',
+        'published_review' => $published,
+    ]])->save();
+    $landingInput = $test->landing->input;
+    $landingInput['pr_review_receipt'] = $reviewPayload;
+    $landingInput['implementation_receipt'] = $implementationPayload;
+    $landingInput['published_review'] = $published;
+    $test->landing->forceFill(['input' => $landingInput])->save();
+
+    $test->body = $proofBody;
+    $test->published = $published;
+    $test->implementations->flow = 'proof';
+    $test->merges->flow = 'proof';
+}
+
 it('lands one exact approved Orbit candidate and replays as a no-op', function () {
     $action = app(AdvanceOrbitLanding::class);
 
@@ -1062,6 +1198,11 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
             'workspace_id' => 'issue-workspace',
             'worktree_path' => $this->worktreePath,
         ])
+        ->and($landing->output['proof_closeout'])->toBe([
+            'schema' => 1,
+            'flow' => 'discovery',
+            'required' => false,
+        ])
         ->and($this->repository->reservationIsHeld())->toBeFalse()
         ->and($this->implementations->calls)->toBe(1)
         ->and($this->issues->calls)->toBe(1)
@@ -1072,6 +1213,7 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->gateway->releaseCalls)->toBe(1)
         ->and($this->merges->calls)->toBe(1)
         ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->proofTopologies->calls)->toBe(0)
         ->and($this->herdrWorkspace->closeCalls)->toBe(1);
 
     $maintenance = MaintenanceRun::sole();
@@ -1097,6 +1239,138 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->primaryCheckout->calls)->toBe(1)
         ->and(MaintenanceRun::count())->toBe(1);
     Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
+});
+
+it('closes a retained proof topology before releasing the merge reservation', function () {
+    useProofLandingFlow($this);
+
+    expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))
+        ->toBeNull();
+
+    $landing = $this->landing->fresh();
+    expect($landing->status)->toBe(PhaseRunStatus::Completed)
+        ->and($landing->output['merge_verification']['flow'])->toBe('proof')
+        ->and($landing->output['proof_closeout'])->toBe([
+            'schema' => 1,
+            'flow' => 'proof',
+            'required' => true,
+            'record' => [
+                'schema' => 1,
+                'state' => 'complete',
+                'issue' => 'ORB-234',
+                'attempt_id' => str_repeat('6', 32),
+                'candidate_sha' => $this->candidateSha,
+                'artifact_sha' => $this->artifactSha,
+                'merge_sha' => str_repeat('f', 40),
+                'main_sha' => str_repeat('8', 40),
+                'generation_id' => 'generation-42',
+                'error' => null,
+                'recorded_at' => '2026-09-11T15:00:00Z',
+            ],
+        ])
+        ->and($this->proofTopologies->calls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('retains the merge reservation while a structured proof closeout failure retries', function () {
+    useProofLandingFlow($this);
+    $this->proofTopologies->state = 'refresh-failed';
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect($action->handle($this->delivery->id, $this->landing->id))
+        ->toBe(AdvanceOrbitLanding::MAINTENANCE_RETRY_SECONDS)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'landing_proof_closeout_wait',
+            'phase_run_id' => $this->landing->id,
+            'record' => [
+                'schema' => 1,
+                'state' => 'refresh-failed',
+                'issue' => 'ORB-234',
+                'attempt_id' => str_repeat('6', 32),
+                'candidate_sha' => $this->candidateSha,
+                'artifact_sha' => $this->artifactSha,
+                'merge_sha' => str_repeat('f', 40),
+                'main_sha' => str_repeat('8', 40),
+                'generation_id' => null,
+                'error' => 'Snapshot refresh remains pending.',
+                'recorded_at' => '2026-09-11T15:00:00Z',
+            ],
+        ])
+        ->and($this->landing->fresh()->current_block)->toBe('proof_closeout')
+        ->and($this->landing->fresh()->output)->not->toHaveKey('proof_closeout')
+        ->and($this->gateway->releaseCalls)->toBe(0)
+        ->and($this->proofTopologies->calls)->toBe(1);
+
+    $this->proofTopologies->state = 'complete';
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1)
+        ->and($this->proofTopologies->calls)->toBe(2)
+        ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('retains proof closeout identity across structured retries', function () {
+    useProofLandingFlow($this);
+    $this->proofTopologies->state = 'refresh-failed';
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect($action->handle($this->delivery->id, $this->landing->id))
+        ->toBe(AdvanceOrbitLanding::MAINTENANCE_RETRY_SECONDS);
+
+    $this->proofTopologies->attemptId = str_repeat('7', 32);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'retry identity changed');
+    expect($this->landing->fresh()->current_block)->toBe('proof_closeout')
+        ->and($this->gateway->releaseCalls)->toBe(0);
+});
+
+it('recovers an interrupted proof closeout without repeating earlier landing mutations', function () {
+    useProofLandingFlow($this);
+    $this->proofTopologies->failures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitRepositoryFailed::class, 'interrupted');
+    expect($this->landing->fresh()->current_block)->toBe('proof_closeout')
+        ->and($this->landing->fresh()->output)->not->toHaveKey('proof_closeout')
+        ->and($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(0);
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1)
+        ->and($this->proofTopologies->calls)->toBe(2)
+        ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('runs queued main cache maintenance while proof closeout is waiting', function () {
+    useProofLandingFlow($this);
+    $this->proofTopologies->state = 'refresh-failed';
+
+    expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))
+        ->toBe(AdvanceOrbitLanding::MAINTENANCE_RETRY_SECONDS);
+
+    $run = MaintenanceRun::sole();
+    $requests = new LandingCacheRefreshRequester;
+    $requests->transactionLevel = DB::transactionLevel();
+    app()->instance(OrbitMainCacheRefreshRequester::class, $requests);
+    app(RunOrbitMainCacheRefresh::class)->handle($run->id);
+
+    expect($run->fresh()->status)->toBe(MaintenanceRunStatus::Completed)
+        ->and($this->landing->fresh()->current_block)->toBe('proof_closeout')
+        ->and($this->gateway->releaseCalls)->toBe(0);
 });
 
 it('retains the merge reservation while Commander waits for owned Herdr agents to exit', function () {
@@ -1384,6 +1658,7 @@ it('queues incomplete landing recovery states', function (DeliveryStatus $status
     'merge verification' => [DeliveryStatus::Landed, 'merge_verification'],
     'repository reconciliation' => [DeliveryStatus::Landed, 'repository_reconciliation'],
     'workspace shutdown' => [DeliveryStatus::Landed, 'workspace_shutdown'],
+    'proof closeout' => [DeliveryStatus::Landed, 'proof_closeout'],
     'reservation release' => [DeliveryStatus::Landed, 'reservation_release'],
 ]);
 
@@ -1468,6 +1743,12 @@ it('guards exhausted landing jobs and preserves recoverable external states', fu
         PhaseRunStatus::Running,
         'workspace_shutdown',
         'landing_workspace_shutdown_required',
+    ],
+    'post-merge proof closeout' => [
+        DeliveryStatus::Landed,
+        PhaseRunStatus::Running,
+        'proof_closeout',
+        'landing_proof_closeout_required',
     ],
 ]);
 

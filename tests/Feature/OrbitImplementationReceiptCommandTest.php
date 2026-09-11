@@ -673,6 +673,23 @@ it('does not capture an implementation when repository verification fails', func
     Queue::assertNothingPushed();
 });
 
+it('rejects an implementation flow that differs from the immutable delivery selection', function () {
+    $planning = $this->delivery->phaseRuns()
+        ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+        ->where('attempt', 1)
+        ->sole();
+    $input = $planning->input;
+    $input['flow'] = 'proof';
+    $planning->forceFill(['input' => $input])->save();
+
+    $this->artisan('delivery:submit-orbit-implementation-receipt', $this->arguments)
+        ->expectsOutput('The implementation receipt no longer matches the active dispatch.')
+        ->assertFailed();
+
+    expect(Receipt::where('kind', 'orbit_implementation')->count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
 it('rejects implementation input or source-receipt corruption', function (string $corruption) {
     if ($corruption === 'input') {
         $input = $this->phaseRun->input;
