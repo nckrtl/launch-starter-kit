@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Delivery\Repositories;
 
 use App\Delivery\Contracts\OrbitImplementationRepository;
+use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
@@ -14,6 +15,7 @@ use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\RequestedOrbitMainCacheRefresh;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
@@ -24,7 +26,7 @@ use Illuminate\Support\Str;
 use JsonException;
 use RuntimeException;
 
-final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCorrectnessInspector, OrbitRepository
+final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitRepository
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -33,6 +35,58 @@ final readonly class ProcessOrbitRepository implements OrbitImplementationReposi
         ['composer', 'check'],
         ['composer', 'test:affected'],
     ];
+
+    public function request(string $repository): RequestedOrbitMainCacheRefresh
+    {
+        $resolvedRepository = realpath($repository);
+        $script = $resolvedRepository === false ? false : realpath($resolvedRepository.'/bin/tia-cache');
+
+        if ($resolvedRepository === false || $resolvedRepository !== $repository
+            || ! is_dir($resolvedRepository) || $script === false
+            || $script !== $resolvedRepository.'/bin/tia-cache'
+            || is_link($resolvedRepository.'/bin/tia-cache') || ! is_executable($script)) {
+            throw new OrbitRepositoryFailed('The configured Orbit main cache refresh adapter is unavailable.');
+        }
+
+        try {
+            $result = Process::path($resolvedRepository)
+                ->timeout(30)
+                ->run([
+                    $script,
+                    'refresh',
+                    '--background',
+                    '--repository='.$resolvedRepository,
+                ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit main cache refresh adapter could not run.',
+                previous: $exception,
+            );
+        }
+
+        if ($result->failed()) {
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit main cache refresh request failed: '.$details);
+        }
+
+        $message = trim($result->output());
+        $disposition = match (true) {
+            $message === 'Main caches already published; no refresh needed.' => 'already_current',
+            preg_match('/^Cache request retained by active worker; log: .+$/', $message) === 1 => 'coalesced',
+            preg_match('/^Main cache refresh queued \(pid [1-9][0-9]*\); log: .+$/', $message) === 1 => 'queued',
+            default => null,
+        };
+
+        if ($disposition === null) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit main cache refresh adapter returned incomplete request evidence.',
+            );
+        }
+
+        return new RequestedOrbitMainCacheRefresh($resolvedRepository, $disposition, $message);
+    }
 
     public function inspectMainCorrectness(OrbitProjectConfig $config): OrbitMainCorrectness
     {

@@ -3,9 +3,11 @@
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitLanding;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
+use App\Delivery\Actions\RunOrbitMainCacheRefresh;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
+use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
@@ -19,21 +21,26 @@ use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\RequestedOrbitMainCacheRefresh;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Enums\MaintenanceRunStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitLandingAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPullRequestLandingFailed;
+use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceOrbitLanding as AdvanceLandingJob;
+use App\Jobs\RunOrbitMainCacheRefresh as RunMainCacheRefreshJob;
 use App\Models\AgentDispatch;
+use App\Models\MaintenanceRun;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
@@ -173,6 +180,35 @@ final class LandingImplementationRepository implements OrbitImplementationReposi
             gateReceiptPath: $gateReceiptPath,
             pullRequestBodyHash: hash('sha256', $pullRequestBody),
             flow: 'discovery',
+        );
+    }
+}
+
+final class LandingCacheRefreshRequester implements OrbitMainCacheRefreshRequester
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public int $failures = 0;
+
+    public string $disposition = 'queued';
+
+    public function request(string $repository): RequestedOrbitMainCacheRefresh
+    {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel);
+        $this->calls++;
+
+        if ($this->failures > 0) {
+            $this->failures--;
+
+            throw new OrbitRepositoryFailed('The cache request was not accepted.');
+        }
+
+        return new RequestedOrbitMainCacheRefresh(
+            repository: $repository,
+            disposition: $this->disposition,
+            message: 'Main cache refresh queued (pid 123); log: /tmp/refresh.log',
         );
     }
 }
@@ -803,6 +839,7 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($landing->status)->toBe(PhaseRunStatus::Completed)
         ->and($landing->current_block)->toBeNull()
         ->and($landing->output['main_sha'])->toBe(str_repeat('e', 40))
+        ->and($landing->output['repository'])->toBe($this->repositoryPath)
         ->and($landing->output['merge']['candidate_sha'])->toBe($this->candidateSha)
         ->and($landing->output['merge']['merge_commit_sha'])->toBe(str_repeat('f', 40))
         ->and($this->repository->reservationIsHeld())->toBeFalse()
@@ -814,9 +851,27 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->gateway->mergeCalls)->toBe(1)
         ->and($this->gateway->releaseCalls)->toBe(1);
 
+    $maintenance = MaintenanceRun::sole();
+    expect($maintenance->status)->toBe(MaintenanceRunStatus::Pending)
+        ->and($maintenance->attempt)->toBe(1)
+        ->and($maintenance->input)->toBe([
+            'schema' => 1,
+            'landing_phase_run_id' => $landing->id,
+            'repository' => $this->repositoryPath,
+            'candidate_sha' => $this->candidateSha,
+            'merge_commit_sha' => str_repeat('f', 40),
+            'pre_merge_main_sha' => str_repeat('e', 40),
+        ]);
+    Queue::assertPushed(
+        RunMainCacheRefreshJob::class,
+        fn (RunMainCacheRefreshJob $job): bool => $job->maintenanceRunId === $maintenance->id,
+    );
+
     expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
         ->and($this->gateway->mergeCalls)->toBe(1)
-        ->and($this->gateway->releaseCalls)->toBe(1);
+        ->and($this->gateway->releaseCalls)->toBe(1)
+        ->and(MaintenanceRun::count())->toBe(1);
+    Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 });
 
 it('lands the exact candidate approved by the second pull request review', function () {
@@ -909,12 +964,16 @@ it('preserves a landed merge while reservation release is retried', function () 
     expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
         ->and($this->landing->fresh()->current_block)->toBe('reservation_release')
         ->and($this->delivery->fresh()->failure_details['code'])
-        ->toBe('landing_reservation_release_required');
+        ->toBe('landing_reservation_release_required')
+        ->and(MaintenanceRun::count())->toBe(1);
+    Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 
     expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
         ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($this->gateway->mergeCalls)->toBe(1)
-        ->and($this->gateway->releaseCalls)->toBe(2);
+        ->and($this->gateway->releaseCalls)->toBe(2)
+        ->and(MaintenanceRun::count())->toBe(1);
+    Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 });
 
 it('rejects issue and configuration drift before merge', function (string $drift) {
@@ -1066,3 +1125,100 @@ it('guards exhausted landing jobs and preserves recoverable external states', fu
         'landing_reservation_release_required',
     ],
 ]);
+
+it('completes the delivery-bound main cache refresh request without changing the landed result', function () {
+    app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id);
+    $run = MaintenanceRun::sole();
+    $requests = new LandingCacheRefreshRequester;
+    $requests->transactionLevel = DB::transactionLevel();
+    $requests->disposition = 'coalesced';
+    app()->instance(OrbitMainCacheRefreshRequester::class, $requests);
+    $job = new RunMainCacheRefreshJob($run->id);
+
+    $job->handle(app(RunOrbitMainCacheRefresh::class));
+
+    $run->refresh();
+    expect($run->status)->toBe(MaintenanceRunStatus::Completed)
+        ->and($run->attempt)->toBe(1)
+        ->and($run->started_at)->not->toBeNull()
+        ->and($run->finished_at)->not->toBeNull()
+        ->and($run->result)->toBe([
+            'repository' => $this->repositoryPath,
+            'disposition' => 'coalesced',
+            'message' => 'Main cache refresh queued (pid 123); log: /tmp/refresh.log',
+        ])
+        ->and($requests->calls)->toBe(1)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull();
+
+    $job->handle(app(RunOrbitMainCacheRefresh::class));
+    expect($requests->calls)->toBe(1)
+        ->and($run->fresh()->attempt)->toBe(1);
+});
+
+it('retries an interrupted main cache refresh request from its durable ledger', function () {
+    app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id);
+    $run = MaintenanceRun::sole();
+    $requests = new LandingCacheRefreshRequester;
+    $requests->transactionLevel = DB::transactionLevel();
+    $requests->failures = 1;
+    app()->instance(OrbitMainCacheRefreshRequester::class, $requests);
+    $action = app(RunOrbitMainCacheRefresh::class);
+
+    expect(fn () => $action->handle($run->id))
+        ->toThrow(OrbitRepositoryFailed::class, 'not accepted');
+    expect($run->fresh()->status)->toBe(MaintenanceRunStatus::Running)
+        ->and($run->fresh()->attempt)->toBe(1)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed);
+
+    $action->handle($run->id);
+
+    expect($run->fresh()->status)->toBe(MaintenanceRunStatus::Completed)
+        ->and($run->fresh()->attempt)->toBe(2)
+        ->and($requests->calls)->toBe(2)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed);
+});
+
+it('fails only an exhausted maintenance run and keeps the confirmed merge landed', function () {
+    app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id);
+    $run = MaintenanceRun::sole();
+    $job = new RunMainCacheRefreshJob($run->id);
+
+    $job->failed(new RuntimeException('Maintenance retries exhausted.'));
+
+    expect($run->fresh()->status)->toBe(MaintenanceRunStatus::Failed)
+        ->and($run->fresh()->failure_code)->toBe('orbit_main_cache_refresh_enqueue_failed')
+        ->and($run->fresh()->failure_message)->toBe('Maintenance retries exhausted.')
+        ->and($run->fresh()->finished_at)->not->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($job->tries)->toBe(0)
+        ->and($job->backoff)->toBe([1, 5, 15, 30])
+        ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
+        ->and(RunMainCacheRefreshJob::LOCK_SECONDS)->toBeGreaterThan($job->timeout)
+        ->and($job->retryUntil() > now())->toBeTrue();
+});
+
+it('releases a contended maintenance-run lock without making an external request', function () {
+    app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id);
+    $run = MaintenanceRun::sole();
+    $requests = new LandingCacheRefreshRequester;
+    $requests->transactionLevel = DB::transactionLevel();
+    app()->instance(OrbitMainCacheRefreshRequester::class, $requests);
+    $lock = Cache::lock(
+        "maintenance:orbit-main-cache-refresh:{$run->id}",
+        RunMainCacheRefreshJob::LOCK_SECONDS,
+    );
+    expect($lock->get())->toBeTrue();
+
+    try {
+        $job = (new RunMainCacheRefreshJob($run->id))->withFakeQueueInteractions();
+        $job->handle(app(RunOrbitMainCacheRefresh::class));
+        $job->assertReleased(1);
+    } finally {
+        $lock->release();
+    }
+
+    expect($requests->calls)->toBe(0)
+        ->and($run->fresh()->status)->toBe(MaintenanceRunStatus::Pending);
+});

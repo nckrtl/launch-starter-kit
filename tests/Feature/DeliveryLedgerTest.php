@@ -5,12 +5,14 @@ use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Enums\MaintenanceRunStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Queries\DeliveryTimeline;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\ExternalEvent;
+use App\Models\MaintenanceRun;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
@@ -138,10 +140,27 @@ it('builds a deterministic read-only delivery timeline', function () {
         'prompt_name' => 'test', 'prompt_version' => 1, 'prompt_hash' => str_repeat('2', 64),
         'status' => AgentDispatchStatus::Settled, 'dispatched_at' => $at, 'settled_at' => $at,
     ]);
+    MaintenanceRun::create([
+        'project_orchestration_id' => $delivery->project_orchestration_id,
+        'delivery_id' => $delivery->id,
+        'kind' => 'test',
+        'status' => MaintenanceRunStatus::Completed,
+        'attempt' => 1,
+        'idempotency_key' => str_repeat('3', 64),
+        'started_at' => $at,
+        'finished_at' => $at,
+    ]);
 
     $before = $delivery->fresh()->updated_at;
     $types = collect(app(DeliveryTimeline::class)->for($delivery))->pluck('type')->all();
 
-    expect($types)->toBe(['phase.started', 'phase.finished', 'dispatch.sent', 'dispatch.settled'])
+    expect($types)->toBe([
+        'phase.started',
+        'phase.finished',
+        'dispatch.sent',
+        'dispatch.settled',
+        'maintenance.started',
+        'maintenance.finished',
+    ])
         ->and($delivery->fresh()->updated_at->equalTo($before))->toBeTrue();
 });

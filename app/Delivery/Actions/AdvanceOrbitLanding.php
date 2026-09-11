@@ -50,6 +50,7 @@ final readonly class AdvanceOrbitLanding
         private OrbitPullRequestLandingGateway $pullRequests,
         private OrbitPullRequestReviewReceiptValidator $reviewReceipts,
         private OrbitPullRequestReviewSourceValidator $sources,
+        private QueueOrbitMainCacheRefresh $cacheRefresh,
     ) {}
 
     /** Return a delay when the same queued job should retry a non-failing wait. */
@@ -64,11 +65,18 @@ final readonly class AdvanceOrbitLanding
 
         $intent = $this->landingIntent($delivery, $expectedPhaseId);
 
-        if ($intent === null || $this->isCompleted($delivery, $intent[0])) {
+        if ($intent === null) {
+            return null;
+        }
+
+        if ($this->isCompleted($delivery, $intent[0])) {
+            $this->cacheRefresh->handle($delivery->id, $intent[0]->id);
+
             return null;
         }
 
         if ($delivery->status === DeliveryStatus::Landed) {
+            $this->cacheRefresh->handle($delivery->id, $intent[0]->id);
             $this->releaseAndFinalize($delivery, $intent[0]);
 
             return null;
@@ -354,9 +362,11 @@ final readonly class AdvanceOrbitLanding
         $approval = is_array($output) ? ($output['approved_pull_request'] ?? null) : null;
         $reservation = is_array($output) ? ($output['reservation'] ?? null) : null;
         $mainSha = is_array($output) ? ($output['main_sha'] ?? null) : null;
+        $repository = is_array($output) ? ($output['repository'] ?? null) : null;
 
-        return is_array($output) && count($output) === 3
+        return is_array($output) && count($output) === 4
             && is_string($mainSha) && preg_match('/^[a-f0-9]{40}$/', $mainSha) === 1
+            && is_string($repository) && str_starts_with($repository, '/')
             && is_array($approval) && ! array_is_list($approval)
             && $approval === [
                 'number' => $delivery->pull_request_number,
@@ -515,6 +525,7 @@ final readonly class AdvanceOrbitLanding
             );
             $output = [
                 'main_sha' => $main->mainSha,
+                'repository' => $config->repository,
                 'approved_pull_request' => [
                     'number' => $approved->number,
                     'url' => $approved->url,
@@ -578,6 +589,8 @@ final readonly class AdvanceOrbitLanding
             if ($delivery->status === DeliveryStatus::Landed
                 && $phase->current_block === 'reservation_release'
                 && $phase->output === $output) {
+                $this->cacheRefresh->handle($delivery->id, $phase->id);
+
                 return;
             }
 
@@ -601,6 +614,7 @@ final readonly class AdvanceOrbitLanding
             $delivery->status = DeliveryStatus::Landed;
             $delivery->failure_details = null;
             $delivery->save();
+            $this->cacheRefresh->handle($delivery->id, $phase->id);
         });
     }
 
