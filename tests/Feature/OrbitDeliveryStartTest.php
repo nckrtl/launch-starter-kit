@@ -9,6 +9,7 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Jobs\DispatchOrbitPlanning as DispatchOrbitPlanningJob;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -52,7 +53,7 @@ beforeEach(function () {
 
 afterEach(fn () => File::deleteDirectory($this->projectsPath));
 
-it('records a live Orbit delivery and exact planning preparation without dispatching it', function () {
+it('records a live Orbit delivery before routing its planning dispatch through the queue', function () {
     $delivery = app(StartOrbitDelivery::class)->handle(
         $this->project,
         $this->issue,
@@ -96,8 +97,12 @@ it('records a live Orbit delivery and exact planning preparation without dispatc
         ])
         ->and(AgentDispatch::count())->toBe(0);
 
-    expect(app(AdvanceDeliveryAction::class)->handle($delivery->id))->toBeFalse();
     Queue::assertNothingPushed();
+    expect(app(AdvanceDeliveryAction::class)->handle($delivery->id))->toBeFalse();
+    Queue::assertPushed(
+        DispatchOrbitPlanningJob::class,
+        fn (DispatchOrbitPlanningJob $job): bool => $job->deliveryId === $delivery->id,
+    );
 });
 
 it('rejects inconsistent live Orbit preparation before writing the ledger', function (string $case) {

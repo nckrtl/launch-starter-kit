@@ -41,6 +41,10 @@ enabled projects and queues the existing `AdvanceDelivery` path. It skips
 paused projects and terminal, paused, or blocked deliveries. It does not contain
 a second workflow state machine.
 
+For a prepared live Orbit delivery, `AdvanceDelivery` queues the bounded initial
+planning-dispatch job. Duplicate jobs serialize on a delivery-specific cache
+lock, and a stale exhausted job cannot overwrite a later planning attempt.
+
 This worker does not cut over Orbit's feature loop. Until shadow parity and the
 reconciliation runtime are proven, `/home/nckrtl/orbit/bin/loop` continues to
 invoke the legacy controller.

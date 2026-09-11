@@ -629,12 +629,13 @@ initial phase. `StartOrbitDelivery` validates an enabled discovery-mode Orbit
 config and records the same verified issue snapshot,
 candidate receipt, worktree, branch, candidate, and tree used by shadow
 preparation. It creates no dispatch, job, Herdr process, or Linear mutation.
-It leaves the delivery in the explicit non-runnable `preparing` status, which
-the generic advancement action ignores. The existing shadow start remains
-unchanged. This gives the live planning path
-its own real `Delivery` and `PhaseRun` instead of adding a second planning-only
-ledger beside the workflow kernel. Activation waits for Commander-owned
-planning receipt validation and the durable prompt stage.
+It leaves the delivery in `preparing`; the generic advancement path now queues
+the bounded, retryable initial planning-dispatch job. That job uses the existing
+durable prompt stage and relies on the Herdr settled event to queue receipt
+advancement. The existing shadow start remains unchanged. The live planning
+path therefore uses its real `Delivery` and `PhaseRun` instead of a second
+planning-only ledger. The normal start entry point still belongs to the legacy
+controller until an explicit Commander start boundary and a live canary pass.
 
 ### Project registry boundary
 

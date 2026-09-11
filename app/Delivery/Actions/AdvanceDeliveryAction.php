@@ -22,6 +22,7 @@ use App\Jobs\AdvanceOrbitLanding as AdvanceOrbitLandingJob;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
 use App\Jobs\AdvanceOrbitPullRequestReview as AdvanceOrbitPullRequestReviewJob;
 use App\Jobs\DispatchOrbitImplementation;
+use App\Jobs\DispatchOrbitPlanning as DispatchOrbitPlanningJob;
 use App\Jobs\DispatchOrbitPlanningCorrection;
 use App\Jobs\DispatchOrbitPlanReview;
 use App\Jobs\DispatchOrbitPullRequestReview;
@@ -61,6 +62,12 @@ final readonly class AdvanceDeliveryAction
                     }
 
                     return $this->advanceOrbitPlanning->handle($deliveryId);
+                }
+
+                if ($planning?->attempt === 1 && $delivery->status === DeliveryStatus::Preparing) {
+                    DispatchOrbitPlanningJob::dispatch($deliveryId)->afterCommit();
+
+                    return false;
                 }
 
                 if ($delivery->status === DeliveryStatus::Queued) {

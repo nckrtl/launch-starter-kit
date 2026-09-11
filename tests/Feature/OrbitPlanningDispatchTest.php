@@ -28,11 +28,13 @@ use App\Delivery\Exceptions\OrbitPlanningDispatchFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
+use App\Jobs\DispatchOrbitPlanning as DispatchOrbitPlanningJob;
 use App\Models\AgentDispatch;
 use App\Models\ExternalEvent;
 use App\Models\PhaseRun;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Queue;
 
@@ -423,6 +425,80 @@ it('exposes the verified live planning dispatch through its explicit command', f
     expect(AgentDispatch::sole()->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
     Queue::assertNothingPushed();
+});
+
+it('runs the initial planning dispatch through a bounded queued job', function () {
+    $job = new DispatchOrbitPlanningJob($this->delivery->id);
+
+    $job->handle(app(DispatchOrbitPlanning::class));
+
+    expect($job->tries)->toBe(0)
+        ->and($job->timeout)->toBe(DispatchOrbitPlanningJob::TIMEOUT_SECONDS)
+        ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
+        ->and(DispatchOrbitPlanningJob::LOCK_SECONDS)->toBeGreaterThan($job->timeout)
+        ->and($job->retryUntil() > now())->toBeTrue()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and(AgentDispatch::sole()->status)->toBe(AgentDispatchStatus::Waiting);
+});
+
+it('preserves a blocked planning dispatch outcome in the queued job', function () {
+    $this->transitioner->failure = new OrbitIssueTransitionFailed(
+        'Linear read-back unavailable.',
+        ambiguous: true,
+    );
+
+    (new DispatchOrbitPlanningJob($this->delivery->id))
+        ->handle(app(DispatchOrbitPlanning::class));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details)->toMatchArray([
+            'code' => 'linear_transition_ambiguous',
+        ]);
+});
+
+it('fails only an active initial planning dispatch after queue exhaustion', function () {
+    $job = new DispatchOrbitPlanningJob($this->delivery->id);
+
+    $job->failed(new RuntimeException('Queue exhausted.'));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Failed)
+        ->and($this->delivery->fresh()->failed_at)->not->toBeNull()
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'planning_dispatch_exhausted',
+            'message' => 'Queue exhausted.',
+        ]);
+});
+
+it('does not let an exhausted initial dispatch job overwrite a later planning attempt', function () {
+    PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Pending,
+    ]);
+
+    (new DispatchOrbitPlanningJob($this->delivery->id))
+        ->failed(new RuntimeException('Stale queue failure.'));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Preparing)
+        ->and($this->delivery->fresh()->failed_at)->toBeNull()
+        ->and($this->delivery->fresh()->failure_details)->toBeNull();
+});
+
+it('releases a contended initial planning dispatch lock for retry', function () {
+    $lock = Cache::lock(
+        "delivery:planning-dispatch:{$this->delivery->id}",
+        DispatchOrbitPlanningJob::LOCK_SECONDS,
+    );
+    $lock->get();
+
+    try {
+        $job = (new DispatchOrbitPlanningJob($this->delivery->id))->withFakeQueueInteractions();
+        $job->handle(app(DispatchOrbitPlanning::class));
+        $job->assertReleased(1);
+    } finally {
+        $lock->release();
+    }
 });
 
 it('reconciles an ambiguous deterministic agent start without starting a replacement', function () {
