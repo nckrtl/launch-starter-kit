@@ -45,6 +45,16 @@ For a prepared live Orbit delivery, `AdvanceDelivery` queues the bounded initial
 planning-dispatch job. Duplicate jobs serialize on a delivery-specific cache
 lock, and a stale exhausted job cannot overwrite a later planning attempt.
 
+Start a deliberate live canary without changing the normal Orbit entry point:
+
+```bash
+php artisan delivery:start-orbit orbit ORB-234
+```
+
+The command resolves the stable Linear UUID from the issue key, uses the same
+controller reservation as the legacy loop, runs the trusted worktree and
+candidate checks, writes the live ledger, and queues `AdvanceDelivery`.
+
 This worker does not cut over Orbit's feature loop. Until shadow parity and the
 reconciliation runtime are proven, `/home/nckrtl/orbit/bin/loop` continues to
 invoke the legacy controller.

@@ -7,13 +7,14 @@ namespace App\Delivery\IssueProviders;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitIssueResolver;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitIssueProvider
+final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitIssueProvider, OrbitIssueResolver
 {
     private const string QUERY = <<<'GRAPHQL'
 query LoopIssue($id: String!) {
@@ -41,6 +42,13 @@ GRAPHQL;
         return $this->snapshots->make($response, $issueId, $issueKey, $viewerId);
     }
 
+    public function resolve(string $issueKey): OrbitIssueSnapshot
+    {
+        [$response, $viewerId] = $this->request($issueKey, $issueKey);
+
+        return $this->snapshots->makeResolved($response, $issueKey, $viewerId);
+    }
+
     public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         [$response, $viewerId] = $this->request($issueId, $issueKey);
@@ -66,7 +74,7 @@ GRAPHQL;
     }
 
     /** @return array{array<mixed, mixed>, string} */
-    private function request(string $issueId, string $issueKey): array
+    private function request(string $identifier, string $issueKey): array
     {
         $target = config('commander.hermes.ssh_target');
         $profile = config('commander.hermes.profiles.tom');
@@ -75,7 +83,8 @@ GRAPHQL;
         if (! is_string($target) || preg_match('/^[A-Za-z0-9._-]+@[A-Za-z0-9.:-]+$/', $target) !== 1
             || ! is_string($profile) || preg_match('/^\/[A-Za-z0-9._\/-]+$/', $profile) !== 1
             || ! is_string($viewerId) || ! $this->isUuid($viewerId)
-            || ! $this->isUuid($issueId) || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1) {
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
+            || (! $this->isUuid($identifier) && $identifier !== $issueKey)) {
             throw new OrbitIssueProviderFailed('The Hermes Orbit issue provider is not configured.');
         }
 
@@ -83,7 +92,7 @@ GRAPHQL;
             $input = json_encode([
                 'service' => 'linear',
                 'document' => self::QUERY,
-                'variables' => ['id' => $issueId],
+                'variables' => ['id' => $identifier],
             ], JSON_THROW_ON_ERROR);
             $result = Process::input($input)
                 ->timeout(30)

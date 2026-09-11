@@ -9,6 +9,7 @@ use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitIssueResolver;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
@@ -46,6 +47,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitImplementationRepository::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitMainCacheRefreshRequester::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitIssueProvider::class, SshOrbitIssueProvider::class);
+        $this->app->bind(OrbitIssueResolver::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitActiveIssueProvider::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitCloseoutIssueProvider::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitIssueCompletionTransitioner::class, SshOrbitIssueTransitioner::class);

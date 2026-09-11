@@ -2,6 +2,7 @@
 
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
+use App\Delivery\Contracts\OrbitIssueResolver;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
@@ -124,6 +125,36 @@ it('fetches one normalized issue through the fixed read-only Hermes RPC boundary
             && ! str_contains($input['document'], 'mutation');
     });
 });
+
+it('resolves the stable issue ID from a legacy-compatible Orbit key', function () {
+    fakeProviderResponse(providerResponse());
+
+    $snapshot = app(OrbitIssueResolver::class)->resolve('ORB-234');
+
+    expect($snapshot->issueId)->toBe(providerIssueId())
+        ->and($snapshot->issueKey)->toBe('ORB-234');
+
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input)
+            && ($input['variables'] ?? null) === ['id' => 'ORB-234']
+            && is_string($input['document'] ?? null)
+            && ! str_contains($input['document'], 'mutation');
+    });
+});
+
+it('rejects a resolved issue with malformed or mismatched canonical identity', function (array $overrides) {
+    fakeProviderResponse(providerResponse($overrides));
+
+    expect(fn () => app(OrbitIssueResolver::class)->resolve('ORB-234'))
+        ->toThrow(OrbitIssueProviderFailed::class);
+})->with([
+    'malformed UUID' => [['id' => 'not-a-uuid']],
+    'different key' => [['identifier' => 'ORB-235']],
+]);
 
 it('matches the installed controller contract for equivalent issue collections', function () {
     $factory = app(OrbitIssueSnapshotFactory::class);
@@ -425,3 +456,12 @@ it('rejects unsafe provider configuration and invalid identifiers before SSH', f
     'invalid UUID' => ['not-a-uuid', 'ORB-234'],
     'wrong project key' => [providerIssueId(), 'ABC-234'],
 ]);
+
+it('rejects an unsafe issue key before trying to resolve it', function () {
+    Process::fake()->preventStrayProcesses();
+
+    expect(fn () => app(OrbitIssueResolver::class)->resolve('not-an-orbit-key'))
+        ->toThrow(OrbitIssueProviderFailed::class, 'not configured');
+
+    Process::assertNothingRan();
+});

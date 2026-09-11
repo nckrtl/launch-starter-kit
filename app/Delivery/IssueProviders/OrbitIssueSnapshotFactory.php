@@ -49,6 +49,20 @@ final readonly class OrbitIssueSnapshotFactory
         );
     }
 
+    public function makeResolved(
+        mixed $response,
+        string $expectedIssueKey,
+        string $expectedViewerId,
+    ): OrbitIssueSnapshot {
+        return $this->makeSnapshot(
+            $response,
+            null,
+            $expectedIssueKey,
+            $expectedViewerId,
+            null,
+        );
+    }
+
     public function makeActive(
         mixed $response,
         string $expectedIssueId,
@@ -85,7 +99,7 @@ final readonly class OrbitIssueSnapshotFactory
 
     private function makeSnapshot(
         mixed $response,
-        string $expectedIssueId,
+        ?string $expectedIssueId,
         string $expectedIssueKey,
         string $expectedViewerId,
         ?string $expectedAssigneeId,
@@ -98,12 +112,12 @@ final readonly class OrbitIssueSnapshotFactory
         $viewerId = $this->requiredUuid($viewer['id'] ?? null);
 
         if (($root['errors'] ?? []) !== []
-            || ! $this->isUuid($expectedIssueId)
+            || ($expectedIssueId !== null && ! $this->isUuid($expectedIssueId))
             || preg_match('/^ORB-[0-9]+$/', $expectedIssueKey) !== 1
             || ! $this->isUuid($expectedViewerId)
             || ($expectedAssigneeId !== null && ! $this->isUuid($expectedAssigneeId))
             || $viewerId !== $expectedViewerId
-            || $issue['id'] !== $expectedIssueId
+            || ($expectedIssueId !== null && $issue['id'] !== $expectedIssueId)
             || $issue['identifier'] !== $expectedIssueKey) {
             throw new OrbitIssueProviderFailed('The Linear issue response does not match the requested Orbit issue.');
         }

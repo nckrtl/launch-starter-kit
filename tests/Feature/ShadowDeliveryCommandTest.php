@@ -2,12 +2,14 @@
 
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitIssueResolver;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -23,14 +25,19 @@ use function Pest\Laravel\mock;
 
 uses(RefreshDatabase::class);
 
-final class ShadowCommandIssueProvider implements OrbitIssueProvider
+final class ShadowCommandIssueProvider implements OrbitIssueProvider, OrbitIssueResolver
 {
     /** @var list<array{issue_id: string, issue_key: string}> */
     public array $requests = [];
 
+    /** @var list<string> */
+    public array $resolveRequests = [];
+
     public ?OrbitIssueProviderFailed $failure = null;
 
     public ?OrbitIssueSnapshot $freshSnapshot = null;
+
+    private bool $resolved = false;
 
     public function __construct(private readonly OrbitIssueSnapshot $snapshot) {}
 
@@ -42,9 +49,22 @@ final class ShadowCommandIssueProvider implements OrbitIssueProvider
             throw $this->failure;
         }
 
-        return count($this->requests) > 1 && $this->freshSnapshot !== null
+        return ($this->resolved || count($this->requests) > 1) && $this->freshSnapshot !== null
             ? $this->freshSnapshot
             : $this->snapshot;
+    }
+
+    public function resolve(string $issueKey): OrbitIssueSnapshot
+    {
+        $this->resolveRequests[] = $issueKey;
+
+        if ($this->failure !== null) {
+            throw $this->failure;
+        }
+
+        $this->resolved = true;
+
+        return $this->snapshot;
     }
 }
 
@@ -81,6 +101,7 @@ beforeEach(function () {
         contractHash: str_repeat('e', 64),
     ));
     app()->instance(OrbitIssueProvider::class, $this->issueProvider);
+    app()->instance(OrbitIssueResolver::class, $this->issueProvider);
 
     Queue::fake();
     Process::fake(['*' => Process::sequence()
@@ -116,6 +137,15 @@ function runShadowCommand(string $project, string $issueId, string $issueKey): a
     return [
         'project' => $project,
         'issue-id' => $issueId,
+        'issue-key' => $issueKey,
+        '--force' => true,
+    ];
+}
+
+function runOrbitCommand(string $project, string $issueKey): array
+{
+    return [
+        'project' => $project,
         'issue-key' => $issueKey,
         '--force' => true,
     ];
@@ -205,6 +235,103 @@ it('prepares and records an Orbit worktree before queueing advancement', functio
     Process::assertRan(fn ($process): bool => $process->command === ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir']
         && $process->path === realpath($this->worktree)
         && $process->timeout === 10);
+});
+
+it('starts a live Orbit delivery from its legacy-compatible issue key', function () {
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('Orbit delivery 1 queued for ORB-234 in project orbit.')
+        ->assertSuccessful();
+
+    $delivery = Delivery::sole();
+
+    expect($delivery->workflow_type)->toBe(OrbitFeatureWorkflow::TYPE)
+        ->and($delivery->status)->toBe(DeliveryStatus::Preparing)
+        ->and($delivery->current_phase)->toBe(OrbitFeatureWorkflow::INITIAL_PHASE)
+        ->and($delivery->external_issue_id)->toBe(shadowIssueId())
+        ->and($delivery->external_issue_key)->toBe('ORB-234')
+        ->and(PhaseRun::sole()->input['flow'])->toBe('discovery')
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234'])
+        ->and($this->issueProvider->requests)->toBe([
+            ['issue_id' => shadowIssueId(), 'issue_key' => 'ORB-234'],
+        ]);
+
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $job): bool => $job->deliveryId === $delivery->id,
+    );
+    Process::assertRanTimes(fn () => true, 5);
+});
+
+it('refuses a live Orbit start when event correlation is disabled', function () {
+    config()->set('herdr.orchestration.enabled', false);
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('Herdr orchestration is disabled.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+});
+
+it('rejects invalid live Orbit issue keys before resolution', function () {
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'not-a-key'))
+        ->expectsOutputToContain('issue key field format is invalid')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+});
+
+it('refuses a duplicate active live Orbit delivery before resolving the issue again', function () {
+    $arguments = runOrbitCommand('orbit', 'ORB-234');
+    $this->artisan('delivery:start-orbit', $arguments)->assertSuccessful();
+    Queue::fake();
+
+    $this->artisan('delivery:start-orbit', $arguments)
+        ->expectsOutput('An active delivery already exists for [ORB-234].')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(1)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234']);
+    Queue::assertNothingPushed();
+    Process::assertRanTimes(fn () => true, 5);
+});
+
+it('does not start a live Orbit delivery when key resolution fails', function () {
+    $this->issueProvider->failure = new OrbitIssueProviderFailed('The Linear issue is unavailable.');
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('The Linear issue is unavailable.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234'])
+        ->and($this->issueProvider->requests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+});
+
+it('does not start a live Orbit delivery when its contract changes during preparation', function () {
+    $this->issueProvider->freshSnapshot = new OrbitIssueSnapshot(
+        issueId: shadowIssueId(),
+        issueKey: 'ORB-234',
+        payload: ['id' => shadowIssueId(), 'identifier' => 'ORB-234', 'title' => 'Changed issue'],
+        contractHash: str_repeat('f', 64),
+    );
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('The Orbit issue contract changed before dispatch.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234'])
+        ->and($this->issueProvider->requests)->toHaveCount(1);
+    Queue::assertNothingPushed();
+    Process::assertRanTimes(fn () => true, 5);
 });
 
 it('refuses to start when shadow mode is disabled', function () {

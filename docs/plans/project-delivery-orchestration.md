@@ -634,8 +634,11 @@ the bounded, retryable initial planning-dispatch job. That job uses the existing
 durable prompt stage and relies on the Herdr settled event to queue receipt
 advancement. The existing shadow start remains unchanged. The live planning
 path therefore uses its real `Delivery` and `PhaseRun` instead of a second
-planning-only ledger. The normal start entry point still belongs to the legacy
-controller until an explicit Commander start boundary and a live canary pass.
+planning-only ledger. The explicit `delivery:start-orbit` boundary resolves the
+same uppercase issue key accepted by `bin/loop`, holds the shared controller
+reservation through preparation, and queues the generic advancement entry
+point. The normal `bin/loop` start still belongs to the legacy controller until
+a live Commander canary passes.
 
 ### Project registry boundary
 
