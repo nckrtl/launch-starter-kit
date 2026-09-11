@@ -8,6 +8,7 @@ use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\HerdrAgentIdentifiers;
+use App\Delivery\Data\HerdrAgentLaunch;
 use App\Delivery\Data\OpenedHerdrWorktree;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
@@ -42,8 +43,11 @@ final class WorkflowFakeHerdrRuntime implements HerdrRuntime
 
     public bool $reuseWorktree = false;
 
-    public function openWorktree(string $repositoryPath, string $worktreePath): OpenedHerdrWorktree
-    {
+    public function openWorktree(
+        string $repositoryPath,
+        string $worktreePath,
+        ?string $label = null,
+    ): OpenedHerdrWorktree {
         $this->calls[] = 'open:'.$repositoryPath.':'.$worktreePath;
 
         if ($this->reuseWorktree) {
@@ -63,8 +67,11 @@ final class WorkflowFakeHerdrRuntime implements HerdrRuntime
         return $this->ids("pane-{$this->sequence}", '');
     }
 
-    public function startAgent(string $paneId, string $name): HerdrAgentIdentifiers
-    {
+    public function startAgent(
+        string $paneId,
+        string $name,
+        ?HerdrAgentLaunch $launch = null,
+    ): HerdrAgentIdentifiers {
         $this->calls[] = 'start:'.$name;
 
         if ($this->failStartOnce) {

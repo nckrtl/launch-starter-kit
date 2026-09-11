@@ -1,5 +1,6 @@
 <?php
 
+use App\Delivery\Data\HerdrAgentLaunch;
 use App\Herdr\RequestFailed;
 use App\Herdr\SocketClient;
 use App\Herdr\SocketHerdrRuntime;
@@ -50,6 +51,28 @@ it('maps protocol 22 orchestration responses and sends exact methods', function 
             'focus' => false,
             'trust_repository' => false,
         ]);
+});
+
+it('passes a workflow-owned label and agent launch profile to Herdr', function () {
+    $runtime = new SocketHerdrRuntime(new SocketClient($this->server->socketPath));
+    $launch = new HerdrAgentLaunch('codex', ['-m', 'gpt-5.6-sol'], 120_000);
+
+    $runtime->openWorktree('/tmp/repository', '/tmp/worktree', 'ORB-234');
+    $runtime->startAgent('p1', 'orb-234-loop-builder', $launch);
+
+    expect($this->server->requests()[0]['params'])->toBe([
+        'cwd' => '/tmp/repository',
+        'path' => '/tmp/worktree',
+        'focus' => false,
+        'trust_repository' => false,
+        'label' => 'ORB-234',
+    ])->and($this->server->requests()[1]['params'])->toBe([
+        'pane_id' => 'p1',
+        'name' => 'orb-234-loop-builder',
+        'kind' => 'codex',
+        'args' => ['-m', 'gpt-5.6-sol'],
+        'timeout_ms' => 120_000,
+    ]);
 });
 
 it('retries a prompt while the named agent is becoming ready', function () {

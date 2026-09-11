@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace App\Delivery\Actions;
 
 use App\Delivery\Enums\AgentDispatchStatus;
+use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\ExternalEvent;
@@ -57,7 +59,13 @@ final readonly class CaptureHerdrEvent
             ->where('herdr_session', is_string($session) ? $session : '')
             ->when($paneId !== null, fn ($query) => $query->where('herdr_pane_id', $paneId))
             ->when($workspaceId !== null, fn ($query) => $query->where('herdr_workspace_id', $workspaceId))
-            ->whereIn('status', [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled])
+            ->where(function ($query): void {
+                $query->whereIn('status', [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled])
+                    ->orWhere(function ($query): void {
+                        $query->where('status', AgentDispatchStatus::Starting)
+                            ->where('error_code', 'herdr_prompt_attempted');
+                    });
+            })
             ->latest('id')
             ->first();
 
@@ -68,8 +76,18 @@ final readonly class CaptureHerdrEvent
             return;
         }
 
-        DB::transaction(function () use ($event, $dispatch): void {
+        $shouldAdvance = DB::transaction(function () use ($event, $dispatch): bool {
             $locked = AgentDispatch::query()->whereKey($dispatch->id)->lockForUpdate()->firstOrFail();
+            $promptWasAttempted = $locked->status === AgentDispatchStatus::Starting
+                && $locked->error_code === 'herdr_prompt_attempted';
+
+            if (! $promptWasAttempted
+                && ! in_array($locked->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true)) {
+                $event->failure_message = 'unmatched_dispatch';
+                $event->save();
+
+                return false;
+            }
 
             if ($locked->status !== AgentDispatchStatus::Settled) {
                 $locked->status = AgentDispatchStatus::Settled;
@@ -77,14 +95,25 @@ final readonly class CaptureHerdrEvent
                 $locked->save();
             }
 
-            $phaseRun = $locked->phaseRun()->firstOrFail();
+            $phaseRun = $locked->phaseRun()->with('delivery')->firstOrFail();
             $event->delivery_id = $phaseRun->delivery_id;
             $event->agent_dispatch_id = $locked->id;
             $event->failure_message = null;
             $event->save();
+
+            if ($promptWasAttempted
+                && $phaseRun->delivery->status === DeliveryStatus::Preparing) {
+                $phaseRun->delivery->status = DeliveryStatus::WaitingForAgent;
+                $phaseRun->delivery->save();
+            }
+
+            return $phaseRun->delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+                || $phaseRun->delivery->workflow_version !== OrbitFeatureWorkflow::VERSION;
         });
 
-        AdvanceDelivery::dispatch((int) $event->delivery_id)->afterCommit();
+        if ($shouldAdvance) {
+            AdvanceDelivery::dispatch((int) $event->delivery_id)->afterCommit();
+        }
 
         $event->processed_at = now();
         $event->save();

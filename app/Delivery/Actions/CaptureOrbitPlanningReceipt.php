@@ -35,7 +35,9 @@ final readonly class CaptureOrbitPlanningReceipt
                 || $lockedPhase->delivery->current_phase !== OrbitFeatureWorkflow::INITIAL_PHASE
                 || $lockedPhase->phase_name !== OrbitFeatureWorkflow::INITIAL_PHASE
                 || $lockedPhase->status !== PhaseRunStatus::Running
-                || $lockedDispatch->status !== AgentDispatchStatus::Waiting
+                || (! ($lockedDispatch->status === AgentDispatchStatus::Starting
+                    && $lockedDispatch->error_code === 'herdr_prompt_attempted')
+                    && ! in_array($lockedDispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true))
                 || ! $this->matchesLedger($lockedPhase, $lockedDispatch, $payload)) {
                 throw new OrbitPlanningReceiptFailed('The planning receipt no longer matches the active dispatch.');
             }

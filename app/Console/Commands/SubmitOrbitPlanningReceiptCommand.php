@@ -57,7 +57,9 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
             || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::INITIAL_PHASE
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::INITIAL_PHASE
             || $phaseRun->status !== PhaseRunStatus::Running
-            || $dispatch->status !== AgentDispatchStatus::Waiting) {
+            || (! ($dispatch->status === AgentDispatchStatus::Starting
+                && $dispatch->error_code === 'herdr_prompt_attempted')
+                && ! in_array($dispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true))) {
             $this->error('The planning phase run and dispatch do not match an active Orbit worker.');
 
             return self::FAILURE;

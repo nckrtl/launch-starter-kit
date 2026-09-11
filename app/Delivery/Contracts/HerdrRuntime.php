@@ -5,15 +5,24 @@ declare(strict_types=1);
 namespace App\Delivery\Contracts;
 
 use App\Delivery\Data\HerdrAgentIdentifiers;
+use App\Delivery\Data\HerdrAgentLaunch;
 use App\Delivery\Data\OpenedHerdrWorktree;
 
 interface HerdrRuntime
 {
-    public function openWorktree(string $repositoryPath, string $worktreePath): OpenedHerdrWorktree;
+    public function openWorktree(
+        string $repositoryPath,
+        string $worktreePath,
+        ?string $label = null,
+    ): OpenedHerdrWorktree;
 
     public function splitPane(string $paneId, string $workingDirectory): HerdrAgentIdentifiers;
 
-    public function startAgent(string $paneId, string $name): HerdrAgentIdentifiers;
+    public function startAgent(
+        string $paneId,
+        string $name,
+        ?HerdrAgentLaunch $launch = null,
+    ): HerdrAgentIdentifiers;
 
     public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers;
 

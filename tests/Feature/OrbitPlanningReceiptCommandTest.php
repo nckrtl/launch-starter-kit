@@ -175,6 +175,32 @@ it('captures a blocked planning receipt without an artifact or plan validation',
     Queue::assertNothingPushed();
 });
 
+it('accepts a valid receipt after Herdr settles the exact planning dispatch', function () {
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+
+    $this->artisan('delivery:submit-orbit-receipt', $this->arguments)->assertSuccessful();
+
+    expect(Receipt::sole()->payload['dispatch_id'])->toBe($this->dispatch->id)
+        ->and(Receipt::sole()->validation_status)->toBe(ReceiptValidationStatus::Valid);
+    Queue::assertNothingPushed();
+});
+
+it('accepts a receipt that proves a prompt reached the worker before the prompt RPC returns', function () {
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Starting,
+        'error_code' => 'herdr_prompt_attempted',
+    ])->save();
+
+    $this->artisan('delivery:submit-orbit-receipt', $this->arguments)->assertSuccessful();
+
+    expect(Receipt::sole()->payload['dispatch_id'])->toBe($this->dispatch->id)
+        ->and(Receipt::sole()->validation_status)->toBe(ReceiptValidationStatus::Valid);
+    Queue::assertNothingPushed();
+});
+
 it('requires the exact active planning dispatch', function () {
     $this->artisan('delivery:submit-orbit-receipt', [
         ...$this->arguments,

@@ -6,6 +6,7 @@ namespace App\Herdr;
 
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
+use App\Delivery\Data\HerdrAgentLaunch;
 use App\Delivery\Data\OpenedHerdrWorktree;
 use InvalidArgumentException;
 use Throwable;
@@ -18,14 +19,23 @@ final readonly class SocketHerdrRuntime implements HerdrRuntime
 
     public function __construct(private SocketClient $client) {}
 
-    public function openWorktree(string $repositoryPath, string $worktreePath): OpenedHerdrWorktree
-    {
-        $result = $this->client->request('worktree.open', [
+    public function openWorktree(
+        string $repositoryPath,
+        string $worktreePath,
+        ?string $label = null,
+    ): OpenedHerdrWorktree {
+        $parameters = [
             'cwd' => $repositoryPath,
             'path' => $worktreePath,
             'focus' => false,
             'trust_repository' => false,
-        ]);
+        ];
+
+        if ($label !== null) {
+            $parameters['label'] = $label;
+        }
+
+        $result = $this->client->request('worktree.open', $parameters);
         $this->assertType($result, 'worktree_opened');
         $workspace = Payload::assoc($result['workspace'] ?? null);
         $tab = Payload::assoc($result['tab'] ?? null);
@@ -53,14 +63,18 @@ final readonly class SocketHerdrRuntime implements HerdrRuntime
         return $this->identifiers(Payload::assoc($result['pane'] ?? null), '');
     }
 
-    public function startAgent(string $paneId, string $name): HerdrAgentIdentifiers
-    {
+    public function startAgent(
+        string $paneId,
+        string $name,
+        ?HerdrAgentLaunch $launch = null,
+    ): HerdrAgentIdentifiers {
+        $launch ??= HerdrAgentLaunch::default();
         $result = $this->client->request('agent.start', [
             'pane_id' => $paneId,
             'name' => $name,
-            'kind' => 'codex',
-            'args' => [],
-            'timeout_ms' => 15_000,
+            'kind' => $launch->kind,
+            'args' => $launch->arguments,
+            'timeout_ms' => $launch->timeoutMilliseconds,
         ]);
         $this->assertType($result, 'agent_started');
 
