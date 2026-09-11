@@ -9,11 +9,13 @@ use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
+use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
 use App\Delivery\IssueProviders\SshOrbitIssueTransitioner;
 use App\Delivery\PullRequests\SshOrbitPullRequestPublisher;
+use App\Delivery\PullRequests\SshOrbitPullRequestReviewPublisher;
 use App\Delivery\Repositories\ProcessOrbitRepository;
 use App\Herdr\SocketClient;
 use App\Herdr\SocketHerdrRuntime;
@@ -37,6 +39,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitReviewIssueTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitPullRequestInspector::class, SshOrbitPullRequestPublisher::class);
         $this->app->bind(OrbitPullRequestPublisher::class, SshOrbitPullRequestPublisher::class);
+        $this->app->bind(OrbitPullRequestReviewPublisher::class, SshOrbitPullRequestReviewPublisher::class);
 
         $this->app->bind(HerdrRuntime::class, function (): SocketHerdrRuntime {
             $path = config('herdr.socket');

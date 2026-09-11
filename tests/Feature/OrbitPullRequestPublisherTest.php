@@ -2,7 +2,9 @@
 
 use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
+use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
 use App\Delivery\Exceptions\OrbitPullRequestPublicationFailed;
+use App\Delivery\Exceptions\OrbitPullRequestReviewPublicationFailed;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Sleep;
 
@@ -42,7 +44,7 @@ function orbitPullRequestDetails(
     ];
 }
 /**
- * @param  list<array{path: string, method?: string, body?: array<string, mixed>, output?: mixed, exit?: int}>  $responses
+ * @param  list<array{path: string, app?: bool, method?: string, body?: array<string, mixed>, output?: mixed, exit?: int}>  $responses
  */
 function fakeOrbitPullRequestPublisher(array $responses): void
 {
@@ -60,6 +62,7 @@ function fakeOrbitPullRequestPublisher(array $responses): void
             ->and($input)->toBe([
                 'service' => 'github',
                 'path' => 'repos/nckrtl/orbit/'.$expected['path'],
+                ...(isset($expected['app']) ? ['app' => $expected['app']] : []),
                 ...(isset($expected['method']) ? ['method' => $expected['method']] : []),
                 ...(array_key_exists('body', $expected) ? ['body' => $expected['body']] : []),
             ]);
@@ -72,6 +75,18 @@ function fakeOrbitPullRequestPublisher(array $responses): void
         );
     })->preventStrayProcesses();
 
+}
+
+/** @return array<string, mixed> */
+function orbitPublishedReview(string $candidate, string $body, string $state, int $id = 901): array
+{
+    return [
+        'id' => $id,
+        'user' => ['login' => 'tom-nckrtl[bot]'],
+        'commit_id' => $candidate,
+        'body' => $body,
+        'state' => $state,
+    ];
 }
 
 it('creates and reads back one exact Orbit pull request', function () {
@@ -126,6 +141,304 @@ it('inspects one exact pull request without mutation or mergeability polling', f
     Process::assertRanTimes(fn () => true, 1);
     Sleep::assertNeverSlept();
 });
+
+it('updates the approved body and publishes one exact app approval', function () {
+    $approvedBody = $this->body."\nReviewer-authored final body.";
+    fakeOrbitPullRequestPublisher([
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $this->body)],
+        ['path' => 'pulls/42', 'method' => 'PATCH', 'body' => ['body' => $approvedBody]],
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $approvedBody)],
+        ['path' => 'pulls/42/reviews?per_page=100', 'output' => []],
+        [
+            'path' => 'pulls/42/reviews',
+            'app' => true,
+            'method' => 'POST',
+            'body' => [
+                'commit_id' => $this->candidate,
+                'body' => 'Approved.',
+                'event' => 'APPROVE',
+            ],
+        ],
+        [
+            'path' => 'pulls/42/reviews?per_page=100',
+            'output' => [orbitPublishedReview($this->candidate, 'Approved.', 'APPROVED')],
+        ],
+    ]);
+
+    $published = app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'approved',
+        'All acceptance items passed.',
+        $approvedBody,
+    );
+
+    expect($published->id)->toBe(901)
+        ->and($published->pullRequestNumber)->toBe(42)
+        ->and($published->reviewerLogin)->toBe('tom-nckrtl[bot]')
+        ->and($published->candidateSha)->toBe($this->candidate)
+        ->and($published->state)->toBe('APPROVED')
+        ->and($published->reviewBodyHash)->toBe(hash('sha256', 'Approved.'))
+        ->and($published->pullRequestBodyHash)->toBe(hash('sha256', $approvedBody));
+});
+
+it('publishes an exact changes-requested review without changing the pull request body', function () {
+    $handoff = 'Fix every listed finding.';
+    fakeOrbitPullRequestPublisher([
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $this->body)],
+        [
+            'path' => 'pulls/42/reviews?per_page=100',
+            'output' => [orbitPublishedReview($this->candidate, $handoff, 'CHANGES_REQUESTED')],
+        ],
+    ]);
+
+    $published = app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'changes',
+        $handoff,
+        null,
+    );
+
+    expect($published->state)->toBe('CHANGES_REQUESTED')
+        ->and($published->reviewBodyHash)->toBe(hash('sha256', $handoff))
+        ->and($published->pullRequestBodyHash)->toBe(hash('sha256', $this->body));
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('replays an already published approval without another mutation', function () {
+    $approvedBody = $this->body."\nReviewer-authored final body.";
+    fakeOrbitPullRequestPublisher([
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $approvedBody)],
+        [
+            'path' => 'pulls/42/reviews?per_page=100',
+            'output' => [orbitPublishedReview($this->candidate, 'Approved.', 'APPROVED')],
+        ],
+    ]);
+
+    $published = app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'approved',
+        'All acceptance items passed.',
+        $approvedBody,
+    );
+
+    expect($published->id)->toBe(901);
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('selects the greatest exact review ID during replay', function () {
+    fakeOrbitPullRequestPublisher([
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $this->body)],
+        [
+            'path' => 'pulls/42/reviews?per_page=100',
+            'output' => [
+                orbitPublishedReview($this->candidate, 'Fix every listed finding.', 'CHANGES_REQUESTED', 903),
+                orbitPublishedReview($this->candidate, 'Fix every listed finding.', 'CHANGES_REQUESTED', 901),
+            ],
+        ],
+    ]);
+
+    $published = app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'changes',
+        'Fix every listed finding.',
+        null,
+    );
+
+    expect($published->id)->toBe(903);
+    Process::assertRanTimes(fn () => true, 2);
+});
+
+it('does not replay reviews with different provenance or contents', function () {
+    $otherCandidate = str_repeat('c', 40);
+    fakeOrbitPullRequestPublisher([
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $this->body)],
+        [
+            'path' => 'pulls/42/reviews?per_page=100',
+            'output' => [
+                [...orbitPublishedReview($this->candidate, 'Fix it.', 'CHANGES_REQUESTED', 1), 'user' => ['login' => 'nckrtl']],
+                orbitPublishedReview($otherCandidate, 'Fix it.', 'CHANGES_REQUESTED', 2),
+                orbitPublishedReview($this->candidate, 'Different body.', 'CHANGES_REQUESTED', 3),
+                orbitPublishedReview($this->candidate, 'Fix it.', 'COMMENTED', 4),
+            ],
+        ],
+        [
+            'path' => 'pulls/42/reviews',
+            'app' => true,
+            'method' => 'POST',
+            'body' => [
+                'commit_id' => $this->candidate,
+                'body' => 'Fix it.',
+                'event' => 'REQUEST_CHANGES',
+            ],
+        ],
+        [
+            'path' => 'pulls/42/reviews?per_page=100',
+            'output' => [orbitPublishedReview($this->candidate, 'Fix it.', 'CHANGES_REQUESTED', 5)],
+        ],
+    ]);
+
+    $published = app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'changes',
+        'Fix it.',
+        null,
+    );
+
+    expect($published->id)->toBe(5);
+    Process::assertRanTimes(fn () => true, 4);
+});
+
+it('recovers lost pull request body and review publication responses through exact read-back', function () {
+    $approvedBody = $this->body."\nReviewer-authored final body.";
+    fakeOrbitPullRequestPublisher([
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $this->body)],
+        ['path' => 'pulls/42', 'method' => 'PATCH', 'body' => ['body' => $approvedBody], 'exit' => 1],
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $approvedBody)],
+        ['path' => 'pulls/42/reviews?per_page=100', 'output' => []],
+        [
+            'path' => 'pulls/42/reviews',
+            'app' => true,
+            'method' => 'POST',
+            'body' => [
+                'commit_id' => $this->candidate,
+                'body' => 'Approved.',
+                'event' => 'APPROVE',
+            ],
+            'exit' => 1,
+        ],
+        [
+            'path' => 'pulls/42/reviews?per_page=100',
+            'output' => [orbitPublishedReview($this->candidate, 'Approved.', 'APPROVED')],
+        ],
+    ]);
+
+    $published = app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'approved',
+        'All acceptance items passed.',
+        $approvedBody,
+    );
+
+    expect($published->id)->toBe(901);
+});
+
+it('rejects an unresolved review publication and review history requiring pagination', function (string $failure) {
+    $reviews = $failure === 'pagination'
+        ? array_fill(0, 100, orbitPublishedReview($this->candidate, 'Other.', 'COMMENTED'))
+        : [];
+    $responses = [
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $this->body)],
+        ['path' => 'pulls/42/reviews?per_page=100', 'output' => $reviews],
+    ];
+
+    if ($failure === 'unresolved') {
+        $responses[] = [
+            'path' => 'pulls/42/reviews',
+            'app' => true,
+            'method' => 'POST',
+            'body' => [
+                'commit_id' => $this->candidate,
+                'body' => 'Fix the finding.',
+                'event' => 'REQUEST_CHANGES',
+            ],
+        ];
+        $responses[] = ['path' => 'pulls/42/reviews?per_page=100', 'output' => []];
+    }
+
+    fakeOrbitPullRequestPublisher($responses);
+
+    expect(fn () => app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'changes',
+        'Fix the finding.',
+        null,
+    ))->toThrow(
+        OrbitPullRequestReviewPublicationFailed::class,
+        $failure === 'pagination' ? 'requires pagination' : 'outcome is unresolved',
+    );
+})->with(['unresolved', 'pagination']);
+
+it('rejects malformed review history', function (mixed $reviews) {
+    fakeOrbitPullRequestPublisher([
+        ['path' => 'pulls/42', 'output' => orbitPullRequestDetails($this->candidate, $this->body)],
+        ['path' => 'pulls/42/reviews?per_page=100', 'output' => $reviews],
+    ]);
+
+    expect(fn () => app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'changes',
+        'Fix it.',
+        null,
+    ))->toThrow(OrbitPullRequestReviewPublicationFailed::class);
+})->with([
+    'invalid JSON' => ['{'],
+    'not a list' => [['review' => orbitPublishedReview(str_repeat('a', 40), 'Fix it.', 'CHANGES_REQUESTED')]],
+    'invalid review ID' => [[orbitPublishedReview(str_repeat('a', 40), 'Fix it.', 'CHANGES_REQUESTED', 0)]],
+    'missing actor' => [[['id' => 1, 'commit_id' => str_repeat('a', 40), 'body' => 'Fix it.', 'state' => 'CHANGES_REQUESTED']]],
+]);
+
+it('rejects an unexpected pull request body before an approval retry', function () {
+    $approvedBody = $this->body."\nReviewer-authored final body.";
+    fakeOrbitPullRequestPublisher([[
+        'path' => 'pulls/42',
+        'output' => orbitPullRequestDetails($this->candidate, 'Unexpected concurrent body.'),
+    ]]);
+
+    expect(fn () => app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        'approved',
+        'All acceptance items passed.',
+        $approvedBody,
+    ))->toThrow(OrbitPullRequestReviewPublicationFailed::class, 'read-back differs');
+
+    Process::assertRanTimes(fn () => true, 1);
+});
+
+it('rejects invalid pull request review publication input', function (string $result, ?string $approvedBody) {
+    expect(fn () => app(OrbitPullRequestReviewPublisher::class)->publishReview(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+        $result,
+        'Review handoff.',
+        $approvedBody,
+    ))->toThrow(OrbitPullRequestReviewPublicationFailed::class, 'publication input is invalid');
+
+    Process::assertNothingRan();
+})->with([
+    'unknown result' => ['pass', null],
+    'blocked result' => ['blocked', null],
+    'approved without body' => ['approved', null],
+    'changes with body' => ['changes', 'Replacement body'],
+]);
 
 it('updates an existing pull request and accepts a lost patch response only after exact read-back', function () {
     fakeOrbitPullRequestPublisher([
