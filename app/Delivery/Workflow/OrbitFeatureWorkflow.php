@@ -16,6 +16,8 @@ final readonly class OrbitFeatureWorkflow
 
     public const string IMPLEMENTATION_PHASE = 'implementing';
 
+    public const string PR_REVIEW_PHASE = 'pr_review';
+
     public const string RESOLUTION_PHASE = 'resolution';
 
     public const string PLANNING_AGENT_ROLE = 'planner';
@@ -23,6 +25,8 @@ final readonly class OrbitFeatureWorkflow
     public const string PLAN_REVIEW_AGENT_ROLE = 'plan-reviewer';
 
     public const string IMPLEMENTATION_AGENT_ROLE = 'implementer';
+
+    public const string PR_REVIEW_AGENT_ROLE = 'pr-reviewer';
 
     public const string RESOLUTION_AGENT_ROLE = 'resolver';
 

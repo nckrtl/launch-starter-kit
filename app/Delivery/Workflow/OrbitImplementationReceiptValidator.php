@@ -56,6 +56,10 @@ final readonly class OrbitImplementationReceiptValidator
         $review = $reviewReceipt?->phaseRun;
         $reviewDispatch = $review?->agentDispatches->first();
 
+        $reviewedCandidate = $payload['candidate_sha'] ?? null;
+        $reviewDelivery = clone $delivery;
+        $reviewDelivery->candidate_sha = is_string($reviewedCandidate) ? $reviewedCandidate : null;
+
         return $reviewReceipt !== null && $review !== null && $reviewDispatch !== null
             && $implementation->delivery_id === $delivery->id
             && $implementation->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
@@ -70,8 +74,9 @@ final readonly class OrbitImplementationReceiptValidator
             && $reviewDispatch->status === AgentDispatchStatus::Settled
             && $reviewReceipt->payload === $payload
             && ($payload['result'] ?? null) === 'pass'
-            && ($payload['candidate_sha'] ?? null) === $delivery->candidate_sha
-            && $this->reviewReceipts->matches($delivery, $review, $reviewDispatch, $reviewReceipt);
+            && is_string($reviewedCandidate)
+            && preg_match('/^[a-f0-9]{40}$/', $reviewedCandidate) === 1
+            && $this->reviewReceipts->matches($reviewDelivery, $review, $reviewDispatch, $reviewReceipt);
     }
 
     /** @param array<string, mixed> $payload */
@@ -99,7 +104,7 @@ final readonly class OrbitImplementationReceiptValidator
             && ($payload['attempt'] ?? null) === $phase->attempt
             && in_array($payload['result'] ?? null, ['ready', 'blocked'], true)
             && ($payload['worktree'] ?? null) === $delivery->worktree_path
-            && ($payload['reviewed_candidate_sha'] ?? null) === $delivery->candidate_sha
+            && ($payload['reviewed_candidate_sha'] ?? null) === $this->reviewedCandidate($phase)
             && is_string($payload['candidate_sha'] ?? null)
             && preg_match('/^[a-f0-9]{40}$/', $payload['candidate_sha']) === 1
             && is_string($payload['handoff_path'] ?? null)
@@ -132,5 +137,13 @@ final readonly class OrbitImplementationReceiptValidator
             && is_string($payload['pull_request_body_sha256'] ?? null)
             && hash_equals($payload['pull_request_body_sha256'], hash('sha256', $payload['pull_request_body']))
             && ($payload['flow'] ?? null) === 'discovery';
+    }
+
+    private function reviewedCandidate(PhaseRun $phase): mixed
+    {
+        $input = $phase->input;
+        $review = is_array($input) ? ($input['plan_review_receipt'] ?? null) : null;
+
+        return is_array($review) ? ($review['candidate_sha'] ?? null) : null;
     }
 }

@@ -17,6 +17,7 @@ use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
+use App\Jobs\AdvanceOrbitImplementation as AdvanceOrbitImplementationJob;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
 use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPlanningCorrection;
@@ -76,9 +77,20 @@ final readonly class AdvanceDeliveryAction
                 AdvanceOrbitPlanReviewJob::dispatch($deliveryId)->afterCommit();
             }
 
-            if ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+            $implementation = $delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+                ? $delivery->phaseRuns()
+                    ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+                    ->latest('attempt')
+                    ->first()
+                : null;
+
+            if ($implementation?->attempt === 1
                 && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                 DispatchOrbitImplementation::dispatch($deliveryId)->afterCommit();
+            }
+
+            if ($implementation?->attempt === 1 && $delivery->status === DeliveryStatus::WaitingForAgent) {
+                AdvanceOrbitImplementationJob::dispatch($deliveryId)->afterCommit();
             }
 
             return false;
