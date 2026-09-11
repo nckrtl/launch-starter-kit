@@ -77,7 +77,7 @@ final readonly class OrbitPlanReviewReceiptValidator
             );
     }
 
-    private function matchesPlanningProvenance(Delivery $delivery, PhaseRun $planning): bool
+    public function matchesPlanningProvenance(Delivery $delivery, PhaseRun $planning): bool
     {
         if ($planning->attempt === 1) {
             return true;

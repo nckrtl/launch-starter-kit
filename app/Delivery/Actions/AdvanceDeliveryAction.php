@@ -51,9 +51,11 @@ final readonly class AdvanceDeliveryAction
                 if ($planning?->attempt === 2) {
                     if (in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                         DispatchOrbitPlanningCorrection::dispatch($deliveryId)->afterCommit();
+
+                        return false;
                     }
 
-                    return false;
+                    return $this->advanceOrbitPlanning->handle($deliveryId);
                 }
 
                 if ($delivery->status === DeliveryStatus::Queued) {

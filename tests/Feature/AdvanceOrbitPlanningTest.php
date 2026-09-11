@@ -1,6 +1,7 @@
 <?php
 
 use App\Delivery\Actions\AdvanceDeliveryAction;
+use App\Delivery\Actions\AdvanceOrbitPlanning;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPlanReview;
 use App\Delivery\Actions\StartOrbitDelivery;
@@ -215,6 +216,7 @@ afterEach(fn () => File::deleteDirectory($this->base));
 function capturePlanningAdvancementReceipt(object $test, string $result = 'ready'): Receipt
 {
     $ready = $result === 'ready';
+    $correction = $test->phase->attempt === 2;
     $payload = [
         'kind' => 'orbit_planning',
         'schema_version' => 1,
@@ -222,12 +224,16 @@ function capturePlanningAdvancementReceipt(object $test, string $result = 'ready
         'dispatch_id' => $test->planner->id,
         'issue_key' => 'ORB-234',
         'phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
-        'attempt' => 1,
+        'attempt' => $test->phase->attempt,
         'result' => $result,
         'worktree' => $test->worktree,
         'candidate_sha' => $test->candidateSha,
-        'handoff_path' => '.loop/runtime/planning-handoff.md',
-        'handoff' => $ready ? 'Planning is ready for independent review.' : 'Planning stopped on a missing product decision.',
+        'handoff_path' => $correction
+            ? '.loop/runtime/planning-correction-handoff.md'
+            : '.loop/runtime/planning-handoff.md',
+        'handoff' => $ready
+            ? ($correction ? 'The review findings were corrected.' : 'Planning is ready for independent review.')
+            : 'Planning stopped on a missing product decision.',
         'artifact_sha' => $ready ? $test->artifactSha : null,
         'plan_sha256' => $ready ? $test->planHash : null,
     ];
@@ -243,6 +249,99 @@ function capturePlanningAdvancementReceipt(object $test, string $result = 'ready
         'captured_at' => now(),
         'validated_at' => now(),
     ]);
+}
+
+/** @return array{Receipt, PhaseRun} */
+function preparePlanningCorrectionAdvancement(object $test): array
+{
+    $planningReceipt = capturePlanningAdvancementReceipt($test);
+    $test->phase->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'output' => ['receipt_id' => $planningReceipt->id, 'result' => 'ready'],
+        'finished_at' => now(),
+    ])->save();
+    $review = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PLAN_REVIEW_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Completed,
+        'input' => [
+            'planning_receipt_id' => $planningReceipt->id,
+            'planning_receipt' => $planningReceipt->payload,
+        ],
+        'started_at' => now(),
+        'finished_at' => now(),
+    ]);
+    $reviewer = AgentDispatch::query()->create([
+        'phase_run_id' => $review->id,
+        'agent_role' => OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE,
+        'idempotency_key' => 'planning-correction-reviewer',
+        'herdr_agent_name' => 'orb-234-loop-plan-review',
+        'prompt_name' => 'orbit_plan_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('7', 64),
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ]);
+    $reviewPayload = [
+        'kind' => 'orbit_plan_review',
+        'schema_version' => 1,
+        'delivery_id' => $test->delivery->id,
+        'dispatch_id' => $reviewer->id,
+        'issue_key' => 'ORB-234',
+        'phase' => OrbitFeatureWorkflow::PLAN_REVIEW_PHASE,
+        'attempt' => 1,
+        'result' => 'fix',
+        'worktree' => $test->worktree,
+        'candidate_sha' => $test->candidateSha,
+        'handoff_path' => '.loop/runtime/plan-review-handoff.md',
+        'handoff' => 'Correct every preflight finding.',
+        'artifact_sha' => str_repeat('f', 40),
+        'plan_sha256' => str_repeat('6', 64),
+    ];
+    $reviewReceipt = Receipt::query()->create([
+        'phase_run_id' => $review->id,
+        'kind' => 'orbit_plan_review',
+        'schema_version' => 1,
+        'payload' => $reviewPayload,
+        'payload_hash' => hash('sha256', json_encode($reviewPayload, JSON_THROW_ON_ERROR)),
+        'candidate_sha' => $test->candidateSha,
+        'validation_status' => ReceiptValidationStatus::Valid,
+        'captured_at' => now(),
+        'validated_at' => now(),
+    ]);
+    $review->forceFill(['output' => ['receipt_id' => $reviewReceipt->id, 'result' => 'fix']])->save();
+    $correction = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Running,
+        'input' => [
+            'plan_review_receipt_id' => $reviewReceipt->id,
+            'plan_review_receipt' => $reviewReceipt->payload,
+        ],
+        'started_at' => now(),
+    ]);
+    $planner = AgentDispatch::query()->create([
+        'phase_run_id' => $correction->id,
+        'agent_role' => OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        'idempotency_key' => 'planning-correction-planner',
+        'herdr_agent_name' => 'orb-234-loop-builder',
+        'prompt_name' => 'orbit_planning_correction',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('8', 64),
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ]);
+    $test->delivery->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'candidate_sha' => $test->candidateSha,
+        'status' => DeliveryStatus::WaitingForAgent,
+    ])->save();
+    $test->phase = $correction;
+    $test->planner = $planner;
+
+    return [$reviewReceipt, $correction];
 }
 
 it('atomically consumes a ready planning receipt into one independent plan-review intent', function () {
@@ -330,6 +429,94 @@ it('records a blocked planning handoff without creating a reviewer', function ()
         ->and(PhaseRun::count())->toBe(1)
         ->and(AgentDispatch::count())->toBe(1)
         ->and($this->repository->verifications)->toBe(1);
+});
+
+it('routes a ready planning correction to plan review attempt two', function () {
+    [$fixReceipt, $correction] = preparePlanningCorrectionAdvancement($this);
+    $receipt = capturePlanningAdvancementReceipt($this);
+    $action = app(AdvanceOrbitPlanning::class);
+
+    expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeTrue()
+        ->and($action->handle($this->delivery->id))->toBeFalse();
+
+    $review = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    $reviewer = $review->agentDispatches()->sole();
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($correction->fresh()->output)->toBe(['receipt_id' => $receipt->id, 'result' => 'ready'])
+        ->and($correction->input)->toBe([
+            'plan_review_receipt_id' => $fixReceipt->id,
+            'plan_review_receipt' => $fixReceipt->payload,
+        ])
+        ->and($review->input)->toBe([
+            'planning_receipt_id' => $receipt->id,
+            'planning_receipt' => $receipt->payload,
+        ])
+        ->and($reviewer->agent_role)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE)
+        ->and($reviewer->herdr_agent_name)->toBe('orb-234-loop-plan-review')
+        ->and($reviewer->status)->toBe(AgentDispatchStatus::Pending)
+        ->and(PhaseRun::count())->toBe(4)
+        ->and(AgentDispatch::count())->toBe(4)
+        ->and($this->repository->verifications)->toBe(1);
+});
+
+it('routes a blocked planning correction to resolution with complete provenance', function () {
+    [$fixReceipt, $correction] = preparePlanningCorrectionAdvancement($this);
+    $receipt = capturePlanningAdvancementReceipt($this, 'blocked');
+    $this->repository->outcome = new VerifiedOrbitPlanningOutcome(
+        $this->candidateSha,
+        $this->treeSha,
+        null,
+        null,
+    );
+    $action = app(AdvanceOrbitPlanning::class);
+
+    expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeTrue()
+        ->and($action->handle($this->delivery->id))->toBeFalse();
+
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->where('attempt', 1)
+        ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($correction->fresh()->output)->toBe(['receipt_id' => $receipt->id, 'result' => 'blocked'])
+        ->and($resolution->input)->toBe([
+            'planning_receipt_id' => $receipt->id,
+            'planning_receipt' => $receipt->payload,
+            'plan_review_receipt_id' => $fixReceipt->id,
+            'plan_review_receipt' => $fixReceipt->payload,
+        ])
+        ->and($resolver->agent_role)->toBe(OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE)
+        ->and($resolver->herdr_agent_name)->toBe('orb-234-loop-resolution-1')
+        ->and($resolver->prompt_name)->toBe('orbit_resolution')
+        ->and($resolver->status)->toBe(AgentDispatchStatus::Pending)
+        ->and(PhaseRun::count())->toBe(4)
+        ->and(AgentDispatch::count())->toBe(4)
+        ->and($this->repository->verifications)->toBe(1);
+});
+
+it('rejects changed correction provenance before consuming its receipt', function () {
+    preparePlanningCorrectionAdvancement($this);
+    capturePlanningAdvancementReceipt($this);
+    $input = $this->phase->input;
+    $input['plan_review_receipt']['handoff'] = 'Changed review findings.';
+    $this->phase->forceFill(['input' => $input])->save();
+
+    expect(fn () => app(AdvanceOrbitPlanning::class)->handle($this->delivery->id))
+        ->toThrow(OrbitPlanningAdvancementFailed::class, 'correction provenance is inconsistent');
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::INITIAL_PHASE)
+        ->and($this->phase->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->repository->verifications)->toBe(0);
 });
 
 it('refuses a repository outcome that does not match the immutable receipt', function () {
