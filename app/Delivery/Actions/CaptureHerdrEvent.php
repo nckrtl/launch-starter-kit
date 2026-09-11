@@ -6,6 +6,7 @@ namespace App\Delivery\Actions;
 
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Enums\PhaseRunStatus;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -56,7 +57,8 @@ final readonly class CaptureHerdrEvent
         $workspaceId = is_string($data['workspace_id'] ?? null) ? $data['workspace_id'] : null;
         $session = config('herdr.session');
 
-        $dispatch = AgentDispatch::query()
+        $dispatches = AgentDispatch::query()
+            ->with('phaseRun.delivery')
             ->where('herdr_session', is_string($session) ? $session : '')
             ->when($paneId !== null, fn ($query) => $query->where('herdr_pane_id', $paneId))
             ->when($workspaceId !== null, fn ($query) => $query->where('herdr_workspace_id', $workspaceId))
@@ -67,15 +69,26 @@ final readonly class CaptureHerdrEvent
                             ->where('error_code', 'herdr_prompt_attempted');
                     });
             })
-            ->latest('id')
-            ->first();
+            ->get()
+            ->filter(static function (AgentDispatch $candidate): bool {
+                $phase = $candidate->phaseRun;
+                $delivery = $phase->delivery;
 
-        if ($paneId === null || $dispatch === null) {
-            $event->failure_message = 'unmatched_dispatch';
+                return $phase->status === PhaseRunStatus::Running
+                    && $delivery->current_phase === $phase->phase_name
+                    && in_array($delivery->status, [DeliveryStatus::Preparing, DeliveryStatus::WaitingForAgent], true);
+            });
+
+        if ($paneId === null || $dispatches->count() !== 1) {
+            $event->failure_message = $dispatches->count() > 1
+                ? 'ambiguous_dispatch'
+                : 'unmatched_dispatch';
             $event->save();
 
             return;
         }
+
+        $dispatch = $dispatches->firstOrFail();
 
         $deliveryId = PhaseRun::query()->whereKey($dispatch->phase_run_id)->value('delivery_id');
 

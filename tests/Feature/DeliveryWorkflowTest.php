@@ -217,6 +217,99 @@ it('starts each phase once and advances two phases idempotently from repeated ev
         ->and(AgentDispatch::count())->toBe(2);
 });
 
+it('correlates a reused Herdr pane to its current active dispatch', function () {
+    Queue::fake();
+    (new AdvanceDelivery($this->delivery->id))->handle(app(AdvanceDeliveryAction::class));
+    $first = AgentDispatch::sole();
+    $first->phaseRun->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'finished_at' => now(),
+    ])->save();
+    $first->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    $phase = PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => 'retained_worker',
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now(),
+    ]);
+    $second = AgentDispatch::query()->create([
+        'phase_run_id' => $phase->id,
+        'agent_role' => 'retained-worker',
+        'idempotency_key' => 'retained-worker-dispatch',
+        'herdr_session' => $first->herdr_session,
+        'herdr_workspace_id' => $first->herdr_workspace_id,
+        'herdr_tab_id' => $first->herdr_tab_id,
+        'herdr_pane_id' => $first->herdr_pane_id,
+        'herdr_terminal_id' => $first->herdr_terminal_id,
+        'herdr_agent_id' => $first->herdr_agent_id,
+        'herdr_agent_name' => $first->herdr_agent_name,
+        'prompt_name' => 'retained_worker',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('1', 64),
+        'status' => AgentDispatchStatus::Waiting,
+        'dispatched_at' => now(),
+    ]);
+    $this->delivery->forceFill([
+        'current_phase' => $phase->phase_name,
+        'status' => DeliveryStatus::WaitingForAgent,
+    ])->save();
+    config()->set('herdr.orchestration.enabled', true);
+
+    $event = app(CaptureHerdrEvent::class)->handle([
+        'event' => 'pane.agent_status_changed',
+        'data' => [
+            'pane_id' => $first->herdr_pane_id,
+            'workspace_id' => $first->herdr_workspace_id,
+            'agent_status' => 'done',
+        ],
+    ]);
+
+    expect($event?->agent_dispatch_id)->toBe($second->id)
+        ->and($second->fresh()->status)->toBe(AgentDispatchStatus::Settled)
+        ->and($first->fresh()->status)->toBe(AgentDispatchStatus::Settled);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
+});
+
+it('refuses ambiguous active ownership of one Herdr pane', function () {
+    Queue::fake();
+    (new AdvanceDelivery($this->delivery->id))->handle(app(AdvanceDeliveryAction::class));
+    $first = AgentDispatch::sole();
+    $phase = PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => $first->phaseRun->phase_name,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now(),
+    ]);
+    $second = $first->replicate()->forceFill([
+        'phase_run_id' => $phase->id,
+        'idempotency_key' => 'ambiguous-retained-worker-dispatch',
+        'status' => AgentDispatchStatus::Waiting,
+        'settled_at' => null,
+    ]);
+    $second->save();
+    config()->set('herdr.orchestration.enabled', true);
+
+    $event = app(CaptureHerdrEvent::class)->handle([
+        'event' => 'pane.agent_status_changed',
+        'data' => [
+            'pane_id' => $first->herdr_pane_id,
+            'workspace_id' => $first->herdr_workspace_id,
+            'agent_status' => 'idle',
+        ],
+    ]);
+
+    expect($event?->failure_message)->toBe('ambiguous_dispatch')
+        ->and($event?->agent_dispatch_id)->toBeNull()
+        ->and($first->fresh()->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($second->fresh()->status)->toBe(AgentDispatchStatus::Waiting);
+    Queue::assertNothingPushed();
+});
+
 it('uses the latest project config when an active delivery advances', function () {
     Queue::fake();
     app(ConfigureProjectOrchestration::class)->handle(
