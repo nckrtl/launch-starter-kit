@@ -27,6 +27,7 @@ use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitImplementationAdvancementFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceOrbitImplementation as AdvanceImplementationJob;
+use App\Jobs\DispatchOrbitImplementation as DispatchImplementationJob;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
@@ -557,7 +558,7 @@ it('routes an actual merge conflict to one retained-Builder correction intent', 
 
     Queue::fake();
     app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
-    Queue::assertNothingPushed();
+    Queue::assertPushed(DispatchImplementationJob::class, 1);
 });
 
 it('does not consume the receipt when verified implementation evidence differs', function () {

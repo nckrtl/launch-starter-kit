@@ -36,6 +36,8 @@ final readonly class OrbitFeatureWorkflow
 
     public const int IMPLEMENTATION_PROMPT_VERSION = 1;
 
+    public const int IMPLEMENTATION_CORRECTION_PROMPT_VERSION = 1;
+
     public function planningPrompt(
         string $issueKey,
         string $worktree,
@@ -231,7 +233,7 @@ Flow: discovery
 Delivery: {$deliveryId}
 Phase run: {$phaseRunId}
 Dispatch: {$dispatchId}
-Current process skill: /home/nckrtl/orbit/.agents/skills/developing-features/SKILL.md
+Current process skill: {$worktree}/.agents/skills/developing-features/SKILL.md
 
 Read that process and the assigned worktree guidance. Implement the exact candidate and
 approved planning artifact identified by this immutable review receipt:
@@ -264,6 +266,78 @@ clean pushed candidate, artifact, gate, and pull request body; it does not publi
 request or advance the delivery. Correct a reported structural error before returning. If
 implementation cannot complete, use `blocked` and record its classification, evidence, and
 smallest next action in the handoff. Return the receipt ID in your final response and stop.
+PROMPT;
+    }
+
+    /**
+     * @param  array<string, mixed>  $implementationReceipt
+     * @param  array<string, mixed>  $pullRequest
+     */
+    public function implementationCorrectionPrompt(
+        string $issueKey,
+        string $worktree,
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        string $receiptCommand,
+        array $implementationReceipt,
+        array $pullRequest,
+    ): string {
+        $receipt = json_encode(
+            $implementationReceipt,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+        $published = json_encode(
+            $pullRequest,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+
+        return <<<PROMPT
+Resolve the published candidate's actual merge conflicts with main for {$issueKey} in the retained Builder.
+
+Issue: {$issueKey}
+Worktree: {$worktree}
+Assigned phase: implementing
+Flow: discovery
+Delivery: {$deliveryId}
+Phase run: {$phaseRunId}
+Dispatch: {$dispatchId}
+Current process skill: {$worktree}/.agents/skills/developing-features/SKILL.md
+
+Preserve the approved plan, completed implementation, and prior acceptance evidence. The
+published pull request was verified as unmergeable for this exact implementation receipt:
+
+```json
+{$receipt}
+```
+
+```json
+{$published}
+```
+
+Resolve only the real conflicts against current main. Do not restart preflight merely because
+main advanced. You may coordinate bounded native helpers within this process, but you must
+integrate their work and stop them before handoff. Do not change Linear, create or merge a
+GitHub pull request, or invoke the legacy Orbit controller's advance command.
+
+Run the required checks through the retained Builder, commit the correction, push the exact
+issue branch, and publish the corrected candidate artifact. Update the complete pull request
+body inside `.loop/runtime/` and write the complete correction handoff there. Keep `.loop`
+untracked.
+
+Before ending, run one receipt command from the assigned worktree root.
+
+Ready:
+`{$receiptCommand} --result=ready --handoff=.loop/runtime/implementation-handoff.md --artifact=FULL_SHA --gate=ABSOLUTE_GATE_PATH --body=.loop/runtime/pull-request-body.md`
+
+Blocked:
+`{$receiptCommand} --result=blocked --handoff=.loop/runtime/implementation-handoff.md`
+
+For ready, replace `FULL_SHA` and `ABSOLUTE_GATE_PATH` with the exact corrected artifact SHA
+and successful Builder gate receipt. The receipt command independently verifies the clean
+pushed candidate, artifact, gate, and pull request body. Correct a reported structural error
+before returning. If correction cannot complete, use `blocked` and record its classification,
+evidence, and smallest next action in the handoff. Return the receipt ID and stop.
 PROMPT;
     }
 }

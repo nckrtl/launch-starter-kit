@@ -13,6 +13,7 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
@@ -33,6 +34,19 @@ final class ImplementationReceiptRepository implements OrbitImplementationReposi
 
     public ?string $failure = null;
 
+    public string $expectedReviewedCandidate;
+
+    public string $expectedCandidate;
+
+    public string $expectedArtifact;
+
+    public function __construct()
+    {
+        $this->expectedReviewedCandidate = str_repeat('a', 40);
+        $this->expectedCandidate = str_repeat('b', 40);
+        $this->expectedArtifact = str_repeat('d', 40);
+    }
+
     public function verifyImplementationOutcome(
         OrbitProjectConfig $config,
         PreparedWorktree $startupWorktree,
@@ -51,9 +65,9 @@ final class ImplementationReceiptRepository implements OrbitImplementationReposi
 
         expect($startupWorktree->headSha)->toBe(str_repeat('a', 40))
             ->and($snapshot->issueKey)->toBe('ORB-234')
-            ->and($reviewedCandidateSha)->toBe(str_repeat('a', 40))
-            ->and($candidateSha)->toBe(str_repeat('b', 40))
-            ->and($artifactSha)->toBe(str_repeat('d', 40))
+            ->and($reviewedCandidateSha)->toBe($this->expectedReviewedCandidate)
+            ->and($candidateSha)->toBe($this->expectedCandidate)
+            ->and($artifactSha)->toBe($this->expectedArtifact)
             ->and($pullRequestBody)->toContain('Issue: ORB-234');
 
         return new VerifiedOrbitImplementationOutcome(
@@ -169,7 +183,12 @@ beforeEach(function () {
     $this->dispatch = AgentDispatch::query()->create([
         'phase_run_id' => $this->phaseRun->id,
         'agent_role' => OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
-        'idempotency_key' => 'orbit-implementation-receipt',
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $this->delivery->id,
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+            1,
+            OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        )->value,
         'herdr_agent_name' => 'orb-234-loop-builder',
         'prompt_name' => 'orbit_implementation',
         'prompt_version' => 1,
@@ -363,6 +382,95 @@ function implementationPromoteToSecondReview(object $test): void
     ]])->save();
 }
 
+function implementationPromoteToMergeConflictReceipt(object $test): void
+{
+    $test->artisan('delivery:submit-orbit-implementation-receipt', $test->arguments)->assertSuccessful();
+    $sourceReceipt = Receipt::query()
+        ->where('phase_run_id', $test->phaseRun->id)
+        ->where('kind', 'orbit_implementation')
+        ->sole();
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'dispatched_at' => now(),
+        'settled_at' => now(),
+    ])->save();
+    $test->phaseRun->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'output' => [
+            'receipt_id' => $sourceReceipt->id,
+            'result' => 'ready',
+            'pull_request_number' => 42,
+            'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+            'mergeable' => false,
+        ],
+        'finished_at' => now(),
+    ])->save();
+    $correction = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Running,
+        'input' => [
+            'implementation_receipt_id' => $sourceReceipt->id,
+            'implementation_receipt' => $sourceReceipt->payload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => false,
+            ],
+        ],
+        'started_at' => now(),
+    ]);
+    $correctionDispatch = AgentDispatch::query()->create([
+        'phase_run_id' => $correction->id,
+        'agent_role' => OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        'idempotency_key' => 'orbit-implementation-correction-receipt',
+        'herdr_agent_name' => 'orb-234-loop-builder',
+        'prompt_name' => 'orbit_implementation_correction',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('5', 64),
+        'status' => AgentDispatchStatus::Waiting,
+    ]);
+
+    $test->reviewedSha = $test->candidateSha;
+    $test->candidateSha = str_repeat('7', 40);
+    $test->artifactSha = str_repeat('8', 40);
+    $test->gatePath = $test->repositoryPath.'/.git/orbit-checks/'.$test->candidateSha.'/review/result.json';
+    File::makeDirectory(dirname($test->gatePath), 0755, true);
+    File::put($test->gatePath, "{}\n");
+    File::put($test->handoffPath, "Merge conflicts are resolved.\n");
+    File::put($test->bodyPath, implode("\n", [
+        'Issue: ORB-234',
+        'Flow: discovery',
+        'Candidate: '.$test->candidateSha,
+        'Artifact: '.$test->artifactSha,
+        'Builder gate: passed ('.$test->gatePath.')',
+    ])."\n");
+    $test->delivery->refresh()->forceFill([
+        'candidate_sha' => $test->reviewedSha,
+        'pull_request_number' => 42,
+        'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+        'current_phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'status' => DeliveryStatus::WaitingForAgent,
+    ])->save();
+    $test->phaseRun = $correction;
+    $test->dispatch = $correctionDispatch;
+    $test->arguments = [
+        'phase-run' => (string) $correction->id,
+        'dispatch' => (string) $correctionDispatch->id,
+        '--result' => 'ready',
+        '--handoff' => '.loop/runtime/implementation-handoff.md',
+        '--artifact' => $test->artifactSha,
+        '--gate' => $test->gatePath,
+        '--body' => '.loop/runtime/pull-request-body.md',
+    ];
+    $test->repository->verificationCount = 0;
+    $test->repository->expectedReviewedCandidate = $test->reviewedSha;
+    $test->repository->expectedCandidate = $test->candidateSha;
+    $test->repository->expectedArtifact = $test->artifactSha;
+    Queue::fake();
+}
+
 it('captures one immutable idempotent ready implementation receipt', function () {
     $this->artisan('delivery:submit-orbit-implementation-receipt', $this->arguments)
         ->expectsOutput('Orbit implementation receipt 3 captured for phase run 3.')
@@ -405,6 +513,26 @@ it('captures one immutable idempotent ready implementation receipt', function ()
     expect(Receipt::where('kind', 'orbit_implementation')->count())->toBe(1)
         ->and($this->repository->verificationCount)->toBe(2);
     Queue::assertPushed(AdvanceDelivery::class, 2);
+});
+
+it('captures a corrected implementation receipt from an exact merge-conflict transition', function () {
+    implementationPromoteToMergeConflictReceipt($this);
+
+    $this->artisan('delivery:submit-orbit-implementation-receipt', $this->arguments)
+        ->assertSuccessful();
+
+    $receipt = Receipt::query()
+        ->where('phase_run_id', $this->phaseRun->id)
+        ->where('kind', 'orbit_implementation')
+        ->sole();
+
+    expect($receipt->payload['attempt'])->toBe(2)
+        ->and($receipt->payload['reviewed_candidate_sha'])->toBe($this->reviewedSha)
+        ->and($receipt->payload['candidate_sha'])->toBe($this->candidateSha)
+        ->and($receipt->payload['artifact_sha'])->toBe($this->artifactSha)
+        ->and($receipt->payload['handoff'])->toBe('Merge conflicts are resolved.')
+        ->and($this->repository->verificationCount)->toBe(1);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('captures a blocked implementation without claiming completion evidence', function () {

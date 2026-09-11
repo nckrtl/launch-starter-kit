@@ -55,8 +55,16 @@ final class SubmitOrbitImplementationReceiptCommand extends Command
             ->with(['delivery.projectOrchestration', 'agentDispatches'])
             ->find($phaseRunId);
         $dispatch = $phaseRun?->agentDispatches->firstWhere('id', $dispatchId);
+        $latestImplementationId = $phaseRun === null
+            ? null
+            : PhaseRun::query()
+                ->where('delivery_id', $phaseRun->delivery_id)
+                ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+                ->latest('attempt')
+                ->value('id');
 
         if ($phaseRun === null || $dispatch === null || $phaseRun->agentDispatches->count() !== 1
+            || $latestImplementationId !== $phaseRun->id
             || $phaseRun->delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
             || $phaseRun->delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
@@ -65,7 +73,7 @@ final class SubmitOrbitImplementationReceiptCommand extends Command
                     && $dispatch->status === AgentDispatchStatus::Starting
                     && $dispatch->error_code === 'herdr_prompt_attempted'))
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            || $phaseRun->attempt !== 1
+            || ! in_array($phaseRun->attempt, [1, 2], true)
             || $phaseRun->status !== PhaseRunStatus::Running
             || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
             || (! ($dispatch->status === AgentDispatchStatus::Starting

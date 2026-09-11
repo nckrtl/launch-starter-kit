@@ -6,6 +6,7 @@ namespace App\Delivery\Actions;
 
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\HerdrAgentIdentifiers;
@@ -21,6 +22,7 @@ use App\Delivery\Exceptions\OrbitImplementationDispatchFailed;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitImplementationReceiptValidator;
 use App\Delivery\Workflow\OrbitPlanReviewReceiptValidator;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -35,9 +37,11 @@ final readonly class DispatchOrbitImplementation
         private ProjectConfigRegistry $configs,
         private ResolveOrbitDeliveryPreparation $preparations,
         private OrbitRepository $repository,
+        private OrbitImplementationRepository $implementations,
         private OrbitIssueProvider $issues,
         private HerdrRuntime $herdr,
         private OrbitFeatureWorkflow $workflow,
+        private OrbitImplementationReceiptValidator $implementationReceipts,
         private OrbitPlanReviewReceiptValidator $reviewReceipts,
     ) {}
 
@@ -56,7 +60,7 @@ final readonly class DispatchOrbitImplementation
         }
 
         $preparation = $this->preparations->startup($delivery);
-        [$dispatch, $reviewReceipt, $builder, $prompt] = $this->prepareDispatch($delivery, $config);
+        [$dispatch, $sourceReceipt, $builder, $prompt] = $this->prepareDispatch($delivery, $config);
 
         if (in_array($dispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true)) {
             return $dispatch;
@@ -65,10 +69,10 @@ final readonly class DispatchOrbitImplementation
         $reservation = $this->repository->reserveDelivery($config, $preparation->snapshot->issueKey);
 
         try {
-            [$delivery, $dispatch, $reviewReceipt, $builder] = $this->recheckBeforeMutation(
+            [$delivery, $dispatch, $sourceReceipt, $builder] = $this->recheckBeforeMutation(
                 $delivery->id,
                 $dispatch->id,
-                $reviewReceipt->id,
+                $sourceReceipt->id,
                 $builder->id,
                 $config,
             );
@@ -77,7 +81,7 @@ final readonly class DispatchOrbitImplementation
                 return $dispatch;
             }
 
-            $this->verifyImplementationInput($delivery, $config, $preparation, $reviewReceipt);
+            $this->verifyImplementationInput($delivery, $config, $preparation, $sourceReceipt);
 
             try {
                 $retained = $this->herdr->getAgent((string) $builder->herdr_agent_name);
@@ -109,7 +113,7 @@ final readonly class DispatchOrbitImplementation
                 $dispatch,
                 $builder,
                 $retained,
-                $reviewReceipt,
+                $sourceReceipt,
                 $prompt,
                 $config,
                 $preparation,
@@ -124,7 +128,7 @@ final readonly class DispatchOrbitImplementation
         $project = $delivery->projectOrchestration;
         $phase = $delivery->phaseRuns()
             ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
-            ->where('attempt', 1)
+            ->latest('attempt')
             ->first();
         $dispatch = $phase?->agentDispatches()->first();
         $active = ($delivery->status === DeliveryStatus::Queued
@@ -155,7 +159,7 @@ final readonly class DispatchOrbitImplementation
             $phase = PhaseRun::query()
                 ->where('delivery_id', $locked->id)
                 ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
-                ->where('attempt', 1)
+                ->latest('attempt')
                 ->lockForUpdate()
                 ->firstOrFail();
             $dispatch = AgentDispatch::query()
@@ -173,8 +177,8 @@ final readonly class DispatchOrbitImplementation
                 throw new OrbitImplementationDispatchFailed('The live Orbit delivery changed before implementation dispatch.');
             }
 
-            $reviewReceipt = $this->sourceReviewReceipt($locked, $phase);
-            $builder = $this->sourceBuilder($locked, $config, $reviewReceipt);
+            $sourceReceipt = $this->sourceReceipt($locked, $phase);
+            $builder = $this->sourceBuilderForPhase($locked, $config, $phase, $sourceReceipt);
             $this->assertDispatchIntent($locked, $phase, $dispatch);
 
             if ($locked->status === DeliveryStatus::Queued) {
@@ -201,15 +205,7 @@ final readonly class DispatchOrbitImplementation
                 throw new OrbitImplementationDispatchFailed('The retained implementation state is inconsistent.');
             }
 
-            $prompt = $this->workflow->implementationPrompt(
-                (string) $locked->external_issue_key,
-                (string) $locked->worktree_path,
-                $locked->id,
-                $phase->id,
-                $dispatch->id,
-                $this->receiptCommand($phase, $dispatch),
-                $reviewReceipt->payload,
-            );
+            $prompt = $this->implementationPrompt($locked, $phase, $dispatch, $sourceReceipt);
             $promptHash = hash('sha256', $prompt);
 
             if ($dispatch->status === AgentDispatchStatus::Pending) {
@@ -219,7 +215,7 @@ final readonly class DispatchOrbitImplementation
                 throw new OrbitImplementationDispatchFailed('The retained implementation prompt is inconsistent.');
             }
 
-            return [$dispatch, $reviewReceipt, $builder, $prompt];
+            return [$dispatch, $sourceReceipt, $builder, $prompt];
         });
     }
 
@@ -234,22 +230,23 @@ final readonly class DispatchOrbitImplementation
         $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($deliveryId);
         $phase = $delivery->phaseRuns()
             ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
-            ->where('attempt', 1)
+            ->latest('attempt')
             ->firstOrFail();
         $dispatch = AgentDispatch::query()->whereKey($dispatchId)->firstOrFail();
-        $reviewReceipt = $this->sourceReviewReceipt($delivery, $phase);
-        $builder = $this->sourceBuilder($delivery, $config, $reviewReceipt);
+        $sourceReceipt = $this->sourceReceipt($delivery, $phase);
+        $builder = $this->sourceBuilderForPhase($delivery, $config, $phase, $sourceReceipt);
+        $this->assertDispatchPrompt($delivery, $phase, $dispatch, $sourceReceipt);
 
         if ($delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
             || $delivery->projectOrchestration->config !== $config->toArray()
-            || $reviewReceipt->id !== $receiptId
+            || $sourceReceipt->id !== $receiptId
             || $builder->id !== $builderId) {
             throw new OrbitImplementationDispatchFailed('The live Orbit implementation input changed before external mutation.');
         }
 
         if ($delivery->status === DeliveryStatus::WaitingForAgent
             && in_array($dispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true)) {
-            return [$delivery, $dispatch, $reviewReceipt, $builder];
+            return [$delivery, $dispatch, $sourceReceipt, $builder];
         }
 
         if ($delivery->status !== DeliveryStatus::Preparing
@@ -268,19 +265,26 @@ final readonly class DispatchOrbitImplementation
             throw new OrbitImplementationDispatchFailed('The Orbit implementation dispatch changed before external mutation.');
         }
 
-        return [$delivery, $dispatch, $reviewReceipt, $builder];
+        return [$delivery, $dispatch, $sourceReceipt, $builder];
     }
 
     private function verifyImplementationInput(
         Delivery $delivery,
         OrbitProjectConfig $config,
         OrbitDeliveryPreparation $preparation,
-        Receipt $reviewReceipt,
+        Receipt $sourceReceipt,
     ): void {
         $issue = $this->issues->fetch($preparation->snapshot->issueId, $preparation->snapshot->issueKey);
         $this->assertCurrentIssue($preparation, $issue);
-        $candidateSha = $this->sha($reviewReceipt->payload, 'candidate_sha');
-        $artifactSha = $this->sha($reviewReceipt->payload, 'artifact_sha');
+
+        if ($sourceReceipt->kind === 'orbit_implementation') {
+            $this->verifyImplementationCorrectionInput($delivery, $config, $preparation, $sourceReceipt);
+
+            return;
+        }
+
+        $candidateSha = $this->sha($sourceReceipt->payload, 'candidate_sha');
+        $artifactSha = $this->sha($sourceReceipt->payload, 'artifact_sha');
         $verified = $this->repository->verifyPlanningOutcome(
             $config,
             $preparation->worktree,
@@ -301,8 +305,38 @@ final readonly class DispatchOrbitImplementation
             || $verified->artifactSha !== null
             || $verified->planContentsHash !== null
             || $artifact->artifactSha !== $artifactSha
-            || $artifact->planContentsHash !== ($reviewReceipt->payload['plan_sha256'] ?? null)) {
+            || $artifact->planContentsHash !== ($sourceReceipt->payload['plan_sha256'] ?? null)) {
             throw new OrbitImplementationDispatchFailed('The verified implementation input no longer matches its passing review.');
+        }
+    }
+
+    private function verifyImplementationCorrectionInput(
+        Delivery $delivery,
+        OrbitProjectConfig $config,
+        OrbitDeliveryPreparation $preparation,
+        Receipt $implementationReceipt,
+    ): void {
+        $payload = $implementationReceipt->payload;
+        $verified = $this->implementations->verifyImplementationOutcome(
+            $config,
+            $preparation->worktree,
+            $preparation->snapshot,
+            $this->sha($payload, 'reviewed_candidate_sha'),
+            $this->sha($payload, 'candidate_sha'),
+            $this->sha($payload, 'artifact_sha'),
+            $this->string($payload, 'gate_receipt_path'),
+            $this->string($payload, 'pull_request_body'),
+        );
+
+        if ($verified->candidateSha !== $delivery->candidate_sha
+            || $verified->candidateSha !== ($payload['candidate_sha'] ?? null)
+            || $verified->artifactSha !== ($payload['artifact_sha'] ?? null)
+            || $verified->gateReceiptPath !== ($payload['gate_receipt_path'] ?? null)
+            || $verified->pullRequestBodyHash !== ($payload['pull_request_body_sha256'] ?? null)
+            || $verified->flow !== ($payload['flow'] ?? null)) {
+            throw new OrbitImplementationDispatchFailed(
+                'The verified merge-conflict correction input no longer matches its implementation receipt.',
+            );
         }
     }
 
@@ -354,7 +388,7 @@ final readonly class DispatchOrbitImplementation
         AgentDispatch $dispatch,
         AgentDispatch $builder,
         HerdrAgentIdentifiers $retained,
-        Receipt $reviewReceipt,
+        Receipt $sourceReceipt,
         string $prompt,
         OrbitProjectConfig $config,
         OrbitDeliveryPreparation $preparation,
@@ -374,17 +408,17 @@ final readonly class DispatchOrbitImplementation
         ])->save();
 
         try {
-            $this->assertFinalLedger($delivery->id, $dispatch->id, $reviewReceipt->id, $builder->id, $config);
+            $this->assertFinalLedger($delivery->id, $dispatch->id, $sourceReceipt->id, $builder->id, $config);
             $this->verifyImplementationInput(
                 Delivery::query()->findOrFail($delivery->id),
                 $config,
                 $preparation,
-                Receipt::query()->findOrFail($reviewReceipt->id),
+                Receipt::query()->findOrFail($sourceReceipt->id),
             );
             $this->markPromptAttempted(
                 $delivery->id,
                 $dispatch->id,
-                $reviewReceipt->id,
+                $sourceReceipt->id,
                 $builder->id,
                 $config,
             );
@@ -516,11 +550,12 @@ final readonly class DispatchOrbitImplementation
         $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($deliveryId);
         $phase = $delivery->phaseRuns()
             ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
-            ->where('attempt', 1)
+            ->latest('attempt')
             ->firstOrFail();
         $dispatch = AgentDispatch::query()->whereKey($dispatchId)->firstOrFail();
-        $reviewReceipt = $this->sourceReviewReceipt($delivery, $phase);
-        $builder = $this->sourceBuilder($delivery, $config, $reviewReceipt);
+        $sourceReceipt = $this->sourceReceipt($delivery, $phase);
+        $builder = $this->sourceBuilderForPhase($delivery, $config, $phase, $sourceReceipt);
+        $this->assertDispatchPrompt($delivery, $phase, $dispatch, $sourceReceipt);
 
         if ($delivery->status !== DeliveryStatus::Preparing
             || $delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
@@ -529,11 +564,128 @@ final readonly class DispatchOrbitImplementation
             || $dispatch->phase_run_id !== $phase->id
             || $dispatch->status !== AgentDispatchStatus::Starting
             || $dispatch->error_code !== 'implementation_final_verification'
-            || $reviewReceipt->id !== $receiptId
+            || $sourceReceipt->id !== $receiptId
             || $builder->id !== $builderId
             || ! $this->sameStoredAgent($dispatch, $builder)) {
             throw new OrbitImplementationDispatchFailed('The implementation ledger changed before prompting.');
         }
+    }
+
+    /** @return array<string, mixed> */
+    private function pullRequestInput(PhaseRun $phase): array
+    {
+        $input = $phase->input;
+        $pullRequest = is_array($input) ? ($input['pull_request'] ?? null) : null;
+
+        if (! is_array($pullRequest) || array_is_list($pullRequest)) {
+            throw new OrbitImplementationDispatchFailed('The implementation correction has malformed pull request input.');
+        }
+
+        $normalized = [];
+
+        foreach ($pullRequest as $key => $value) {
+            if (! is_string($key)) {
+                throw new OrbitImplementationDispatchFailed(
+                    'The implementation correction has malformed pull request input.',
+                );
+            }
+
+            $normalized[$key] = $value;
+        }
+
+        return $normalized;
+    }
+
+    private function implementationPrompt(
+        Delivery $delivery,
+        PhaseRun $phase,
+        AgentDispatch $dispatch,
+        Receipt $sourceReceipt,
+    ): string {
+        if ($phase->attempt === 1) {
+            return $this->workflow->implementationPrompt(
+                (string) $delivery->external_issue_key,
+                (string) $delivery->worktree_path,
+                $delivery->id,
+                $phase->id,
+                $dispatch->id,
+                $this->receiptCommand($phase, $dispatch),
+                $sourceReceipt->payload,
+            );
+        }
+
+        return $this->workflow->implementationCorrectionPrompt(
+            (string) $delivery->external_issue_key,
+            (string) $delivery->worktree_path,
+            $delivery->id,
+            $phase->id,
+            $dispatch->id,
+            $this->receiptCommand($phase, $dispatch),
+            $sourceReceipt->payload,
+            $this->pullRequestInput($phase),
+        );
+    }
+
+    private function sourceReceipt(Delivery $delivery, PhaseRun $implementation): Receipt
+    {
+        return match ($implementation->attempt) {
+            1 => $this->sourceReviewReceipt($delivery, $implementation),
+            2 => $this->sourceImplementationReceipt($delivery, $implementation),
+            default => throw new OrbitImplementationDispatchFailed(
+                'The implementation attempt is not supported for retained-Builder dispatch.',
+            ),
+        };
+    }
+
+    private function sourceImplementationReceipt(Delivery $delivery, PhaseRun $correction): Receipt
+    {
+        $input = $correction->input;
+        $receiptId = is_array($input) ? ($input['implementation_receipt_id'] ?? null) : null;
+
+        if (! is_int($receiptId)) {
+            throw new OrbitImplementationDispatchFailed('The implementation correction has malformed receipt input.');
+        }
+
+        $receipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($receiptId);
+        $source = $receipt?->phaseRun;
+        $sourceDispatches = $source?->agentDispatches;
+        $sourceDispatch = $sourceDispatches?->first();
+
+        if ($receipt === null || $source === null || $sourceDispatches === null || $sourceDispatch === null
+            || ! $this->implementationReceipts->matchesInput($delivery, $correction)
+            || ! $this->implementationReceipts->matches($delivery, $source, $sourceDispatch, $receipt)) {
+            throw new OrbitImplementationDispatchFailed(
+                'The implementation correction no longer matches its published implementation receipt.',
+            );
+        }
+
+        return $receipt;
+    }
+
+    private function sourceBuilderForPhase(
+        Delivery $delivery,
+        OrbitProjectConfig $config,
+        PhaseRun $implementation,
+        Receipt $sourceReceipt,
+    ): AgentDispatch {
+        if ($implementation->attempt === 1) {
+            return $this->sourceBuilder($delivery, $config, $sourceReceipt);
+        }
+
+        $sourceImplementation = $sourceReceipt->phaseRun;
+        $sourceDispatches = $sourceImplementation->agentDispatches;
+        $sourceDispatch = $sourceDispatches->first();
+        $reviewReceipt = $this->sourceReviewReceipt($delivery, $sourceImplementation);
+        $builder = $this->sourceBuilder($delivery, $config, $reviewReceipt);
+
+        if ($sourceDispatches->count() !== 1 || $sourceDispatch === null
+            || ! $this->sameStoredAgent($sourceDispatch, $builder)) {
+            throw new OrbitImplementationDispatchFailed(
+                'The merge-conflict correction did not retain the exact implementation Builder.',
+            );
+        }
+
+        return $builder;
     }
 
     private function sourceReviewReceipt(Delivery $delivery, PhaseRun $implementation): Receipt
@@ -551,6 +703,9 @@ final readonly class DispatchOrbitImplementation
         $receipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($receiptId);
         $review = $receipt?->phaseRun;
         $reviewDispatch = $review?->agentDispatches->first();
+        $reviewCandidate = $payload['candidate_sha'] ?? null;
+        $reviewDelivery = clone $delivery;
+        $reviewDelivery->candidate_sha = is_string($reviewCandidate) ? $reviewCandidate : null;
 
         if ($receipt === null || $review === null || $reviewDispatch === null
             || $implementation->delivery_id !== $delivery->id
@@ -566,7 +721,7 @@ final readonly class DispatchOrbitImplementation
             || $reviewDispatch->status !== AgentDispatchStatus::Settled
             || $receipt->payload !== $payload
             || ($payload['result'] ?? null) !== 'pass'
-            || ! $this->reviewReceipts->matches($delivery, $review, $reviewDispatch, $receipt)) {
+            || ! $this->reviewReceipts->matches($reviewDelivery, $review, $reviewDispatch, $receipt)) {
             throw new OrbitImplementationDispatchFailed('The implementation no longer matches its passing plan review.');
         }
 
@@ -631,17 +786,39 @@ final readonly class DispatchOrbitImplementation
         $expectedKey = IdempotencyKey::forDispatch(
             $delivery->id,
             OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
-            1,
+            $phase->attempt,
             OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
         )->value;
         $expectedName = strtolower((string) $delivery->external_issue_key).'-loop-builder';
+        $expectedPrompt = $phase->attempt === 1
+            ? 'orbit_implementation'
+            : 'orbit_implementation_correction';
+        $expectedVersion = $phase->attempt === 1
+            ? OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION
+            : OrbitFeatureWorkflow::IMPLEMENTATION_CORRECTION_PROMPT_VERSION;
 
-        if ($phase->agentDispatches()->count() !== 1
+        if (! in_array($phase->attempt, [1, 2], true)
+            || $phase->agentDispatches()->count() !== 1
+            || $dispatch->phase_run_id !== $phase->id
             || $dispatch->idempotency_key !== $expectedKey
             || $dispatch->herdr_agent_name !== $expectedName
-            || $dispatch->prompt_name !== 'orbit_implementation'
-            || $dispatch->prompt_version !== OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION) {
+            || $dispatch->prompt_name !== $expectedPrompt
+            || $dispatch->prompt_version !== $expectedVersion) {
             throw new OrbitImplementationDispatchFailed('The retained implementation intent is inconsistent.');
+        }
+    }
+
+    private function assertDispatchPrompt(
+        Delivery $delivery,
+        PhaseRun $phase,
+        AgentDispatch $dispatch,
+        Receipt $sourceReceipt,
+    ): void {
+        $this->assertDispatchIntent($delivery, $phase, $dispatch);
+        $prompt = $this->implementationPrompt($delivery, $phase, $dispatch, $sourceReceipt);
+
+        if (! hash_equals($dispatch->prompt_hash, hash('sha256', $prompt))) {
+            throw new OrbitImplementationDispatchFailed('The retained implementation prompt is inconsistent.');
         }
     }
 
@@ -727,6 +904,18 @@ final readonly class DispatchOrbitImplementation
         $value = $payload[$key] ?? null;
 
         if (! is_string($value) || preg_match('/^[a-f0-9]{40}$/', $value) !== 1) {
+            throw new OrbitImplementationDispatchFailed("The implementation has an invalid {$key}.");
+        }
+
+        return $value;
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function string(array $payload, string $key): string
+    {
+        $value = $payload[$key] ?? null;
+
+        if (! is_string($value) || trim($value) === '') {
             throw new OrbitImplementationDispatchFailed("The implementation has an invalid {$key}.");
         }
 

@@ -35,8 +35,14 @@ final readonly class CaptureOrbitImplementationReceipt
                 ->where('phase_run_id', $phaseRun->id)
                 ->lockForUpdate()
                 ->first();
+            $latestImplementationId = PhaseRun::query()
+                ->where('delivery_id', $phaseRun->delivery_id)
+                ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+                ->latest('attempt')
+                ->value('id');
 
             if ($delivery === null || $lockedPhase === null || $lockedDispatch === null
+                || $latestImplementationId !== $lockedPhase->id
                 || $delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
                 || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
                 || $delivery->current_phase !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
@@ -46,7 +52,7 @@ final readonly class CaptureOrbitImplementationReceipt
                         && $lockedDispatch->error_code === 'herdr_prompt_attempted'))
                 || $lockedPhase->delivery_id !== $delivery->id
                 || $lockedPhase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-                || $lockedPhase->attempt !== 1
+                || ! in_array($lockedPhase->attempt, [1, 2], true)
                 || $lockedPhase->status !== PhaseRunStatus::Running
                 || $lockedPhase->agentDispatches()->count() !== 1
                 || $lockedDispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE

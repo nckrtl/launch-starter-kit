@@ -6,6 +6,7 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitImplementation;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
@@ -17,6 +18,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
@@ -161,6 +163,38 @@ final class ImplementationDispatchIssueProvider implements OrbitIssueProvider
         $this->calls++;
 
         return $this->snapshot;
+    }
+}
+
+final class ImplementationCorrectionVerifier implements OrbitImplementationRepository
+{
+    public int $calls = 0;
+
+    public function verifyImplementationOutcome(
+        OrbitProjectConfig $config,
+        PreparedWorktree $startupWorktree,
+        PreparedIssueSnapshot $snapshot,
+        string $reviewedCandidateSha,
+        string $candidateSha,
+        string $artifactSha,
+        string $gateReceiptPath,
+        string $pullRequestBody,
+    ): VerifiedOrbitImplementationOutcome {
+        $this->calls++;
+
+        expect($startupWorktree->headSha)->toBe(str_repeat('a', 40))
+            ->and($reviewedCandidateSha)->toBe(str_repeat('b', 40))
+            ->and($candidateSha)->toBe(str_repeat('c', 40))
+            ->and($artifactSha)->toBe(str_repeat('d', 40));
+
+        return new VerifiedOrbitImplementationOutcome(
+            candidateSha: $candidateSha,
+            treeSha: str_repeat('e', 40),
+            artifactSha: $artifactSha,
+            gateReceiptPath: $gateReceiptPath,
+            pullRequestBodyHash: hash('sha256', $pullRequestBody),
+            flow: 'discovery',
+        );
     }
 }
 
@@ -375,8 +409,10 @@ beforeEach(function () {
         $payload['id'], $payload['identifier'], $payload, str_repeat('d', 64),
     ));
     $this->herdr = new ImplementationDispatchHerdrRuntime;
+    $this->implementationVerifier = new ImplementationCorrectionVerifier;
     $this->herdr->agent = implementationDispatchAgent($this->worktree, 'done');
     app()->instance(OrbitRepository::class, $this->repository);
+    app()->instance(OrbitImplementationRepository::class, $this->implementationVerifier);
     app()->instance(OrbitIssueProvider::class, $this->issues);
     app()->instance(HerdrRuntime::class, $this->herdr);
     Queue::fake();
@@ -494,8 +530,113 @@ function promoteImplementationDispatchToSecondReview(object $test): void
     ]])->save();
 }
 
+function promoteImplementationToMergeConflictCorrection(object $test): void
+{
+    app(DispatchOrbitImplementation::class)->handle($test->delivery->id);
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    $test->implementationBody = implode("\n", [
+        'Issue: ORB-234',
+        'Candidate: '.str_repeat('c', 40),
+        'Artifact: '.str_repeat('d', 40),
+        'Flow: discovery',
+        'Builder gate: passed (/home/nckrtl/orbit/.git/orbit-checks/gate/result.json)',
+    ]);
+    $test->implementationPayload = [
+        'kind' => 'orbit_implementation', 'schema_version' => 1,
+        'delivery_id' => $test->delivery->id, 'dispatch_id' => $test->dispatch->id,
+        'issue_key' => 'ORB-234', 'phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'attempt' => 1, 'result' => 'ready', 'worktree' => $test->worktree,
+        'reviewed_candidate_sha' => str_repeat('b', 40),
+        'candidate_sha' => str_repeat('c', 40),
+        'handoff_path' => '.loop/runtime/implementation-handoff.md',
+        'handoff' => 'The candidate is ready but conflicts with main.',
+        'artifact_sha' => str_repeat('d', 40),
+        'gate_receipt_path' => '/home/nckrtl/orbit/.git/orbit-checks/gate/result.json',
+        'pull_request_body_path' => '.loop/runtime/pull-request-body.md',
+        'pull_request_body' => $test->implementationBody,
+        'pull_request_body_sha256' => hash('sha256', $test->implementationBody),
+        'flow' => 'discovery',
+    ];
+    $test->implementationReceipt = Receipt::query()->create([
+        'phase_run_id' => $test->implementation->id,
+        'kind' => 'orbit_implementation',
+        'schema_version' => 1,
+        'payload' => $test->implementationPayload,
+        'payload_hash' => hash('sha256', json_encode($test->implementationPayload, JSON_THROW_ON_ERROR)),
+        'candidate_sha' => str_repeat('c', 40),
+        'validation_status' => ReceiptValidationStatus::Valid,
+        'captured_at' => now(),
+        'validated_at' => now(),
+    ]);
+    $test->implementation->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'output' => [
+            'receipt_id' => $test->implementationReceipt->id,
+            'result' => 'ready',
+            'pull_request_number' => 42,
+            'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+            'mergeable' => false,
+        ],
+        'finished_at' => now(),
+    ])->save();
+    $test->correction = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Pending,
+        'input' => [
+            'implementation_receipt_id' => $test->implementationReceipt->id,
+            'implementation_receipt' => $test->implementationPayload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => false,
+            ],
+        ],
+    ]);
+    $test->correctionDispatch = AgentDispatch::query()->create([
+        'phase_run_id' => $test->correction->id,
+        'agent_role' => OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $test->delivery->id,
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+            2,
+            OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-builder',
+        'prompt_name' => 'orbit_implementation_correction',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Pending,
+    ]);
+    $test->delivery->refresh()->forceFill([
+        'candidate_sha' => str_repeat('c', 40),
+        'pull_request_number' => 42,
+        'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+        'current_phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'status' => DeliveryStatus::Queued,
+    ])->save();
+    $test->repository->calls = [];
+    $test->issues->calls = 0;
+    $test->herdr->calls = [];
+    $test->herdr->prompts = [];
+    $test->implementationVerifier->calls = 0;
+}
+
 it('queues the dedicated implementation dispatcher', function () {
     expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeFalse();
+    Queue::assertPushed(DispatchImplementationJob::class, 1);
+});
+
+it('queues the retained-Builder dispatcher for a merge-conflict correction', function () {
+    promoteImplementationToMergeConflictCorrection($this);
+    Queue::fake();
+
+    expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeFalse();
+
     Queue::assertPushed(DispatchImplementationJob::class, 1);
 });
 
@@ -525,6 +666,61 @@ it('prompts the exact retained Builder with the immutable passing review', funct
     app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
     expect($this->herdr->calls)->toBe(['get', 'prompt'])
         ->and(AgentDispatch::where('herdr_pane_id', 'builder-pane')->count())->toBe(2);
+});
+
+it('prompts the exact retained Builder to correct verified merge conflicts', function () {
+    promoteImplementationToMergeConflictCorrection($this);
+
+    $dispatch = app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
+
+    expect($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($this->repository->calls)->toBe(['reserve'])
+        ->and($this->implementationVerifier->calls)->toBe(2)
+        ->and($this->issues->calls)->toBe(2)
+        ->and($dispatch->id)->toBe($this->correctionDispatch->id)
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->herdr_pane_id)->toBe($this->builder->herdr_pane_id)
+        ->and($this->correction->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->repository->reservationIsHeld())->toBeFalse()
+        ->and($this->herdr->prompts[0])->toContain(
+            "Resolve the published candidate's actual merge conflicts with main",
+            'Do not restart preflight merely because',
+            "delivery:submit-orbit-implementation-receipt {$this->correction->id} {$this->correctionDispatch->id} --result=ready",
+            json_encode($this->implementationPayload, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES),
+            'https://github.com/nckrtl/orbit/pull/42',
+        )
+        ->and($dispatch->prompt_hash)->toBe(hash('sha256', $this->herdr->prompts[0]));
+
+    app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
+    expect($this->herdr->calls)->toBe(['get', 'prompt']);
+});
+
+it('rejects a correction whose implementation dispatch did not retain the exact Builder', function () {
+    promoteImplementationToMergeConflictCorrection($this);
+    $this->dispatch->forceFill(['herdr_pane_id' => 'replacement-pane'])->save();
+
+    expect(fn () => app(DispatchOrbitImplementation::class)->handle($this->delivery->id))
+        ->toThrow(OrbitImplementationDispatchFailed::class, 'did not retain the exact implementation Builder');
+
+    expect($this->herdr->calls)->toBe([]);
+});
+
+it('rejects correction input changes after taking the controller reservation', function () {
+    promoteImplementationToMergeConflictCorrection($this);
+    $this->repository->afterReserve = function (): void {
+        DB::table('receipts')->where('id', $this->implementationReceipt->id)->update([
+            'payload_hash' => str_repeat('0', 64),
+        ]);
+    };
+
+    expect(fn () => app(DispatchOrbitImplementation::class)->handle($this->delivery->id))
+        ->toThrow(OrbitImplementationDispatchFailed::class, 'published implementation receipt');
+
+    expect($this->herdr->calls)->toBe([])
+        ->and($this->implementationVerifier->calls)->toBe(0)
+        ->and($this->correctionDispatch->fresh()->status)->toBe(AgentDispatchStatus::Pending)
+        ->and($this->repository->reservationIsHeld())->toBeFalse();
 });
 
 it('accepts a second passing review only when its correction retained the exact Builder', function () {
@@ -674,6 +870,26 @@ it('preserves settlement while the implementation prompt returns', function () {
 
     expect($dispatch->status)->toBe(AgentDispatchStatus::Settled)
         ->and($dispatch->error_code)->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
+});
+
+it('preserves correction settlement while the retained-Builder prompt returns', function () {
+    promoteImplementationToMergeConflictCorrection($this);
+    config()->set('herdr.orchestration.enabled', true);
+    $this->herdr->beforePromptReturn = function (): void {
+        app(CaptureHerdrEvent::class)->handle([
+            'event' => 'pane.agent_status_changed',
+            'data' => ['pane_id' => 'builder-pane', 'workspace_id' => 'workspace-1', 'agent_status' => 'done'],
+        ]);
+    };
+
+    $dispatch = app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
+
+    expect($dispatch->id)->toBe($this->correctionDispatch->id)
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Settled)
+        ->and($dispatch->error_code)->toBeNull()
+        ->and($this->implementation->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
     Queue::assertPushed(AdvanceDelivery::class, 1);
 });

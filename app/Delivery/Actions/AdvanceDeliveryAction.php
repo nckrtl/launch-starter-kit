@@ -84,7 +84,7 @@ final readonly class AdvanceDeliveryAction
                     ->first()
                 : null;
 
-            if ($implementation?->attempt === 1
+            if (in_array($implementation?->attempt, [1, 2], true)
                 && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                 DispatchOrbitImplementation::dispatch($deliveryId)->afterCommit();
             }

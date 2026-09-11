@@ -37,6 +37,15 @@ final readonly class OrbitImplementationReceiptValidator
 
     public function matchesInput(Delivery $delivery, PhaseRun $implementation): bool
     {
+        return match ($implementation->attempt) {
+            1 => $this->matchesPlanReviewInput($delivery, $implementation),
+            2 => $this->matchesCorrectionInput($delivery, $implementation),
+            default => false,
+        };
+    }
+
+    private function matchesPlanReviewInput(Delivery $delivery, PhaseRun $implementation): bool
+    {
         $input = $implementation->input;
         $receiptId = is_array($input) ? ($input['plan_review_receipt_id'] ?? null) : null;
         $payload = is_array($input) ? ($input['plan_review_receipt'] ?? null) : null;
@@ -77,6 +86,79 @@ final readonly class OrbitImplementationReceiptValidator
             && is_string($reviewedCandidate)
             && preg_match('/^[a-f0-9]{40}$/', $reviewedCandidate) === 1
             && $this->reviewReceipts->matches($reviewDelivery, $review, $reviewDispatch, $reviewReceipt);
+    }
+
+    private function matchesCorrectionInput(Delivery $delivery, PhaseRun $correction): bool
+    {
+        $input = $correction->input;
+        $receiptId = is_array($input) ? ($input['implementation_receipt_id'] ?? null) : null;
+        $payload = is_array($input) ? ($input['implementation_receipt'] ?? null) : null;
+        $pullRequest = is_array($input) ? ($input['pull_request'] ?? null) : null;
+
+        if (! is_int($receiptId) || ! is_array($payload) || array_is_list($payload)
+            || ! is_array($pullRequest) || array_is_list($pullRequest)
+            || array_diff(array_keys($input), [
+                'implementation_receipt_id',
+                'implementation_receipt',
+                'pull_request',
+            ]) !== []
+            || count($input) !== 3) {
+            return false;
+        }
+
+        $receipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($receiptId);
+        $source = $receipt?->phaseRun;
+        $sourceDispatches = $source?->agentDispatches;
+        $sourceDispatch = $sourceDispatches?->first();
+        $sourceCandidate = $payload['candidate_sha'] ?? null;
+        $sourceDelivery = clone $delivery;
+        $sourceDelivery->candidate_sha = is_string($sourceCandidate) ? $sourceCandidate : null;
+
+        return $receipt !== null && $source !== null && $sourceDispatches !== null && $sourceDispatch !== null
+            && $correction->delivery_id === $delivery->id
+            && $correction->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+            && $correction->attempt === 2
+            && $source->delivery_id === $delivery->id
+            && $source->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+            && $source->attempt === 1
+            && $source->status === PhaseRunStatus::Completed
+            && $source->finished_at !== null
+            && $source->output === [
+                'receipt_id' => $receipt->id,
+                'result' => 'ready',
+                'pull_request_number' => $delivery->pull_request_number,
+                'pull_request_url' => $delivery->pull_request_url,
+                'mergeable' => false,
+            ]
+            && $sourceDispatches->count() === 1
+            && $sourceDispatch->agent_role === OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
+            && $sourceDispatch->status === AgentDispatchStatus::Settled
+            && $sourceDispatch->idempotency_key === IdempotencyKey::forDispatch(
+                $delivery->id,
+                OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+                1,
+                OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+            )->value
+            && $sourceDispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-builder'
+            && $sourceDispatch->prompt_name === 'orbit_implementation'
+            && $sourceDispatch->prompt_version === OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION
+            && preg_match('/^[a-f0-9]{64}$/', $sourceDispatch->prompt_hash) === 1
+            && $sourceDispatch->prompt_hash !== str_repeat('0', 64)
+            && $sourceDispatch->dispatched_at !== null
+            && $sourceDispatch->settled_at !== null
+            && $source->receipts()->where('kind', 'orbit_implementation')->count() === 1
+            && $receipt->payload === $payload
+            && ($payload['result'] ?? null) === 'ready'
+            && $delivery->candidate_sha === $sourceCandidate
+            && is_int($delivery->pull_request_number)
+            && $delivery->pull_request_number > 0
+            && $delivery->pull_request_url === "https://github.com/nckrtl/orbit/pull/{$delivery->pull_request_number}"
+            && $pullRequest === [
+                'number' => $delivery->pull_request_number,
+                'url' => $delivery->pull_request_url,
+                'mergeable' => false,
+            ]
+            && $this->matches($sourceDelivery, $source, $sourceDispatch, $receipt);
     }
 
     /** @param array<string, mixed> $payload */
@@ -142,7 +224,9 @@ final readonly class OrbitImplementationReceiptValidator
     private function reviewedCandidate(PhaseRun $phase): mixed
     {
         $input = $phase->input;
-        $review = is_array($input) ? ($input['plan_review_receipt'] ?? null) : null;
+        $review = is_array($input)
+            ? ($input[$phase->attempt === 1 ? 'plan_review_receipt' : 'implementation_receipt'] ?? null)
+            : null;
 
         return is_array($review) ? ($review['candidate_sha'] ?? null) : null;
     }
