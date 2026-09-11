@@ -11,6 +11,7 @@ use App\Delivery\Contracts\OrbitMergeLineageVerifier;
 use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
 use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitWorktreeCleaner;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
@@ -18,8 +19,10 @@ use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\OrbitProofCloseout;
 use App\Delivery\Data\PreparedIssueSnapshot;
+use App\Delivery\Data\PreparedOrbitWorktreeRemoval;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
+use App\Delivery\Data\RemovedOrbitWorktree;
 use App\Delivery\Data\RequestedOrbitMainCacheRefresh;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitMergeLineage;
@@ -32,7 +35,7 @@ use Illuminate\Support\Str;
 use JsonException;
 use RuntimeException;
 
-final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository
+final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository, OrbitWorktreeCleaner
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -397,6 +400,530 @@ final readonly class ProcessOrbitRepository implements OrbitImplementationReposi
         }
 
         return $closeout;
+    }
+
+    public function prepareWorktreeRemoval(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $artifactSha,
+        ?OrbitProofCloseout $proofCloseout,
+        string $cleanupAttemptId,
+    ): PreparedOrbitWorktreeRemoval {
+        $context = $this->worktreeCleanupContext(
+            $config,
+            $issueKey,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $artifactSha,
+            $proofCloseout,
+            $cleanupAttemptId,
+        );
+        $this->refreshWorktreeCleanupState($context['repository']);
+        $state = $this->inspectCleanupGitState(
+            $context['repository'],
+            $worktree,
+            $branch,
+            $candidateSha,
+            $context['artifact_ref'],
+            $artifactSha,
+            'initial',
+        );
+        $archives = $this->proofArchiveHashes($context['repository'], $issueKey, $proofCloseout);
+
+        return new PreparedOrbitWorktreeRemoval(
+            repository: $context['repository'],
+            worktree: $worktree,
+            issueKey: $issueKey,
+            branch: $branch,
+            candidateSha: $candidateSha,
+            artifactRef: $context['artifact_ref'],
+            artifactSha: $artifactSha,
+            cleanupAttemptId: $cleanupAttemptId,
+            proofAttemptId: $proofCloseout?->attemptId,
+            protectedWorktrees: $this->unrelatedWorktrees($state['worktrees'], $worktree, $branch),
+            protectedBranches: $this->unrelatedBranches($state['branches'], $branch),
+            evidenceArchives: $archives,
+            authorizedAt: gmdate('Y-m-d\TH:i:s\Z'),
+        );
+    }
+
+    public function removeWorktree(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $artifactSha,
+        ?OrbitProofCloseout $proofCloseout,
+        string $cleanupAttemptId,
+        PreparedOrbitWorktreeRemoval $authorization,
+        bool $resume,
+    ): RemovedOrbitWorktree {
+        $context = $this->worktreeCleanupContext(
+            $config,
+            $issueKey,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $artifactSha,
+            $proofCloseout,
+            $cleanupAttemptId,
+        );
+        $repository = $context['repository'];
+        $script = $context['script'];
+        $artifactRef = $context['artifact_ref'];
+
+        if ($authorization->repository !== $repository
+            || $authorization->worktree !== $worktree
+            || $authorization->issueKey !== $issueKey
+            || $authorization->branch !== $branch
+            || $authorization->candidateSha !== $candidateSha
+            || $authorization->artifactRef !== $artifactRef
+            || $authorization->artifactSha !== $artifactSha
+            || $authorization->cleanupAttemptId !== $cleanupAttemptId
+            || $authorization->proofAttemptId !== $proofCloseout?->attemptId) {
+            throw new OrbitRepositoryFailed(
+                'The retained Orbit worktree cleanup authorization is inconsistent.',
+            );
+        }
+
+        $this->refreshWorktreeCleanupState($repository);
+
+        $before = $this->inspectCleanupGitState(
+            $repository,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $artifactRef,
+            $artifactSha,
+            $resume ? 'resume' : 'initial',
+        );
+        $archives = $this->proofArchiveHashes($repository, $issueKey, $proofCloseout);
+
+        if ($this->unrelatedWorktrees($before['worktrees'], $worktree, $branch)
+                !== $authorization->protectedWorktrees
+            || $this->unrelatedBranches($before['branches'], $branch)
+                !== $authorization->protectedBranches
+            || $archives !== $authorization->evidenceArchives) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit worktree cleanup state changed after authorization.',
+            );
+        }
+
+        try {
+            $result = Process::path($repository)->timeout(300)->run([$script, $issueKey]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit worktree cleanup adapter could not run.',
+                previous: $exception,
+            );
+        }
+
+        if ($result->failed()
+            || preg_match('/(?:^|\R)Removed '.preg_quote($branch, '/').'\s*$/', $result->output()) !== 1) {
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit worktree cleanup failed: '.$details);
+        }
+
+        if (file_exists($worktree) || is_link($worktree)) {
+            throw new OrbitRepositoryFailed('The Orbit worktree path remains after cleanup.');
+        }
+
+        $after = $this->inspectCleanupGitState(
+            $repository,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $artifactRef,
+            $artifactSha,
+            'complete',
+        );
+
+        if ($this->unrelatedWorktrees($after['worktrees'], $worktree, $branch)
+                !== $authorization->protectedWorktrees) {
+            throw new OrbitRepositoryFailed('An unrelated Orbit worktree changed during cleanup.');
+        }
+
+        if ($this->unrelatedBranches($after['branches'], $branch)
+                !== $authorization->protectedBranches) {
+            throw new OrbitRepositoryFailed('An unrelated Orbit branch changed during cleanup.');
+        }
+
+        if ($authorization->evidenceArchives
+                !== $this->proofArchiveHashes($repository, $issueKey, $proofCloseout)) {
+            throw new OrbitRepositoryFailed('The Orbit proof archives changed during worktree cleanup.');
+        }
+
+        return new RemovedOrbitWorktree(
+            repository: $repository,
+            worktree: $worktree,
+            issueKey: $issueKey,
+            branch: $branch,
+            candidateSha: $candidateSha,
+            artifactRef: $artifactRef,
+            artifactSha: $artifactSha,
+            cleanupAttemptId: $cleanupAttemptId,
+            proofAttemptId: $proofCloseout?->attemptId,
+            evidenceArchives: $archives,
+            removedAt: gmdate('Y-m-d\TH:i:s\Z'),
+        );
+    }
+
+    /** @return array{repository: string, script: string, artifact_ref: string} */
+    private function worktreeCleanupContext(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $artifactSha,
+        ?OrbitProofCloseout $proofCloseout,
+        string $cleanupAttemptId,
+    ): array {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree);
+        $scriptPath = $repository === false ? '' : $repository.'/bin/worktree-remove';
+        $script = $repository === false ? false : realpath($scriptPath);
+        $expectedBranch = Str::lower($issueKey);
+        $artifactRef = "refs/tags/loop/{$expectedBranch}/{$candidateSha}";
+
+        if ($repository === false || $repository !== $config->repository
+            || $root === false || $root !== $config->worktreeRoot
+            || $worktree !== $root.'/'.$expectedBranch
+            || ($path !== false && $path !== $worktree)
+            || ($path === false && (file_exists($worktree) || is_link($worktree)))
+            || $branch !== $expectedBranch
+            || $script === false || $script !== $scriptPath
+            || is_link($scriptPath) || ! is_executable($script)
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1
+            || preg_match('/^[a-f0-9]{32}$/', $cleanupAttemptId) !== 1
+            || ($proofCloseout !== null
+                && (! $proofCloseout->complete()
+                    || $proofCloseout->issueKey !== $issueKey
+                    || $proofCloseout->candidateSha !== $candidateSha
+                    || $proofCloseout->artifactSha !== $artifactSha))) {
+            throw new OrbitRepositoryFailed('The configured Orbit worktree cleanup adapter is unavailable.');
+        }
+
+        return [
+            'repository' => $repository,
+            'script' => $script,
+            'artifact_ref' => $artifactRef,
+        ];
+    }
+
+    private function refreshWorktreeCleanupState(string $repository): void
+    {
+        try {
+            $fetch = Process::path($repository)->timeout(120)->run([
+                'git', 'fetch', '--prune', 'origin',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit worktree cleanup state could not be refreshed.',
+                previous: $exception,
+            );
+        }
+
+        if ($fetch->failed()) {
+            $details = trim($fetch->errorOutput()) ?: trim($fetch->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit worktree cleanup refresh failed: '.$details);
+        }
+    }
+
+    /** @return array<string, string> */
+    private function proofArchiveHashes(
+        string $repository,
+        string $issueKey,
+        ?OrbitProofCloseout $proofCloseout,
+    ): array {
+        if ($proofCloseout === null) {
+            return [];
+        }
+
+        $proofAttemptId = $proofCloseout->attemptId;
+
+        $relativePaths = [
+            ".e2e/proof-evidence/{$issueKey}/{$proofAttemptId}.json",
+            ".e2e/proof-review/{$issueKey}/{$proofAttemptId}.json",
+            ".e2e/proof-review-evaluation/{$issueKey}/{$proofAttemptId}.json",
+            ".e2e/proof-closeout/{$issueKey}/{$proofAttemptId}.json",
+        ];
+        $hashes = [];
+
+        foreach ($relativePaths as $relativePath) {
+            $path = $repository.'/'.$relativePath;
+            $resolved = realpath($path);
+
+            if ($resolved === false || $resolved !== $path || ! is_file($resolved) || is_link($path)) {
+                throw new OrbitRepositoryFailed('The Orbit proof archive is unavailable before worktree cleanup.');
+            }
+
+            $contents = file_get_contents($resolved);
+
+            if ($contents === false) {
+                throw new OrbitRepositoryFailed('The Orbit proof archive could not be read before worktree cleanup.');
+            }
+
+            $hashes[$relativePath] = hash('sha256', $contents);
+        }
+
+        $closeoutPath = ".e2e/proof-closeout/{$issueKey}/{$proofAttemptId}.json";
+
+        try {
+            $closeout = json_decode(
+                (string) file_get_contents($repository.'/'.$closeoutPath),
+                true,
+                flags: JSON_THROW_ON_ERROR,
+            );
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit proof closeout archive is invalid before worktree cleanup.',
+                previous: $exception,
+            );
+        }
+
+        if ($closeout !== $proofCloseout->toArray()) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit proof closeout archive does not match the retained landing evidence.',
+            );
+        }
+
+        return $hashes;
+    }
+
+    /**
+     * @param  'initial'|'resume'|'complete'  $expectedState
+     * @return array{
+     *     worktrees: list<array{worktree: string, head: string, branch: ?string, prunable: bool}>,
+     *     branches: array<string, string>
+     * }
+     */
+    private function inspectCleanupGitState(
+        string $repository,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $artifactRef,
+        string $artifactSha,
+        string $expectedState,
+    ): array {
+        try {
+            $inventory = Process::path($repository)->timeout(10)->run([
+                'git', 'worktree', 'list', '--porcelain', '-z',
+            ]);
+            $branchInventory = Process::path($repository)->timeout(10)->run([
+                'git', 'for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads/',
+            ]);
+            $localArtifact = Process::path($repository)->timeout(10)->run([
+                'git', 'show-ref', '--verify', '--hash', $artifactRef,
+            ]);
+            $remoteArtifact = Process::path($repository)->timeout(30)->run([
+                'git', 'ls-remote', '--refs', 'origin', $artifactRef,
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit worktree cleanup state could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        $worktrees = $inventory->successful() ? $this->parseWorktreeInventory($inventory->output()) : [];
+        $matchingPaths = array_values(array_filter(
+            $worktrees,
+            static fn (array $item): bool => $item['worktree'] === $worktree,
+        ));
+        $matchingBranches = array_values(array_filter(
+            $worktrees,
+            static fn (array $item): bool => $item['branch'] === 'refs/heads/'.$branch,
+        ));
+        $exactWorktrees = array_values(array_filter(
+            $matchingPaths,
+            static fn (array $item): bool => $item['branch'] === 'refs/heads/'.$branch,
+        ));
+        $branches = $branchInventory->successful()
+            ? $this->parseBranchInventory($branchInventory->output())
+            : [];
+        $matchingIssueBranches = array_values(array_filter(
+            array_keys($branches),
+            static fn (string $ref): bool => $ref === 'refs/heads/'.$branch
+                || str_starts_with($ref, 'refs/heads/'.$branch.'-'),
+        ));
+        $localBranchExists = in_array('refs/heads/'.$branch, $matchingIssueBranches, true);
+        $targetPresent = count($exactWorktrees) === 1;
+        $remoteFields = preg_split('/\s+/', trim($remoteArtifact->output())) ?: [];
+        $primary = $worktrees[0]['worktree'] ?? null;
+        $validTargetState = match ($expectedState) {
+            'initial' => $targetPresent && $localBranchExists,
+            'resume' => ($targetPresent && $localBranchExists) || ! $targetPresent,
+            'complete' => ! $targetPresent && ! $localBranchExists,
+        };
+
+        if ($inventory->failed()
+            || $branchInventory->failed()
+            || $primary !== $repository
+            || count($matchingPaths) !== ($targetPresent ? 1 : 0)
+            || count($matchingBranches) !== ($targetPresent ? 1 : 0)
+            || count($exactWorktrees) > 1
+            || ! $validTargetState
+            || count($matchingIssueBranches) !== ($localBranchExists ? 1 : 0)
+            || $localArtifact->failed() || trim($localArtifact->output()) !== $artifactSha
+            || $remoteArtifact->failed() || $remoteFields !== [$artifactSha, $artifactRef]) {
+            throw new OrbitRepositoryFailed('The Orbit worktree cleanup state is inconsistent.');
+        }
+
+        if ($expectedState !== 'complete' && $localBranchExists) {
+            $this->assertCleanupBranchSafety(
+                $repository,
+                $targetPresent ? $worktree : null,
+                $branch,
+                $candidateSha,
+            );
+        }
+
+        foreach ($this->unrelatedWorktrees($worktrees, $worktree, $branch) as $unrelated) {
+            if ($unrelated['prunable']) {
+                throw new OrbitRepositoryFailed(
+                    'An unrelated prunable Orbit worktree makes cleanup unsafe.',
+                );
+            }
+        }
+
+        return ['worktrees' => $worktrees, 'branches' => $branches];
+    }
+
+    private function assertCleanupBranchSafety(
+        string $repository,
+        ?string $worktree,
+        string $branch,
+        string $candidateSha,
+    ): void {
+        try {
+            $branchHead = Process::path($repository)->timeout(10)->run([
+                'git', 'rev-parse', 'refs/heads/'.$branch,
+            ]);
+            $ancestor = Process::path($repository)->timeout(10)->run([
+                'git', 'merge-base', '--is-ancestor', 'refs/heads/'.$branch, 'origin/main',
+            ]);
+            $status = $worktree === null ? null : Process::path($worktree)->timeout(10)->run([
+                'git', 'status', '--porcelain',
+            ]);
+            $worktreeHead = $worktree === null ? null : Process::path($worktree)->timeout(10)->run([
+                'git', 'rev-parse', 'HEAD',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit worktree cleanup candidate could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        if ($branchHead->failed() || trim($branchHead->output()) !== $candidateSha
+            || $ancestor->failed()
+            || ($status !== null && ($status->failed() || trim($status->output()) !== ''))
+            || ($worktreeHead !== null
+                && ($worktreeHead->failed() || trim($worktreeHead->output()) !== $candidateSha))) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit worktree cleanup candidate is dirty, changed, or not merged.',
+            );
+        }
+    }
+
+    /**
+     * @param  list<array{worktree: string, head: string, branch: ?string, prunable: bool}>  $worktrees
+     * @return list<array{worktree: string, head: string, branch: ?string, prunable: bool}>
+     */
+    private function unrelatedWorktrees(array $worktrees, string $worktree, string $branch): array
+    {
+        return array_values(array_filter(
+            $worktrees,
+            static fn (array $item): bool => $item['worktree'] !== $worktree
+                && $item['branch'] !== 'refs/heads/'.$branch,
+        ));
+    }
+
+    /**
+     * @param  array<string, string>  $branches
+     * @return array<string, string>
+     */
+    private function unrelatedBranches(array $branches, string $branch): array
+    {
+        unset($branches['refs/heads/'.$branch]);
+
+        return $branches;
+    }
+
+    /** @return array<string, string> */
+    private function parseBranchInventory(string $output): array
+    {
+        $lines = trim($output) === '' ? [] : preg_split('/\R/', trim($output));
+        $branches = [];
+
+        foreach ($lines ?: [] as $line) {
+            if (preg_match('/^([a-f0-9]{40}) (refs\/heads\/[^\s]+)$/', $line, $matches) !== 1
+                || array_key_exists($matches[2], $branches)) {
+                throw new OrbitRepositoryFailed('The Orbit branch inventory is malformed.');
+            }
+
+            $branches[$matches[2]] = $matches[1];
+        }
+
+        return $branches;
+    }
+
+    /** @return list<array{worktree: string, head: string, branch: ?string, prunable: bool}> */
+    private function parseWorktreeInventory(string $output): array
+    {
+        $records = trim($output, "\0\r\n") === ''
+            ? []
+            : explode("\0\0", trim($output, "\0\r\n"));
+        $worktrees = [];
+
+        foreach ($records as $record) {
+            $fields = explode("\0", $record);
+            $paths = array_values(array_filter(
+                $fields,
+                static fn (string $field): bool => str_starts_with($field, 'worktree '),
+            ));
+            $branches = array_values(array_filter(
+                $fields,
+                static fn (string $field): bool => str_starts_with($field, 'branch '),
+            ));
+            $heads = array_values(array_filter(
+                $fields,
+                static fn (string $field): bool => str_starts_with($field, 'HEAD '),
+            ));
+            $prunable = array_values(array_filter(
+                $fields,
+                static fn (string $field): bool => str_starts_with($field, 'prunable'),
+            ));
+
+            if (count($paths) !== 1 || count($heads) !== 1 || count($branches) > 1
+                || count($prunable) > 1 || $paths[0] === 'worktree '
+                || preg_match('/^HEAD [a-f0-9]{40}$/', $heads[0]) !== 1) {
+                throw new OrbitRepositoryFailed('The Orbit worktree cleanup inventory is malformed.');
+            }
+
+            $worktrees[] = [
+                'worktree' => substr($paths[0], strlen('worktree ')),
+                'head' => substr($heads[0], strlen('HEAD ')),
+                'branch' => $branches === [] ? null : substr($branches[0], strlen('branch ')),
+                'prunable' => $prunable !== [],
+            ];
+        }
+
+        return $worktrees;
     }
 
     public function request(string $repository): RequestedOrbitMainCacheRefresh

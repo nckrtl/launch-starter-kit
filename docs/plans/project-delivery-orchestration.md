@@ -46,7 +46,9 @@ proof-closeout skip for discovery deliveries. Its proof branch calls Orbit's
 trusted `bin/e2e-topology closeout` contract with the retained candidate,
 artifact, merge, and reconciled-main SHAs, keeps the merge reservation during
 retryable failures, and accepts completion only from an exact structured
-receipt.
+receipt. After closeout, Commander records cleanup intent before calling
+Orbit's trusted `bin/worktree-remove` contract and retains the merge reservation
+until exact worktree and branch absence has been verified.
 
 Workspace shutdown is a persistent landing stage. It targets only the workspace
 ID recorded by the delivery, accepts only ledger-owned idle or done agents,
@@ -55,13 +57,21 @@ checks that no unrelated Herdr workspace, agent, or pane disappeared. It support
 the installed protocol 20 close request and sends the explicit `close_group:
 false` guard on protocol 22 and newer.
 
+Worktree cleanup is also a persistent landing stage. The first attempt requires
+the exact clean worktree and candidate branch. Commander persists successful
+preflight authorization, including protected worktree, branch, and proof-archive
+baselines, before invoking removal. Only that authorization allows recovery when
+the worktree was removed before its branch, and retries must still match its
+protected baselines. Commander verifies the local and remote immutable artifact
+ref and, for proof deliveries, binds the four primary proof archives to the
+retained successful closeout record before and after removal.
+
 Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
 repository checks still support only discovery. Before proof is enabled, move
 the potentially hour-long topology operation out of the 540-second landing job
 envelope and bind every prompt and repository check to the delivery's immutable
-flow. The remaining discovery landing slices are repository-owned worktree
-removal and branch absence verification, Linear `Done` transition with
-ownership clearing, and the final Commander `Completed` transition. The normal
+flow. The remaining discovery landing slices are the Linear `Done` transition
+with ownership clearing and the final Commander `Completed` transition. The normal
 `bin/loop ISSUE` entry point still invokes the legacy controller; route it
 through Commander only after those closeout stages pass.
 

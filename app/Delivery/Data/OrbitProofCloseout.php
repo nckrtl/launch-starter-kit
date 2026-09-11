@@ -64,6 +64,50 @@ final readonly class OrbitProofCloseout
         return $this->state === 'complete';
     }
 
+    /** @param array<array-key, mixed> $value */
+    public static function fromArray(array $value): self
+    {
+        if (array_keys($value) !== [
+            'schema',
+            'state',
+            'issue',
+            'attempt_id',
+            'candidate_sha',
+            'artifact_sha',
+            'merge_sha',
+            'main_sha',
+            'generation_id',
+            'error',
+            'recorded_at',
+        ]
+            || ($value['schema'] ?? null) !== self::SCHEMA
+            || ! is_string($value['state'] ?? null)
+            || ! is_string($value['issue'] ?? null)
+            || ! is_string($value['attempt_id'] ?? null)
+            || ! is_string($value['candidate_sha'] ?? null)
+            || ! is_string($value['artifact_sha'] ?? null)
+            || ! is_string($value['merge_sha'] ?? null)
+            || ! is_string($value['main_sha'] ?? null)
+            || ($value['generation_id'] !== null && ! is_string($value['generation_id']))
+            || ($value['error'] !== null && ! is_string($value['error']))
+            || ! is_string($value['recorded_at'] ?? null)) {
+            throw new InvalidArgumentException('The Orbit proof closeout record schema is invalid.');
+        }
+
+        return new self(
+            state: $value['state'],
+            issueKey: $value['issue'],
+            attemptId: $value['attempt_id'],
+            candidateSha: $value['candidate_sha'],
+            artifactSha: $value['artifact_sha'],
+            mergeCommitSha: $value['merge_sha'],
+            mainSha: $value['main_sha'],
+            generationId: $value['generation_id'],
+            error: $value['error'],
+            recordedAt: $value['recorded_at'],
+        );
+    }
+
     /** @return array{schema: int, state: string, issue: string, attempt_id: string, candidate_sha: string, artifact_sha: string, merge_sha: string, main_sha: string, generation_id: string|null, error: string|null, recorded_at: string} */
     public function toArray(): array
     {

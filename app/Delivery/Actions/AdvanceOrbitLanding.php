@@ -13,6 +13,7 @@ use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
 use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitWorktreeCleaner;
 use App\Delivery\Data\ApprovedOrbitPullRequest;
 use App\Delivery\Data\MergedOrbitPullRequest;
 use App\Delivery\Data\OrbitDeliveryPreparation;
@@ -21,7 +22,9 @@ use App\Delivery\Data\OrbitLandingReservation;
 use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\OrbitProofCloseout;
+use App\Delivery\Data\PreparedOrbitWorktreeRemoval;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
+use App\Delivery\Data\RemovedOrbitWorktree;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitMergeLineage;
 use App\Delivery\Enums\DeliveryStatus;
@@ -61,6 +64,7 @@ final readonly class AdvanceOrbitLanding
         private OrbitPullRequestReviewSourceValidator $sources,
         private QueueOrbitMainCacheRefresh $cacheRefresh,
         private ShutdownOrbitHerdrWorkspace $workspaceShutdown,
+        private OrbitWorktreeCleaner $worktreeCleaner,
     ) {}
 
     /** Return a delay when the same queued job should retry a non-failing wait. */
@@ -337,6 +341,7 @@ final readonly class AdvanceOrbitLanding
                 'repository_reconciliation',
                 'workspace_shutdown',
                 'proof_closeout',
+                'worktree_cleanup',
                 'reservation_release',
             ], true)
             && $phase->started_at !== null && $phase->finished_at === null;
@@ -429,6 +434,9 @@ final readonly class AdvanceOrbitLanding
         $reconciliation = is_array($output) ? ($output['repository_reconciliation'] ?? null) : null;
         $workspaceShutdown = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
         $proofCloseout = is_array($output) ? ($output['proof_closeout'] ?? null) : null;
+        $worktreeCleanupIntent = is_array($output) ? ($output['worktree_cleanup_intent'] ?? null) : null;
+        $worktreeCleanupAuthorization = is_array($output) ? ($output['worktree_cleanup_authorization'] ?? null) : null;
+        $worktreeCleanup = is_array($output) ? ($output['worktree_cleanup'] ?? null) : null;
         $preMerge = is_array($output) ? $output : null;
         $normalizedReconciliation = $this->associativeArray($reconciliation);
 
@@ -438,6 +446,7 @@ final readonly class AdvanceOrbitLanding
                 'repository_reconciliation',
                 'workspace_shutdown',
                 'proof_closeout',
+                'worktree_cleanup',
                 'reservation_release',
                 'completed',
             ], true)) {
@@ -450,12 +459,15 @@ final readonly class AdvanceOrbitLanding
             $preMerge['repository_reconciliation'],
             $preMerge['workspace_shutdown'],
             $preMerge['proof_closeout'],
+            $preMerge['worktree_cleanup_intent'],
+            $preMerge['worktree_cleanup_authorization'],
+            $preMerge['worktree_cleanup'],
         );
 
         $requiresVerification = $stage !== 'merge_verification';
-        $requiresReconciliation = in_array($stage, ['workspace_shutdown', 'proof_closeout', 'reservation_release', 'completed'], true);
-        $requiresClosedWorkspace = in_array($stage, ['proof_closeout', 'reservation_release', 'completed'], true);
-        $requiresProofCloseout = in_array($stage, ['reservation_release', 'completed'], true);
+        $requiresReconciliation = in_array($stage, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'reservation_release', 'completed'], true);
+        $requiresClosedWorkspace = in_array($stage, ['proof_closeout', 'worktree_cleanup', 'reservation_release', 'completed'], true);
+        $requiresProofCloseout = in_array($stage, ['worktree_cleanup', 'reservation_release', 'completed'], true);
 
         return $this->matchesPreMergeOutput($delivery, $preMerge, $published)
             && $merge === [
@@ -486,7 +498,19 @@ final readonly class AdvanceOrbitLanding
                     $implementationFlow,
                     $artifactSha,
                 )
-                : $proofCloseout === null);
+                : $proofCloseout === null)
+            && $this->matchesWorktreeCleanupState(
+                $delivery,
+                $merge,
+                $output['repository'] ?? null,
+                $proofCloseout,
+                $worktreeCleanupIntent,
+                $worktreeCleanupAuthorization,
+                $worktreeCleanup,
+                $stage,
+                $implementationFlow,
+                $artifactSha,
+            );
     }
 
     /** @param array<string, mixed> $merge */
@@ -605,6 +629,158 @@ final readonly class AdvanceOrbitLanding
             && ($record['error'] ?? null) === null
             && is_string($record['recorded_at'] ?? null)
             && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $record['recorded_at']) === 1;
+    }
+
+    /**
+     * @param  array<string, mixed>  $merge
+     */
+    private function matchesWorktreeCleanupState(
+        Delivery $delivery,
+        array $merge,
+        mixed $repository,
+        mixed $proofCloseout,
+        mixed $intent,
+        mixed $authorization,
+        mixed $cleanup,
+        string $stage,
+        string $implementationFlow,
+        mixed $artifactSha,
+    ): bool {
+        if (! in_array($stage, ['worktree_cleanup', 'reservation_release', 'completed'], true)) {
+            return $intent === null && $authorization === null && $cleanup === null;
+        }
+
+        if ($stage === 'worktree_cleanup' && $intent === null) {
+            return $authorization === null && $cleanup === null;
+        }
+
+        $proofRecord = is_array($proofCloseout) && ($proofCloseout['flow'] ?? null) === 'proof'
+            ? $this->associativeArray($proofCloseout['record'] ?? null)
+            : null;
+        $proofAttemptId = $proofRecord['attempt_id'] ?? null;
+        $expectedProofAttemptId = $implementationFlow === 'proof' ? $proofAttemptId : null;
+
+        if (! is_array($intent) || array_is_list($intent)
+            || array_keys($intent) !== [
+                'schema',
+                'attempt_id',
+                'repository',
+                'issue_key',
+                'worktree',
+                'branch',
+                'candidate_sha',
+                'artifact_sha',
+                'proof_attempt_id',
+                'started_at',
+            ]
+            || ($intent['schema'] ?? null) !== 1
+            || ! is_string($intent['attempt_id'] ?? null)
+            || preg_match('/^[a-f0-9]{32}$/', $intent['attempt_id']) !== 1
+            || ! is_string($intent['repository'] ?? null)
+            || $intent['repository'] !== $repository
+            || ($intent['issue_key'] ?? null) !== $delivery->external_issue_key
+            || ($intent['worktree'] ?? null) !== $delivery->worktree_path
+            || ($intent['branch'] ?? null) !== strtolower((string) $delivery->external_issue_key)
+            || ($intent['candidate_sha'] ?? null) !== ($merge['candidate_sha'] ?? null)
+            || ($intent['artifact_sha'] ?? null) !== $artifactSha
+            || ($intent['proof_attempt_id'] ?? null) !== $expectedProofAttemptId
+            || ! is_string($intent['started_at'] ?? null)
+            || trim($intent['started_at']) === '') {
+            return false;
+        }
+
+        if ($authorization === null) {
+            return $stage === 'worktree_cleanup' && $cleanup === null;
+        }
+
+        if (! is_array($authorization) || array_is_list($authorization)) {
+            return false;
+        }
+
+        try {
+            $prepared = PreparedOrbitWorktreeRemoval::fromArray($authorization);
+        } catch (\InvalidArgumentException) {
+            return false;
+        }
+
+        if ($prepared->repository !== $intent['repository']
+            || $prepared->worktree !== $intent['worktree']
+            || $prepared->issueKey !== $intent['issue_key']
+            || $prepared->branch !== $intent['branch']
+            || $prepared->candidateSha !== $intent['candidate_sha']
+            || $prepared->artifactSha !== $intent['artifact_sha']
+            || $prepared->cleanupAttemptId !== $intent['attempt_id']
+            || $prepared->proofAttemptId !== $intent['proof_attempt_id']) {
+            return false;
+        }
+
+        if ($stage === 'worktree_cleanup') {
+            return $cleanup === null;
+        }
+
+        $proofAttemptId = is_array($cleanup) ? ($cleanup['proof_attempt_id'] ?? null) : null;
+        $evidenceArchives = is_array($cleanup)
+            ? $this->stringMap($cleanup['evidence_archives'] ?? null)
+            : null;
+
+        if (! is_array($cleanup) || array_is_list($cleanup)
+            || array_keys($cleanup) !== [
+                'schema',
+                'repository',
+                'worktree',
+                'issue_key',
+                'branch',
+                'candidate_sha',
+                'artifact_ref',
+                'artifact_sha',
+                'cleanup_attempt_id',
+                'proof_attempt_id',
+                'evidence_archives',
+                'removed_at',
+            ]
+            || ($cleanup['schema'] ?? null) !== RemovedOrbitWorktree::SCHEMA
+            || ! is_string($cleanup['repository'] ?? null)
+            || ! is_string($cleanup['worktree'] ?? null)
+            || ! is_string($cleanup['issue_key'] ?? null)
+            || ! is_string($cleanup['branch'] ?? null)
+            || ! is_string($cleanup['candidate_sha'] ?? null)
+            || ! is_string($cleanup['artifact_ref'] ?? null)
+            || ! is_string($cleanup['artifact_sha'] ?? null)
+            || ! is_string($cleanup['cleanup_attempt_id'] ?? null)
+            || ($proofAttemptId !== null && ! is_string($proofAttemptId))
+            || $evidenceArchives === null
+            || ! is_string($cleanup['removed_at'] ?? null)) {
+            return false;
+        }
+
+        try {
+            $removed = new RemovedOrbitWorktree(
+                repository: $cleanup['repository'],
+                worktree: $cleanup['worktree'],
+                issueKey: $cleanup['issue_key'],
+                branch: $cleanup['branch'],
+                candidateSha: $cleanup['candidate_sha'],
+                artifactRef: $cleanup['artifact_ref'],
+                artifactSha: $cleanup['artifact_sha'],
+                cleanupAttemptId: $cleanup['cleanup_attempt_id'],
+                proofAttemptId: $proofAttemptId,
+                evidenceArchives: $evidenceArchives,
+                removedAt: $cleanup['removed_at'],
+            );
+        } catch (\InvalidArgumentException) {
+            return false;
+        }
+
+        return $removed->toArray() === $cleanup
+            && $removed->repository === $intent['repository']
+            && $removed->worktree === $intent['worktree']
+            && $removed->issueKey === $intent['issue_key']
+            && $removed->branch === $intent['branch']
+            && $removed->candidateSha === $intent['candidate_sha']
+            && $removed->artifactSha === $intent['artifact_sha']
+            && $removed->cleanupAttemptId === $intent['attempt_id']
+            && $removed->proofAttemptId === $intent['proof_attempt_id']
+            && $removed->evidenceArchives === $prepared->evidenceArchives;
     }
 
     private function verifyImplementation(
@@ -897,6 +1073,12 @@ final readonly class AdvanceOrbitLanding
             }
         }
 
+        $phase = PhaseRun::query()->findOrFail($phaseId);
+
+        if ($phase->current_block === 'worktree_cleanup') {
+            $this->cleanupWorktree($config, $deliveryId, $phaseId);
+        }
+
         $this->releaseAndFinalize(
             $this->delivery($deliveryId),
             PhaseRun::query()->findOrFail($phaseId),
@@ -914,6 +1096,7 @@ final readonly class AdvanceOrbitLanding
             'repository_reconciliation',
             'workspace_shutdown',
             'proof_closeout',
+            'worktree_cleanup',
             'reservation_release',
         ], true)) {
             return;
@@ -990,7 +1173,7 @@ final readonly class AdvanceOrbitLanding
     ): void {
         $phase = PhaseRun::query()->findOrFail($phaseId);
 
-        if (in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'reservation_release'], true)) {
+        if (in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'reservation_release'], true)) {
             return;
         }
 
@@ -1028,7 +1211,7 @@ final readonly class AdvanceOrbitLanding
                 'origin_main_sha' => $reconciled->originMainSha,
             ];
 
-            if ($phase !== null && in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'reservation_release'], true)
+            if ($phase !== null && in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'reservation_release'], true)
                 && is_array($output) && ($output['repository_reconciliation'] ?? null) === $evidence) {
                 return;
             }
@@ -1061,7 +1244,7 @@ final readonly class AdvanceOrbitLanding
             $output = $phase?->output;
             $shutdown = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
 
-            if ($phase !== null && in_array($phase->current_block, ['proof_closeout', 'reservation_release'], true)
+            if ($phase !== null && in_array($phase->current_block, ['proof_closeout', 'worktree_cleanup', 'reservation_release'], true)
                 && $this->matchesClosedWorkspace($delivery, $shutdown)) {
                 return;
             }
@@ -1200,7 +1383,7 @@ final readonly class AdvanceOrbitLanding
                 $this->assertProofCloseoutRetryIdentity($delivery, $phase, $retryRecord);
             }
 
-            if ($phase !== null && $phase->current_block === 'reservation_release'
+            if ($phase !== null && $phase->current_block === 'worktree_cleanup'
                 && is_array($output) && ($output['proof_closeout'] ?? null) === $evidence) {
                 return;
             }
@@ -1222,7 +1405,7 @@ final readonly class AdvanceOrbitLanding
                 );
             }
 
-            $phase->current_block = 'reservation_release';
+            $phase->current_block = 'worktree_cleanup';
             $phase->output = [...$output, 'proof_closeout' => $evidence];
             $phase->save();
             $delivery->failure_details = null;
@@ -1287,6 +1470,370 @@ final readonly class AdvanceOrbitLanding
                 'The Orbit proof closeout retry identity changed.',
             );
         }
+    }
+
+    private function cleanupWorktree(
+        OrbitProjectConfig $config,
+        int $deliveryId,
+        int $phaseId,
+    ): void {
+        $delivery = $this->delivery($deliveryId);
+        $landing = $this->landingIntent($delivery, $phaseId);
+        $phase = $landing[0] ?? null;
+        $implementation = $landing[2] ?? null;
+        $output = $phase?->output;
+        $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+        $proofEvidence = $this->associativeArray(
+            is_array($output) ? ($output['proof_closeout'] ?? null) : null,
+        );
+        $flow = $implementation?->payload['flow'] ?? null;
+        $artifactSha = $implementation?->payload['artifact_sha'] ?? null;
+
+        if ($phase === null || $phase->current_block !== 'worktree_cleanup'
+            || $implementation === null || ! is_array($output) || $merge === null
+            || $proofEvidence === null || ! is_string($flow) || ! is_string($artifactSha)
+            || ! $this->matchesProofCloseout(
+                $delivery,
+                $merge,
+                $this->associativeArray($output['repository_reconciliation'] ?? null),
+                $proofEvidence,
+                $flow,
+                $artifactSha,
+            )) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit worktree cleanup cannot run from its retained landing ledger.',
+            );
+        }
+
+        [$cleanupIntent, $authorization] = $this->worktreeCleanupIntent(
+            $config,
+            $deliveryId,
+            $phaseId,
+        );
+        $resume = $authorization !== null;
+        $proofCloseout = $this->proofCloseoutFromEvidence($proofEvidence);
+        $issueKey = $this->string($cleanupIntent, 'issue_key');
+        $worktree = $this->string($cleanupIntent, 'worktree');
+        $branch = $this->string($cleanupIntent, 'branch');
+        $candidateSha = $this->sha($cleanupIntent, 'candidate_sha');
+        $cleanupArtifactSha = $this->sha($cleanupIntent, 'artifact_sha');
+        $cleanupAttemptId = $this->string($cleanupIntent, 'attempt_id');
+
+        if (! $resume) {
+            $authorization = $this->worktreeCleaner->prepareWorktreeRemoval(
+                $config,
+                $issueKey,
+                $worktree,
+                $branch,
+                $candidateSha,
+                $cleanupArtifactSha,
+                $proofCloseout,
+                $cleanupAttemptId,
+            );
+            $this->recordWorktreeCleanupAuthorization(
+                $deliveryId,
+                $phaseId,
+                $cleanupIntent,
+                $authorization,
+            );
+        }
+
+        $removed = $this->worktreeCleaner->removeWorktree(
+            $config,
+            $issueKey,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $cleanupArtifactSha,
+            $proofCloseout,
+            $cleanupAttemptId,
+            $authorization,
+            $resume,
+        );
+        $this->recordWorktreeCleanup($deliveryId, $phaseId, $cleanupIntent, $removed);
+    }
+
+    /** @return array{array<string, mixed>, ?PreparedOrbitWorktreeRemoval} */
+    private function worktreeCleanupIntent(
+        OrbitProjectConfig $config,
+        int $deliveryId,
+        int $phaseId,
+    ): array {
+        return DB::transaction(function () use ($config, $deliveryId, $phaseId): array {
+            $delivery = $this->lockLedger($deliveryId);
+            $landing = $this->landingIntent($delivery, $phaseId);
+            $phase = $landing[0] ?? null;
+            $implementation = $landing[2] ?? null;
+            $output = $phase?->output;
+            $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+            $proofCloseout = $this->associativeArray(
+                is_array($output) ? ($output['proof_closeout'] ?? null) : null,
+            );
+            $existing = $this->associativeArray(
+                is_array($output) ? ($output['worktree_cleanup_intent'] ?? null) : null,
+            );
+            $authorization = $this->associativeArray(
+                is_array($output) ? ($output['worktree_cleanup_authorization'] ?? null) : null,
+            );
+            $flow = $implementation?->payload['flow'] ?? null;
+            $artifactSha = $implementation?->payload['artifact_sha'] ?? null;
+
+            if ($phase === null || $phase->current_block !== 'worktree_cleanup'
+                || $implementation === null || ! is_array($output) || $merge === null
+                || $proofCloseout === null || ! is_string($flow) || ! is_string($artifactSha)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit worktree cleanup intent cannot be retained from its landing ledger.',
+                );
+            }
+
+            if ($existing !== null) {
+                if (! $this->matchesWorktreeCleanupState(
+                    $delivery,
+                    $merge,
+                    $output['repository'] ?? null,
+                    $proofCloseout,
+                    $existing,
+                    $authorization,
+                    null,
+                    'worktree_cleanup',
+                    $flow,
+                    $artifactSha,
+                )) {
+                    throw new OrbitLandingAdvancementFailed(
+                        'The retained Orbit worktree cleanup intent is inconsistent.',
+                    );
+                }
+
+                return [
+                    $existing,
+                    $authorization === null
+                        ? null
+                        : PreparedOrbitWorktreeRemoval::fromArray($authorization),
+                ];
+            }
+
+            $record = $this->proofCloseoutFromEvidence($proofCloseout);
+            $issueKey = $delivery->external_issue_key;
+            $worktree = $delivery->worktree_path;
+
+            if (! is_string($issueKey) || ! is_string($worktree)
+                || $config->repository !== ($output['repository'] ?? null)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit worktree cleanup has invalid delivery bindings.',
+                );
+            }
+
+            $intent = [
+                'schema' => 1,
+                'attempt_id' => bin2hex(random_bytes(16)),
+                'repository' => $config->repository,
+                'issue_key' => $issueKey,
+                'worktree' => $worktree,
+                'branch' => strtolower($issueKey),
+                'candidate_sha' => $this->sha($merge, 'candidate_sha'),
+                'artifact_sha' => $this->sha($implementation->payload, 'artifact_sha'),
+                'proof_attempt_id' => $record?->attemptId,
+                'started_at' => now()->toISOString(),
+            ];
+
+            if (! $this->matchesWorktreeCleanupState(
+                $delivery,
+                $merge,
+                $output['repository'],
+                $proofCloseout,
+                $intent,
+                null,
+                null,
+                'worktree_cleanup',
+                $flow,
+                $artifactSha,
+            )) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit worktree cleanup intent is inconsistent.',
+                );
+            }
+
+            $phase->output = [...$output, 'worktree_cleanup_intent' => $intent];
+            $phase->save();
+            $delivery->failure_details = null;
+            $delivery->save();
+
+            return [$intent, null];
+        });
+    }
+
+    /** @param array<string, mixed> $intent */
+    private function recordWorktreeCleanupAuthorization(
+        int $deliveryId,
+        int $phaseId,
+        array $intent,
+        PreparedOrbitWorktreeRemoval $authorization,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $phaseId, $intent, $authorization): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $landing = $this->landingIntent($delivery, $phaseId);
+            $phase = $landing[0] ?? null;
+            $implementation = $landing[2] ?? null;
+            $output = $phase?->output;
+            $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+            $proofCloseout = $this->associativeArray(
+                is_array($output) ? ($output['proof_closeout'] ?? null) : null,
+            );
+            $retainedIntent = $this->associativeArray(
+                is_array($output) ? ($output['worktree_cleanup_intent'] ?? null) : null,
+            );
+            $existing = $this->associativeArray(
+                is_array($output) ? ($output['worktree_cleanup_authorization'] ?? null) : null,
+            );
+            $evidence = $authorization->toArray();
+            $flow = $implementation?->payload['flow'] ?? null;
+            $artifactSha = $implementation?->payload['artifact_sha'] ?? null;
+
+            if ($phase === null || $phase->current_block !== 'worktree_cleanup'
+                || $implementation === null || ! is_array($output) || $merge === null
+                || $proofCloseout === null || $retainedIntent !== $intent
+                || ! is_string($flow) || ! is_string($artifactSha)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit worktree cleanup authorization no longer matches its landing ledger.',
+                );
+            }
+
+            if ($existing !== null) {
+                if ($existing === $evidence && $this->matchesWorktreeCleanupState(
+                    $delivery,
+                    $merge,
+                    $output['repository'] ?? null,
+                    $proofCloseout,
+                    $intent,
+                    $existing,
+                    null,
+                    'worktree_cleanup',
+                    $flow,
+                    $artifactSha,
+                )) {
+                    return;
+                }
+
+                throw new OrbitLandingAdvancementFailed(
+                    'The retained Orbit worktree cleanup authorization is inconsistent.',
+                );
+            }
+
+            if (! $this->matchesWorktreeCleanupState(
+                $delivery,
+                $merge,
+                $output['repository'] ?? null,
+                $proofCloseout,
+                $intent,
+                $evidence,
+                null,
+                'worktree_cleanup',
+                $flow,
+                $artifactSha,
+            )) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit worktree cleanup authorization is inconsistent.',
+                );
+            }
+
+            $phase->output = [...$output, 'worktree_cleanup_authorization' => $evidence];
+            $phase->save();
+        });
+    }
+
+    /** @param array<string, mixed> $proofCloseout */
+    private function proofCloseoutFromEvidence(array $proofCloseout): ?OrbitProofCloseout
+    {
+        if (($proofCloseout['flow'] ?? null) === 'discovery') {
+            return null;
+        }
+
+        $record = $this->associativeArray($proofCloseout['record'] ?? null);
+
+        if ($record === null) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit proof closeout record is unavailable for worktree cleanup.',
+            );
+        }
+
+        try {
+            $closeout = OrbitProofCloseout::fromArray($record);
+        } catch (\InvalidArgumentException $exception) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit proof closeout record is invalid for worktree cleanup.',
+                previous: $exception,
+            );
+        }
+
+        if (! $closeout->complete()) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit proof closeout is incomplete before worktree cleanup.',
+            );
+        }
+
+        return $closeout;
+    }
+
+    /** @param array<string, mixed> $intent */
+    private function recordWorktreeCleanup(
+        int $deliveryId,
+        int $phaseId,
+        array $intent,
+        RemovedOrbitWorktree $removed,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $phaseId, $intent, $removed): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $landing = $this->landingIntent($delivery, $phaseId);
+            $phase = $landing[0] ?? null;
+            $implementation = $landing[2] ?? null;
+            $output = $phase?->output;
+            $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+            $proofCloseout = $this->associativeArray(
+                is_array($output) ? ($output['proof_closeout'] ?? null) : null,
+            );
+            $retainedIntent = $this->associativeArray(
+                is_array($output) ? ($output['worktree_cleanup_intent'] ?? null) : null,
+            );
+            $authorization = $this->associativeArray(
+                is_array($output) ? ($output['worktree_cleanup_authorization'] ?? null) : null,
+            );
+            $flow = $implementation?->payload['flow'] ?? null;
+            $artifactSha = $implementation?->payload['artifact_sha'] ?? null;
+            $evidence = $removed->toArray();
+
+            if ($phase !== null && $phase->current_block === 'reservation_release'
+                && is_array($output) && ($output['worktree_cleanup'] ?? null) === $evidence) {
+                return;
+            }
+
+            if ($phase === null || $phase->current_block !== 'worktree_cleanup'
+                || $implementation === null || ! is_array($output) || $merge === null
+                || $proofCloseout === null || $retainedIntent !== $intent || $authorization === null
+                || ! is_string($flow) || ! is_string($artifactSha)
+                || ! $this->matchesWorktreeCleanupState(
+                    $delivery,
+                    $merge,
+                    $output['repository'] ?? null,
+                    $proofCloseout,
+                    $intent,
+                    $authorization,
+                    $evidence,
+                    'reservation_release',
+                    $flow,
+                    $artifactSha,
+                )
+                || array_key_exists('worktree_cleanup', $output)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The removed Orbit worktree no longer matches its landing ledger.',
+                );
+            }
+
+            $phase->current_block = 'reservation_release';
+            $phase->output = [...$output, 'worktree_cleanup' => $evidence];
+            $phase->save();
+            $delivery->failure_details = null;
+            $delivery->save();
+        });
     }
 
     private function resumeMerge(
@@ -1538,6 +2085,26 @@ final readonly class AdvanceOrbitLanding
 
         foreach ($value as $key => $item) {
             if (! is_string($key)) {
+                return null;
+            }
+
+            $result[$key] = $item;
+        }
+
+        return $result;
+    }
+
+    /** @return array<string, string>|null */
+    private function stringMap(mixed $value): ?array
+    {
+        if (! is_array($value) || ($value !== [] && array_is_list($value))) {
+            return null;
+        }
+
+        $result = [];
+
+        foreach ($value as $key => $item) {
+            if (! is_string($key) || ! is_string($item)) {
                 return null;
             }
 

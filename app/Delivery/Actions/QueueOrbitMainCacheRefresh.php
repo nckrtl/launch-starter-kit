@@ -91,6 +91,7 @@ final readonly class QueueOrbitMainCacheRefresh
                     'repository_reconciliation',
                     'workspace_shutdown',
                     'proof_closeout',
+                    'worktree_cleanup',
                     'reservation_release',
                 ], true))
             || ($phase->status === PhaseRunStatus::Completed

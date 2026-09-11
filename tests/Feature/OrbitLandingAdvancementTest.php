@@ -15,6 +15,7 @@ use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
 use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitWorktreeCleaner;
 use App\Delivery\Data\ApprovedOrbitPullRequest;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\HerdrAgentOutput;
@@ -32,8 +33,10 @@ use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\OrbitProofCloseout;
 use App\Delivery\Data\PreparedIssueSnapshot;
+use App\Delivery\Data\PreparedOrbitWorktreeRemoval;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
+use App\Delivery\Data\RemovedOrbitWorktree;
 use App\Delivery\Data\RequestedOrbitMainCacheRefresh;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitMergeLineage;
@@ -353,6 +356,149 @@ final class LandingProofTopologyCloser implements OrbitProofTopologyCloser
             generationId: $complete ? $this->generationId : null,
             error: $complete ? null : 'Snapshot refresh remains pending.',
             recordedAt: '2026-09-11T15:00:00Z',
+        );
+    }
+}
+
+final class LandingWorktreeCleaner implements OrbitWorktreeCleaner
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public int $prepareCalls = 0;
+
+    public int $prepareFailures = 0;
+
+    public int $failures = 0;
+
+    /** @var list<bool> */
+    public array $resumes = [];
+
+    /** @var list<string> */
+    public array $attemptIds = [];
+
+    /** @var list<string|null> */
+    public array $proofAttemptIds = [];
+
+    public bool $returnMismatchedEvidence = false;
+
+    public function prepareWorktreeRemoval(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $artifactSha,
+        ?OrbitProofCloseout $proofCloseout,
+        string $cleanupAttemptId,
+    ): PreparedOrbitWorktreeRemoval {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($config->repository)->toBe(test()->repositoryPath)
+            ->and($issueKey)->toBe('ORB-234')
+            ->and($worktree)->toBe(test()->worktreePath)
+            ->and($branch)->toBe('orb-234')
+            ->and($candidateSha)->toBe(test()->candidateSha)
+            ->and($artifactSha)->toBe(test()->artifactSha)
+            ->and($cleanupAttemptId)->toMatch('/^[a-f0-9]{32}$/')
+            ->and(test()->repository->reservationIsHeld())->toBeTrue()
+            ->and(test()->herdrWorkspace->closed)->toBeTrue();
+        $this->prepareCalls++;
+
+        if ($this->prepareFailures > 0) {
+            $this->prepareFailures--;
+
+            throw new OrbitRepositoryFailed('The worktree cleanup preflight was interrupted.');
+        }
+
+        if ($proofCloseout !== null) {
+            expect($proofCloseout->attemptId)->toMatch('/^[a-f0-9]{32}$/');
+        }
+
+        $archives = $proofCloseout === null ? [] : [
+            ".e2e/proof-evidence/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('1', 64),
+            ".e2e/proof-review/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('2', 64),
+            ".e2e/proof-review-evaluation/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('3', 64),
+            ".e2e/proof-closeout/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('4', 64),
+        ];
+
+        return new PreparedOrbitWorktreeRemoval(
+            repository: $config->repository,
+            worktree: $worktree,
+            issueKey: $issueKey,
+            branch: $branch,
+            candidateSha: $candidateSha,
+            artifactRef: "refs/tags/loop/{$branch}/{$candidateSha}",
+            artifactSha: $artifactSha,
+            cleanupAttemptId: $cleanupAttemptId,
+            proofAttemptId: $proofCloseout?->attemptId,
+            protectedWorktrees: [[
+                'worktree' => $config->repository,
+                'head' => str_repeat('8', 40),
+                'branch' => 'refs/heads/main',
+                'prunable' => false,
+            ]],
+            protectedBranches: ['refs/heads/main' => str_repeat('8', 40)],
+            evidenceArchives: $archives,
+            authorizedAt: '2026-09-11T16:00:00Z',
+        );
+    }
+
+    public function removeWorktree(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $artifactSha,
+        ?OrbitProofCloseout $proofCloseout,
+        string $cleanupAttemptId,
+        PreparedOrbitWorktreeRemoval $authorization,
+        bool $resume,
+    ): RemovedOrbitWorktree {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($config->repository)->toBe(test()->repositoryPath)
+            ->and($issueKey)->toBe('ORB-234')
+            ->and($worktree)->toBe(test()->worktreePath)
+            ->and($branch)->toBe('orb-234')
+            ->and($candidateSha)->toBe(test()->candidateSha)
+            ->and($artifactSha)->toBe(test()->artifactSha)
+            ->and($cleanupAttemptId)->toMatch('/^[a-f0-9]{32}$/')
+            ->and($authorization->cleanupAttemptId)->toBe($cleanupAttemptId)
+            ->and(test()->repository->reservationIsHeld())->toBeTrue()
+            ->and(test()->herdrWorkspace->closed)->toBeTrue();
+        $this->calls++;
+        $this->resumes[] = $resume;
+        $this->attemptIds[] = $cleanupAttemptId;
+        $this->proofAttemptIds[] = $proofCloseout?->attemptId;
+
+        if ($this->failures > 0) {
+            $this->failures--;
+
+            throw new OrbitRepositoryFailed('The worktree cleanup command was interrupted.');
+        }
+
+        $archives = $proofCloseout === null ? [] : [
+            ".e2e/proof-evidence/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('1', 64),
+            ".e2e/proof-review/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('2', 64),
+            ".e2e/proof-review-evaluation/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('3', 64),
+            ".e2e/proof-closeout/{$issueKey}/{$proofCloseout->attemptId}.json" => str_repeat('4', 64),
+        ];
+
+        return new RemovedOrbitWorktree(
+            repository: $config->repository,
+            worktree: $worktree,
+            issueKey: $issueKey,
+            branch: $branch,
+            candidateSha: $candidateSha,
+            artifactRef: "refs/tags/loop/{$branch}/{$candidateSha}",
+            artifactSha: $artifactSha,
+            cleanupAttemptId: $this->returnMismatchedEvidence
+                ? str_repeat('9', 32)
+                : $cleanupAttemptId,
+            proofAttemptId: $proofCloseout?->attemptId,
+            evidenceArchives: $archives,
+            removedAt: '2026-09-11T16:00:00Z',
         );
     }
 }
@@ -861,6 +1007,7 @@ beforeEach(function () {
     $this->merges = new LandingMergeLineageVerifier;
     $this->primaryCheckout = new LandingPrimaryCheckoutReconciler;
     $this->proofTopologies = new LandingProofTopologyCloser;
+    $this->worktreeCleaner = new LandingWorktreeCleaner;
     $this->herdrWorkspace = new LandingHerdrWorkspace($this->repositoryPath, $this->worktreePath);
     $transactionLevel = DB::transactionLevel();
     $this->repository->transactionLevel = $transactionLevel;
@@ -871,6 +1018,7 @@ beforeEach(function () {
     $this->merges->transactionLevel = $transactionLevel;
     $this->primaryCheckout->transactionLevel = $transactionLevel;
     $this->proofTopologies->transactionLevel = $transactionLevel;
+    $this->worktreeCleaner->transactionLevel = $transactionLevel;
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitImplementationRepository::class, $this->implementations);
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
@@ -879,6 +1027,7 @@ beforeEach(function () {
     app()->instance(OrbitMergeLineageVerifier::class, $this->merges);
     app()->instance(OrbitPrimaryCheckoutReconciler::class, $this->primaryCheckout);
     app()->instance(OrbitProofTopologyCloser::class, $this->proofTopologies);
+    app()->instance(OrbitWorktreeCleaner::class, $this->worktreeCleaner);
     app()->instance(HerdrWorkspaceRuntime::class, $this->herdrWorkspace);
     Queue::fake();
 });
@@ -1203,6 +1352,31 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
             'flow' => 'discovery',
             'required' => false,
         ])
+        ->and($landing->output['worktree_cleanup_intent'])->toMatchArray([
+            'schema' => 1,
+            'repository' => $this->repositoryPath,
+            'issue_key' => 'ORB-234',
+            'worktree' => $this->worktreePath,
+            'branch' => 'orb-234',
+            'candidate_sha' => $this->candidateSha,
+            'artifact_sha' => $this->artifactSha,
+            'proof_attempt_id' => null,
+        ])
+        ->and($landing->output['worktree_cleanup_authorization'])->toMatchArray([
+            'schema' => 1,
+            'cleanup_attempt_id' => $landing->output['worktree_cleanup_intent']['attempt_id'],
+        ])
+        ->and($landing->output['worktree_cleanup'])->toMatchArray([
+            'schema' => 1,
+            'repository' => $this->repositoryPath,
+            'issue_key' => 'ORB-234',
+            'worktree' => $this->worktreePath,
+            'branch' => 'orb-234',
+            'candidate_sha' => $this->candidateSha,
+            'artifact_sha' => $this->artifactSha,
+            'proof_attempt_id' => null,
+            'evidence_archives' => [],
+        ])
         ->and($this->repository->reservationIsHeld())->toBeFalse()
         ->and($this->implementations->calls)->toBe(1)
         ->and($this->issues->calls)->toBe(1)
@@ -1214,6 +1388,9 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->merges->calls)->toBe(1)
         ->and($this->primaryCheckout->calls)->toBe(1)
         ->and($this->proofTopologies->calls)->toBe(0)
+        ->and($this->worktreeCleaner->prepareCalls)->toBe(1)
+        ->and($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->worktreeCleaner->resumes)->toBe([false])
         ->and($this->herdrWorkspace->closeCalls)->toBe(1);
 
     $maintenance = MaintenanceRun::sole();
@@ -1237,6 +1414,7 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->gateway->releaseCalls)->toBe(1)
         ->and($this->merges->calls)->toBe(1)
         ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->worktreeCleaner->calls)->toBe(1)
         ->and(MaintenanceRun::count())->toBe(1);
     Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 });
@@ -1269,6 +1447,10 @@ it('closes a retained proof topology before releasing the merge reservation', fu
             ],
         ])
         ->and($this->proofTopologies->calls)->toBe(1)
+        ->and($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->worktreeCleaner->proofAttemptIds)->toBe([str_repeat('6', 32)])
+        ->and($landing->output['worktree_cleanup']['proof_attempt_id'])->toBe(str_repeat('6', 32))
+        ->and($landing->output['worktree_cleanup']['evidence_archives'])->toHaveCount(4)
         ->and($this->gateway->releaseCalls)->toBe(1);
 });
 
@@ -1353,6 +1535,101 @@ it('recovers an interrupted proof closeout without repeating earlier landing mut
         ->and($this->herdrWorkspace->closeCalls)->toBe(1)
         ->and($this->proofTopologies->calls)->toBe(2)
         ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('retains cleanup intent and resumes an interrupted worktree removal without repeating landing mutations', function () {
+    $this->worktreeCleaner->failures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitRepositoryFailed::class, 'cleanup command was interrupted');
+
+    $landing = $this->landing->fresh();
+    $attemptId = $landing->output['worktree_cleanup_intent']['attempt_id'];
+    expect($landing->current_block)->toBe('worktree_cleanup')
+        ->and($landing->output)->toHaveKeys([
+            'workspace_shutdown',
+            'proof_closeout',
+            'worktree_cleanup_intent',
+            'worktree_cleanup_authorization',
+        ])
+        ->and($landing->output)->not->toHaveKey('worktree_cleanup')
+        ->and($attemptId)->toMatch('/^[a-f0-9]{32}$/')
+        ->and($landing->output['worktree_cleanup_authorization']['cleanup_attempt_id'])->toBe($attemptId)
+        ->and($this->worktreeCleaner->prepareCalls)->toBe(1)
+        ->and($this->worktreeCleaner->attemptIds)->toBe([$attemptId])
+        ->and($this->worktreeCleaner->resumes)->toBe([false])
+        ->and($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(0);
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->worktreeCleaner->attemptIds)->toBe([$attemptId, $attemptId])
+        ->and($this->worktreeCleaner->resumes)->toBe([false, true])
+        ->and($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('does not enable cleanup resume semantics until exact-target preflight is retained', function () {
+    $this->worktreeCleaner->prepareFailures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitRepositoryFailed::class, 'cleanup preflight was interrupted');
+
+    $landing = $this->landing->fresh();
+    expect($landing->current_block)->toBe('worktree_cleanup')
+        ->and($landing->output)->toHaveKey('worktree_cleanup_intent')
+        ->and($landing->output)->not->toHaveKey('worktree_cleanup_authorization')
+        ->and($this->worktreeCleaner->prepareCalls)->toBe(1)
+        ->and($this->worktreeCleaner->calls)->toBe(0)
+        ->and($this->gateway->releaseCalls)->toBe(0);
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->worktreeCleaner->prepareCalls)->toBe(2)
+        ->and($this->worktreeCleaner->resumes)->toBe([false])
+        ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('rejects a tampered cleanup intent before retrying worktree removal', function () {
+    $this->worktreeCleaner->failures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitRepositoryFailed::class, 'cleanup command was interrupted');
+
+    $landing = $this->landing->fresh();
+    $output = $landing->output;
+    $output['worktree_cleanup_intent']['repository'] = '/tmp/other-repository';
+    $landing->output = $output;
+    $landing->save();
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'landing intent is inconsistent');
+
+    expect($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(0)
+        ->and($this->landing->fresh()->current_block)->toBe('worktree_cleanup');
+});
+
+it('does not release the merge reservation without cleanup evidence matching its retained intent', function () {
+    $this->worktreeCleaner->returnMismatchedEvidence = true;
+
+    expect(fn () => app(AdvanceOrbitLanding::class)->handle(
+        $this->delivery->id,
+        $this->landing->id,
+    ))->toThrow(OrbitLandingAdvancementFailed::class, 'no longer matches its landing ledger');
+
+    expect($this->landing->fresh()->current_block)->toBe('worktree_cleanup')
+        ->and($this->landing->fresh()->output)->toHaveKey('worktree_cleanup_intent')
+        ->and($this->landing->fresh()->output)->not->toHaveKey('worktree_cleanup')
+        ->and($this->gateway->releaseCalls)->toBe(0);
 });
 
 it('runs queued main cache maintenance while proof closeout is waiting', function () {
@@ -1659,6 +1936,7 @@ it('queues incomplete landing recovery states', function (DeliveryStatus $status
     'repository reconciliation' => [DeliveryStatus::Landed, 'repository_reconciliation'],
     'workspace shutdown' => [DeliveryStatus::Landed, 'workspace_shutdown'],
     'proof closeout' => [DeliveryStatus::Landed, 'proof_closeout'],
+    'worktree cleanup' => [DeliveryStatus::Landed, 'worktree_cleanup'],
     'reservation release' => [DeliveryStatus::Landed, 'reservation_release'],
 ]);
 
@@ -1749,6 +2027,12 @@ it('guards exhausted landing jobs and preserves recoverable external states', fu
         PhaseRunStatus::Running,
         'proof_closeout',
         'landing_proof_closeout_required',
+    ],
+    'post-merge worktree cleanup' => [
+        DeliveryStatus::Landed,
+        PhaseRunStatus::Running,
+        'worktree_cleanup',
+        'landing_worktree_cleanup_required',
     ],
 ]);
 
