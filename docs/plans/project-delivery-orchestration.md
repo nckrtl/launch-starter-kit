@@ -86,8 +86,10 @@ envelope and bind every prompt and repository check to the delivery's immutable
 flow. The discovery workflow now reaches Commander `Completed`. The normal
 `bin/loop ISSUE` entry point still invokes the legacy controller. Commander now
 ships a dedicated, restartable systemd queue-worker unit with timeouts bounded
-below the database queue reservation. Add the reconciliation runtime next, then
-route the entry point through Commander after live shadow parity passes.
+below the database queue reservation. Its systemd timer queues unique scheduled
+reconciliation that wakes the existing advancement path for recoverable
+deliveries on enabled projects. Route the entry point through Commander only
+after live shadow parity passes.
 
 ## Ownership boundaries
 

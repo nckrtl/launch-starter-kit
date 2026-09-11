@@ -24,3 +24,21 @@ it('ships a bounded restartable Commander delivery worker', function (): void {
 
     expect((int) config('queue.connections.database.retry_after'))->toBeGreaterThan(540);
 });
+
+it('ships a persistent one-minute Laravel scheduler timer', function (): void {
+    $service = File::get(base_path('ops/systemd/commander-scheduler.service'));
+    $timer = File::get(base_path('ops/systemd/commander-scheduler.timer'));
+
+    expect($service)
+        ->toContain('Type=oneshot')
+        ->toContain('WorkingDirectory=/fast/apps/commander')
+        ->toContain('ExecStart=/usr/bin/php /fast/apps/commander/artisan schedule:run --no-interaction')
+        ->toContain('TimeoutStartSec=55')
+        ->not->toContain('--force');
+    expect($timer)
+        ->toContain('OnCalendar=*-*-* *:*:00')
+        ->toContain('Persistent=true')
+        ->toContain('AccuracySec=1s')
+        ->toContain('Unit=commander-scheduler.service')
+        ->toContain('WantedBy=timers.target');
+});

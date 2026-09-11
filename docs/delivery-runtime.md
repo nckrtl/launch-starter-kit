@@ -14,8 +14,11 @@ repository:
 
 ```bash
 systemctl --user link /fast/apps/commander/ops/systemd/commander-delivery-worker.service
+systemctl --user link /fast/apps/commander/ops/systemd/commander-scheduler.service
+systemctl --user link /fast/apps/commander/ops/systemd/commander-scheduler.timer
 systemctl --user daemon-reload
 systemctl --user enable --now commander-delivery-worker.service
+systemctl --user enable --now commander-scheduler.timer
 ```
 
 Operate and inspect it with:
@@ -23,12 +26,20 @@ Operate and inspect it with:
 ```bash
 systemctl --user status commander-delivery-worker.service
 systemctl --user reload commander-delivery-worker.service
+systemctl --user status commander-scheduler.timer
 journalctl --user -u commander-delivery-worker.service -n 50 --no-pager
+journalctl --user -u commander-scheduler.service -n 50 --no-pager
 ```
 
 `reload` asks Laravel to restart after its current job, then systemd starts a
 fresh worker. The unit does not use `--force`, so maintenance mode stops it from
 claiming new jobs.
+
+The scheduler timer runs Laravel's scheduler once per minute. It queues one
+short, unique reconciliation job. That job finds recoverable deliveries for
+enabled projects and queues the existing `AdvanceDelivery` path. It skips
+paused projects and terminal, paused, or blocked deliveries. It does not contain
+a second workflow state machine.
 
 This worker does not cut over Orbit's feature loop. Until shadow parity and the
 reconciliation runtime are proven, `/home/nckrtl/orbit/bin/loop` continues to

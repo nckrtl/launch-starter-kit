@@ -1,0 +1,10 @@
+[Unit]
+Description=Commander scheduled task runner
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/fast/apps/commander
+ExecStart=/usr/bin/php /fast/apps/commander/artisan schedule:run --no-interaction
+TimeoutStartSec=55
