@@ -8,6 +8,7 @@ use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
+use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitMergeLineageVerifier;
@@ -49,6 +50,7 @@ use App\Delivery\Enums\MaintenanceRunStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
+use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitLandingAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPullRequestLandingFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
@@ -533,6 +535,62 @@ final class LandingIssues implements OrbitActiveIssueProvider
     }
 }
 
+final class LandingIssueCompletion implements OrbitIssueCompletionTransitioner
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public int $failures = 0;
+
+    public int $mutationCalls = 0;
+
+    public bool $completed = false;
+
+    public function transitionToDone(
+        string $issueId,
+        string $issueKey,
+        string $expectedContractHash,
+    ): OrbitIssueSnapshot {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($issueId)->toBe('11111111-2222-4333-8444-555555555555')
+            ->and($issueKey)->toBe('ORB-234')
+            ->and($expectedContractHash)->toBe(str_repeat('d', 64))
+            ->and(test()->repository->reservationIsHeld())->toBeTrue()
+            ->and(test()->worktreeCleaner->calls)->toBeGreaterThanOrEqual(1);
+        $this->calls++;
+
+        if (! $this->completed) {
+            $this->mutationCalls++;
+            $this->completed = true;
+
+            if ($this->failures > 0) {
+                $this->failures--;
+
+                throw new OrbitIssueTransitionFailed('The Linear completion response is unresolved.', ambiguous: true);
+            }
+        }
+
+        return new OrbitIssueSnapshot(
+            $issueId,
+            $issueKey,
+            [
+                'id' => $issueId,
+                'identifier' => $issueKey,
+                'updatedAt' => '2026-09-11T17:00:00.000Z',
+                'state' => [
+                    'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+                    'name' => 'Done',
+                    'type' => 'completed',
+                ],
+                'assignee' => null,
+                'delegate' => null,
+            ],
+            $expectedContractHash,
+        );
+    }
+}
+
 final class LandingMain implements OrbitMainCorrectnessInspector
 {
     public int $transactionLevel = 0;
@@ -1002,6 +1060,7 @@ beforeEach(function () {
     $this->repository = new LandingRepository;
     $this->implementations = new LandingImplementationRepository;
     $this->issues = new LandingIssues;
+    $this->issueCompletion = new LandingIssueCompletion;
     $this->main = new LandingMain;
     $this->gateway = new LandingGateway;
     $this->merges = new LandingMergeLineageVerifier;
@@ -1013,6 +1072,7 @@ beforeEach(function () {
     $this->repository->transactionLevel = $transactionLevel;
     $this->implementations->transactionLevel = $transactionLevel;
     $this->issues->transactionLevel = $transactionLevel;
+    $this->issueCompletion->transactionLevel = $transactionLevel;
     $this->main->transactionLevel = $transactionLevel;
     $this->gateway->transactionLevel = $transactionLevel;
     $this->merges->transactionLevel = $transactionLevel;
@@ -1022,6 +1082,7 @@ beforeEach(function () {
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitImplementationRepository::class, $this->implementations);
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
+    app()->instance(OrbitIssueCompletionTransitioner::class, $this->issueCompletion);
     app()->instance(OrbitMainCorrectnessInspector::class, $this->main);
     app()->instance(OrbitPullRequestLandingGateway::class, $this->gateway);
     app()->instance(OrbitMergeLineageVerifier::class, $this->merges);
@@ -1377,6 +1438,21 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
             'proof_attempt_id' => null,
             'evidence_archives' => [],
         ])
+        ->and($landing->output['linear_closeout'])->toBe([
+            'schema' => 1,
+            'provider' => 'linear',
+            'issue_id' => '11111111-2222-4333-8444-555555555555',
+            'issue_key' => 'ORB-234',
+            'contract_sha256' => str_repeat('d', 64),
+            'state' => [
+                'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+                'name' => 'Done',
+                'type' => 'completed',
+            ],
+            'assignee' => null,
+            'delegate' => null,
+            'updated_at' => '2026-09-11T17:00:00.000Z',
+        ])
         ->and($this->repository->reservationIsHeld())->toBeFalse()
         ->and($this->implementations->calls)->toBe(1)
         ->and($this->issues->calls)->toBe(1)
@@ -1390,6 +1466,7 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->proofTopologies->calls)->toBe(0)
         ->and($this->worktreeCleaner->prepareCalls)->toBe(1)
         ->and($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->issueCompletion->calls)->toBe(1)
         ->and($this->worktreeCleaner->resumes)->toBe([false])
         ->and($this->herdrWorkspace->closeCalls)->toBe(1);
 
@@ -1415,6 +1492,7 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->merges->calls)->toBe(1)
         ->and($this->primaryCheckout->calls)->toBe(1)
         ->and($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->issueCompletion->calls)->toBe(1)
         ->and(MaintenanceRun::count())->toBe(1);
     Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 });
@@ -1630,6 +1708,38 @@ it('does not release the merge reservation without cleanup evidence matching its
         ->and($this->landing->fresh()->output)->toHaveKey('worktree_cleanup_intent')
         ->and($this->landing->fresh()->output)->not->toHaveKey('worktree_cleanup')
         ->and($this->gateway->releaseCalls)->toBe(0);
+});
+
+it('retains cleanup evidence and the merge reservation while Linear closeout retries', function () {
+    $this->issueCompletion->failures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitIssueTransitionFailed::class, 'completion response is unresolved');
+
+    $landing = $this->landing->fresh();
+    expect($landing->current_block)->toBe('linear_closeout')
+        ->and($landing->output)->toHaveKey('worktree_cleanup')
+        ->and($landing->output)->not->toHaveKey('linear_closeout')
+        ->and($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1)
+        ->and($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->issueCompletion->calls)->toBe(1)
+        ->and($this->issueCompletion->mutationCalls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(0);
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1)
+        ->and($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->issueCompletion->calls)->toBe(2)
+        ->and($this->issueCompletion->mutationCalls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(1);
 });
 
 it('runs queued main cache maintenance while proof closeout is waiting', function () {
@@ -1851,6 +1961,25 @@ it('preserves a landed merge while reservation release is retried', function () 
     Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 });
 
+it('rejects tampered Linear closeout evidence before releasing the reservation', function () {
+    $this->gateway->releaseFailures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitPullRequestLandingFailed::class, 'release is unresolved');
+
+    $landing = $this->landing->fresh();
+    $output = $landing->output;
+    $output['linear_closeout']['state']['type'] = 'started';
+    $landing->output = $output;
+    $landing->save();
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'landing intent is inconsistent');
+    expect($this->gateway->releaseCalls)->toBe(1)
+        ->and($this->landing->fresh()->current_block)->toBe('reservation_release');
+});
+
 it('rejects issue and configuration drift before merge', function (string $drift) {
     if ($drift === 'issue') {
         $this->issues->state = 'In Progress';
@@ -1937,6 +2066,7 @@ it('queues incomplete landing recovery states', function (DeliveryStatus $status
     'workspace shutdown' => [DeliveryStatus::Landed, 'workspace_shutdown'],
     'proof closeout' => [DeliveryStatus::Landed, 'proof_closeout'],
     'worktree cleanup' => [DeliveryStatus::Landed, 'worktree_cleanup'],
+    'Linear closeout' => [DeliveryStatus::Landed, 'linear_closeout'],
     'reservation release' => [DeliveryStatus::Landed, 'reservation_release'],
 ]);
 
@@ -2033,6 +2163,12 @@ it('guards exhausted landing jobs and preserves recoverable external states', fu
         PhaseRunStatus::Running,
         'worktree_cleanup',
         'landing_worktree_cleanup_required',
+    ],
+    'post-merge Linear closeout' => [
+        DeliveryStatus::Landed,
+        PhaseRunStatus::Running,
+        'linear_closeout',
+        'landing_linear_closeout_required',
     ],
 ]);
 

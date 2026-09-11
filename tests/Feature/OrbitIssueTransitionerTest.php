@@ -1,6 +1,8 @@
 <?php
 
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
+use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
+use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
@@ -9,7 +11,7 @@ use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use Illuminate\Support\Facades\Process;
 
-final class TransitionReadBackIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
+final class TransitionReadBackIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitIssueProvider
 {
     /** @var list<array{issue_id: string, issue_key: string}> */
     public array $requests = [];
@@ -30,6 +32,11 @@ final class TransitionReadBackIssueProvider implements OrbitActiveIssueProvider,
     }
 
     public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        return $this->fetch($issueId, $issueKey);
+    }
+
+    public function fetchForCloseout(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         return $this->fetch($issueId, $issueKey);
     }
@@ -79,6 +86,11 @@ function transitionSnapshot(string $state = 'Todo', ?string $contractHash = null
                 'name' => 'In Review',
                 'type' => 'started',
             ],
+            'Done' => [
+                'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+                'name' => 'Done',
+                'type' => 'completed',
+            ],
             default => [
                 'id' => '55555555-6666-4777-8888-999999999999',
                 'name' => 'Todo',
@@ -93,6 +105,7 @@ function transitionSnapshot(string $state = 'Todo', ?string $contractHash = null
                 ['id' => '55555555-6666-4777-8888-999999999999', 'name' => 'Todo'],
                 ['id' => '44444444-5555-4666-8777-888888888888', 'name' => 'In Progress'],
                 ['id' => '66666666-7777-4888-8999-aaaaaaaaaaaa', 'name' => 'In Review'],
+                ['id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb', 'name' => 'Done'],
             ]],
         ],
         'labels' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
@@ -115,9 +128,262 @@ function bindTransitionReadBack(OrbitIssueSnapshot $snapshot): TransitionReadBac
     $provider = new TransitionReadBackIssueProvider($snapshot);
     app()->instance(OrbitIssueProvider::class, $provider);
     app()->instance(OrbitActiveIssueProvider::class, $provider);
+    app()->instance(OrbitCloseoutIssueProvider::class, $provider);
 
     return $provider;
 }
+
+/** @param array<string, mixed> $overrides */
+function completedTransitionSnapshot(?string $contractHash = null, array $overrides = []): OrbitIssueSnapshot
+{
+    return transitionSnapshot('Done', $contractHash, [
+        'assignee' => null,
+        'delegate' => null,
+        ...$overrides,
+    ]);
+}
+
+it('moves an In Review issue to Done and clears both owners', function () {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review'));
+    $completed = completedTransitionSnapshot();
+    Process::fake(function () use ($provider, $completed) {
+        $provider->snapshot = $completed;
+
+        return Process::result(output: '{"data":{"issueUpdate":{"success":true}}}');
+    })->preventStrayProcesses();
+
+    $result = app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+        transitionIssueId(),
+        'ORB-234',
+        $this->contractHash,
+    );
+
+    expect($result)->toBe($completed)
+        ->and($provider->requests)->toHaveCount(2);
+
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input) && ($input['variables'] ?? null) === [
+            'id' => transitionIssueId(),
+            'input' => [
+                'stateId' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+                'assigneeId' => null,
+                'delegateId' => null,
+            ],
+        ];
+    });
+});
+
+it('does not mutate an issue already in the exact Done state with cleared ownership', function () {
+    $completed = completedTransitionSnapshot();
+    $provider = bindTransitionReadBack($completed);
+    Process::fake()->preventStrayProcesses();
+
+    $result = app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+        transitionIssueId(),
+        'ORB-234',
+        $this->contractHash,
+    );
+
+    expect($result)->toBe($completed)
+        ->and($provider->requests)->toHaveCount(1);
+    Process::assertNothingRan();
+});
+
+it('reconciles a lost Done mutation response through exact completed read-back', function () {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review'));
+    $completed = completedTransitionSnapshot();
+    Process::fake(function () use ($provider, $completed) {
+        $provider->snapshot = $completed;
+
+        throw new RuntimeException('SSH response lost');
+    })->preventStrayProcesses();
+
+    $result = app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+        transitionIssueId(),
+        'ORB-234',
+        $this->contractHash,
+    );
+
+    expect($result)->toBe($completed)
+        ->and($provider->requests)->toHaveCount(2);
+});
+
+it('repairs known partial Done ownership without changing the target state', function () {
+    $provider = bindTransitionReadBack(completedTransitionSnapshot(overrides: [
+        'delegate' => ['id' => transitionViewerId()],
+        'assignee' => ['id' => transitionNickId()],
+    ]));
+    $completed = completedTransitionSnapshot();
+    Process::fake(function () use ($provider, $completed) {
+        $provider->snapshot = $completed;
+
+        return Process::result(output: '{"data":{"issueUpdate":{"success":true}}}');
+    })->preventStrayProcesses();
+
+    app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+        transitionIssueId(),
+        'ORB-234',
+        $this->contractHash,
+    );
+
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return ($input['variables']['input'] ?? null) === [
+            'stateId' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'assigneeId' => null,
+            'delegateId' => null,
+        ];
+    });
+});
+
+it('requires exactly one valid Done team state before closing the issue', function (array $states) {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review', overrides: ['team' => [
+        'id' => '33333333-4444-4555-8666-777777777777',
+        'states' => ['nodes' => $states],
+    ]]));
+    Process::fake()->preventStrayProcesses();
+
+    expect(fn () => app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+        transitionIssueId(),
+        'ORB-234',
+        $this->contractHash,
+    ))->toThrow(OrbitIssueTransitionFailed::class, 'exactly one valid Done state');
+
+    expect($provider->requests)->toHaveCount(1);
+    Process::assertNothingRan();
+})->with([
+    'missing' => [[['id' => '66666666-7777-4888-8999-aaaaaaaaaaaa', 'name' => 'In Review']]],
+    'duplicate' => [[
+        ['id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb', 'name' => 'Done'],
+        ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', 'name' => 'Done'],
+    ]],
+    'invalid UUID' => [[['id' => 'not-a-uuid', 'name' => 'Done']]],
+]);
+
+it('refuses completion identity, contract, state, or ownership drift before mutation', function (string $case) {
+    $current = match ($case) {
+        'identity' => new OrbitIssueSnapshot(
+            'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+            'ORB-235',
+            transitionSnapshot('In Review')->payload,
+            $this->contractHash,
+        ),
+        'contract' => transitionSnapshot('In Review', str_repeat('b', 64)),
+        'state' => transitionSnapshot('In Progress'),
+        'delegate' => transitionSnapshot('In Review', overrides: [
+            'delegate' => ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+        ]),
+        'assignee' => transitionSnapshot('In Review', overrides: [
+            'assignee' => ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+        ]),
+    };
+    $provider = bindTransitionReadBack($current);
+    Process::fake()->preventStrayProcesses();
+
+    expect(fn () => app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+        transitionIssueId(),
+        'ORB-234',
+        $this->contractHash,
+    ))->toThrow(OrbitIssueTransitionFailed::class, 'completion input or Hermes configuration is invalid');
+
+    expect($provider->requests)->toHaveCount(1);
+    Process::assertNothingRan();
+})->with(['identity', 'contract', 'state', 'delegate', 'assignee']);
+
+it('reports a failed initial closeout read as non-ambiguous', function () {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review'));
+    $provider->failure = new OrbitIssueProviderFailed('Linear unavailable');
+    Process::fake()->preventStrayProcesses();
+
+    try {
+        app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+            transitionIssueId(),
+            'ORB-234',
+            $this->contractHash,
+        );
+        test()->fail('The completion should require its initial Linear read.');
+    } catch (OrbitIssueTransitionFailed $exception) {
+        expect($exception->getMessage())->toContain('before its Linear closeout')
+            ->and($exception->ambiguous)->toBeFalse()
+            ->and($exception->getPrevious())->toBe($provider->failure);
+    }
+
+    Process::assertNothingRan();
+});
+
+it('reports a failed completion read-back as ambiguous without repeating the mutation', function () {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review'));
+    $readBackFailure = new OrbitIssueProviderFailed('Linear read-back unavailable');
+    Process::fake(function () use ($provider, $readBackFailure) {
+        $provider->failure = $readBackFailure;
+
+        return Process::result(output: '{"data":{"issueUpdate":{"success":true}}}');
+    })->preventStrayProcesses();
+
+    try {
+        app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+            transitionIssueId(),
+            'ORB-234',
+            $this->contractHash,
+        );
+        test()->fail('The completion should require an authoritative read-back.');
+    } catch (OrbitIssueTransitionFailed $exception) {
+        expect($exception->getMessage())->toContain('could not be verified')
+            ->and($exception->ambiguous)->toBeTrue()
+            ->and($exception->getPrevious())->toBe($readBackFailure);
+    }
+
+    Process::assertRanTimes(fn () => true, 1);
+    expect($provider->requests)->toHaveCount(2);
+});
+
+it('rejects an invalid Done read-back as ambiguous', function (string $case) {
+    $provider = bindTransitionReadBack(transitionSnapshot('In Review'));
+    $readBack = match ($case) {
+        'state id' => completedTransitionSnapshot(overrides: ['state' => [
+            'id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+            'name' => 'Done',
+            'type' => 'completed',
+        ]]),
+        'state name' => completedTransitionSnapshot(overrides: ['state' => [
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Closed',
+            'type' => 'completed',
+        ]]),
+        'state type' => completedTransitionSnapshot(overrides: ['state' => [
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Done',
+            'type' => 'started',
+        ]]),
+        'contract' => completedTransitionSnapshot(str_repeat('b', 64)),
+        'delegate' => completedTransitionSnapshot(overrides: ['delegate' => ['id' => transitionViewerId()]]),
+        'assignee' => completedTransitionSnapshot(overrides: ['assignee' => ['id' => transitionNickId()]]),
+    };
+    Process::fake(function () use ($provider, $readBack) {
+        $provider->snapshot = $readBack;
+
+        return Process::result(output: '{"data":{"issueUpdate":{"success":true}}}');
+    })->preventStrayProcesses();
+
+    try {
+        app(OrbitIssueCompletionTransitioner::class)->transitionToDone(
+            transitionIssueId(),
+            'ORB-234',
+            $this->contractHash,
+        );
+        test()->fail('The completion should not pass an invalid Linear read-back.');
+    } catch (OrbitIssueTransitionFailed $exception) {
+        expect($exception->getMessage())->toContain('did not confirm')
+            ->and($exception->ambiguous)->toBeTrue();
+    }
+})->with(['state id', 'state name', 'state type', 'contract', 'delegate', 'assignee']);
 
 it('moves an active issue to In Review and clears the temporary Nick assignment', function () {
     $current = transitionSnapshot('In Progress', overrides: [

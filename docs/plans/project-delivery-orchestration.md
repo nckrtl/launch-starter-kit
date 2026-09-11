@@ -66,14 +66,21 @@ protected baselines. Commander verifies the local and remote immutable artifact
 ref and, for proof deliveries, binds the four primary proof archives to the
 retained successful closeout record before and after removal.
 
+Linear closeout is a persistent landing stage after verified worktree cleanup
+and before reservation release. It resolves exactly one `Done` state, atomically
+clears the assignee and delegate, reconciles uncertain mutation responses
+through authoritative read-back, and records the exact completed issue identity,
+contract, state, ownership, and update time in the landing ledger. A retry that
+finds the exact completed issue does not repeat the mutation, and the merge
+reservation remains held until this evidence is retained.
+
 Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
 repository checks still support only discovery. Before proof is enabled, move
 the potentially hour-long topology operation out of the 540-second landing job
 envelope and bind every prompt and repository check to the delivery's immutable
-flow. The remaining discovery landing slices are the Linear `Done` transition
-with ownership clearing and the final Commander `Completed` transition. The normal
-`bin/loop ISSUE` entry point still invokes the legacy controller; route it
-through Commander only after those closeout stages pass.
+flow. The remaining discovery landing slice is the final Commander `Completed`
+transition. The normal `bin/loop ISSUE` entry point still invokes the legacy
+controller; route it through Commander only after that closeout stage passes.
 
 ## Ownership boundaries
 

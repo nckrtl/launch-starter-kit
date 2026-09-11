@@ -5,7 +5,9 @@ namespace App\Providers;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
+use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
+use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
@@ -45,6 +47,8 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitMainCacheRefreshRequester::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitIssueProvider::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitActiveIssueProvider::class, SshOrbitIssueProvider::class);
+        $this->app->bind(OrbitCloseoutIssueProvider::class, SshOrbitIssueProvider::class);
+        $this->app->bind(OrbitIssueCompletionTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitIssueTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitMainCorrectnessInspector::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitMergeLineageVerifier::class, ProcessOrbitRepository::class);

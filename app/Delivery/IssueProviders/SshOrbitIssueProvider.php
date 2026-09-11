@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Delivery\IssueProviders;
 
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
+use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
@@ -12,7 +13,7 @@ use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
+final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitIssueProvider
 {
     private const string QUERY = <<<'GRAPHQL'
 query LoopIssue($id: String!) {
@@ -50,6 +51,18 @@ GRAPHQL;
         }
 
         return $this->snapshots->makeActive($response, $issueId, $issueKey, $viewerId, $assigneeId);
+    }
+
+    public function fetchForCloseout(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        [$response, $viewerId] = $this->request($issueId, $issueKey);
+        $assigneeId = config('commander.hermes.nick_linear_user_id');
+
+        if (! is_string($assigneeId) || ! $this->isUuid($assigneeId)) {
+            throw new OrbitIssueProviderFailed('The Hermes Orbit closeout issue provider is not configured.');
+        }
+
+        return $this->snapshots->makeForCloseout($response, $issueId, $issueKey, $viewerId, $assigneeId);
     }
 
     /** @return array{array<mixed, mixed>, string} */

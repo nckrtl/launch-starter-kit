@@ -7,6 +7,7 @@ namespace App\Delivery\Actions;
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
+use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitMergeLineageVerifier;
 use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
@@ -32,6 +33,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitLandingAdvancementFailed;
+use App\Delivery\Exceptions\OrbitPlanningHandoffFailed;
 use App\Delivery\Exceptions\OrbitPullRequestLandingFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPullRequestReviewReceiptValidator;
@@ -65,6 +67,7 @@ final readonly class AdvanceOrbitLanding
         private QueueOrbitMainCacheRefresh $cacheRefresh,
         private ShutdownOrbitHerdrWorkspace $workspaceShutdown,
         private OrbitWorktreeCleaner $worktreeCleaner,
+        private OrbitIssueCompletionTransitioner $issueCompletion,
     ) {}
 
     /** Return a delay when the same queued job should retry a non-failing wait. */
@@ -342,6 +345,7 @@ final readonly class AdvanceOrbitLanding
                 'workspace_shutdown',
                 'proof_closeout',
                 'worktree_cleanup',
+                'linear_closeout',
                 'reservation_release',
             ], true)
             && $phase->started_at !== null && $phase->finished_at === null;
@@ -437,6 +441,7 @@ final readonly class AdvanceOrbitLanding
         $worktreeCleanupIntent = is_array($output) ? ($output['worktree_cleanup_intent'] ?? null) : null;
         $worktreeCleanupAuthorization = is_array($output) ? ($output['worktree_cleanup_authorization'] ?? null) : null;
         $worktreeCleanup = is_array($output) ? ($output['worktree_cleanup'] ?? null) : null;
+        $linearCloseout = is_array($output) ? ($output['linear_closeout'] ?? null) : null;
         $preMerge = is_array($output) ? $output : null;
         $normalizedReconciliation = $this->associativeArray($reconciliation);
 
@@ -447,6 +452,7 @@ final readonly class AdvanceOrbitLanding
                 'workspace_shutdown',
                 'proof_closeout',
                 'worktree_cleanup',
+                'linear_closeout',
                 'reservation_release',
                 'completed',
             ], true)) {
@@ -462,12 +468,14 @@ final readonly class AdvanceOrbitLanding
             $preMerge['worktree_cleanup_intent'],
             $preMerge['worktree_cleanup_authorization'],
             $preMerge['worktree_cleanup'],
+            $preMerge['linear_closeout'],
         );
 
         $requiresVerification = $stage !== 'merge_verification';
-        $requiresReconciliation = in_array($stage, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'reservation_release', 'completed'], true);
-        $requiresClosedWorkspace = in_array($stage, ['proof_closeout', 'worktree_cleanup', 'reservation_release', 'completed'], true);
-        $requiresProofCloseout = in_array($stage, ['worktree_cleanup', 'reservation_release', 'completed'], true);
+        $requiresReconciliation = in_array($stage, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'linear_closeout', 'reservation_release', 'completed'], true);
+        $requiresClosedWorkspace = in_array($stage, ['proof_closeout', 'worktree_cleanup', 'linear_closeout', 'reservation_release', 'completed'], true);
+        $requiresProofCloseout = in_array($stage, ['worktree_cleanup', 'linear_closeout', 'reservation_release', 'completed'], true);
+        $requiresLinearCloseout = in_array($stage, ['reservation_release', 'completed'], true);
 
         return $this->matchesPreMergeOutput($delivery, $preMerge, $published)
             && $merge === [
@@ -510,7 +518,10 @@ final readonly class AdvanceOrbitLanding
                 $stage,
                 $implementationFlow,
                 $artifactSha,
-            );
+            )
+            && ($requiresLinearCloseout
+                ? $this->matchesLinearCloseout($delivery, $linearCloseout)
+                : $linearCloseout === null);
     }
 
     /** @param array<string, mixed> $merge */
@@ -646,7 +657,7 @@ final readonly class AdvanceOrbitLanding
         string $implementationFlow,
         mixed $artifactSha,
     ): bool {
-        if (! in_array($stage, ['worktree_cleanup', 'reservation_release', 'completed'], true)) {
+        if (! in_array($stage, ['worktree_cleanup', 'linear_closeout', 'reservation_release', 'completed'], true)) {
             return $intent === null && $authorization === null && $cleanup === null;
         }
 
@@ -781,6 +792,45 @@ final readonly class AdvanceOrbitLanding
             && $removed->cleanupAttemptId === $intent['attempt_id']
             && $removed->proofAttemptId === $intent['proof_attempt_id']
             && $removed->evidenceArchives === $prepared->evidenceArchives;
+    }
+
+    private function matchesLinearCloseout(Delivery $delivery, mixed $closeout): bool
+    {
+        try {
+            $expected = $this->preparations->startup($delivery)->snapshot;
+        } catch (OrbitPlanningHandoffFailed) {
+            return false;
+        }
+
+        $state = is_array($closeout) ? ($closeout['state'] ?? null) : null;
+
+        return is_array($closeout) && ! array_is_list($closeout)
+            && array_keys($closeout) === [
+                'schema',
+                'provider',
+                'issue_id',
+                'issue_key',
+                'contract_sha256',
+                'state',
+                'assignee',
+                'delegate',
+                'updated_at',
+            ]
+            && ($closeout['schema'] ?? null) === 1
+            && ($closeout['provider'] ?? null) === OrbitIssueSnapshot::PROVIDER
+            && ($closeout['issue_id'] ?? null) === $expected->issueId
+            && ($closeout['issue_key'] ?? null) === $expected->issueKey
+            && ($closeout['contract_sha256'] ?? null) === $expected->contractHash
+            && is_array($state) && ! array_is_list($state)
+            && array_keys($state) === ['id', 'name', 'type']
+            && is_string($state['id'] ?? null)
+            && preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $state['id']) === 1
+            && ($state['name'] ?? null) === 'Done'
+            && ($state['type'] ?? null) === 'completed'
+            && array_key_exists('assignee', $closeout) && $closeout['assignee'] === null
+            && array_key_exists('delegate', $closeout) && $closeout['delegate'] === null
+            && is_string($closeout['updated_at'] ?? null)
+            && trim($closeout['updated_at']) !== '';
     }
 
     private function verifyImplementation(
@@ -1079,6 +1129,12 @@ final readonly class AdvanceOrbitLanding
             $this->cleanupWorktree($config, $deliveryId, $phaseId);
         }
 
+        $phase = PhaseRun::query()->findOrFail($phaseId);
+
+        if ($phase->current_block === 'linear_closeout') {
+            $this->closeLinearIssue($deliveryId, $phaseId);
+        }
+
         $this->releaseAndFinalize(
             $this->delivery($deliveryId),
             PhaseRun::query()->findOrFail($phaseId),
@@ -1097,6 +1153,7 @@ final readonly class AdvanceOrbitLanding
             'workspace_shutdown',
             'proof_closeout',
             'worktree_cleanup',
+            'linear_closeout',
             'reservation_release',
         ], true)) {
             return;
@@ -1173,7 +1230,7 @@ final readonly class AdvanceOrbitLanding
     ): void {
         $phase = PhaseRun::query()->findOrFail($phaseId);
 
-        if (in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'reservation_release'], true)) {
+        if (in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'linear_closeout', 'reservation_release'], true)) {
             return;
         }
 
@@ -1211,7 +1268,7 @@ final readonly class AdvanceOrbitLanding
                 'origin_main_sha' => $reconciled->originMainSha,
             ];
 
-            if ($phase !== null && in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'reservation_release'], true)
+            if ($phase !== null && in_array($phase->current_block, ['workspace_shutdown', 'proof_closeout', 'worktree_cleanup', 'linear_closeout', 'reservation_release'], true)
                 && is_array($output) && ($output['repository_reconciliation'] ?? null) === $evidence) {
                 return;
             }
@@ -1244,7 +1301,7 @@ final readonly class AdvanceOrbitLanding
             $output = $phase?->output;
             $shutdown = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
 
-            if ($phase !== null && in_array($phase->current_block, ['proof_closeout', 'worktree_cleanup', 'reservation_release'], true)
+            if ($phase !== null && in_array($phase->current_block, ['proof_closeout', 'worktree_cleanup', 'linear_closeout', 'reservation_release'], true)
                 && $this->matchesClosedWorkspace($delivery, $shutdown)) {
                 return;
             }
@@ -1801,7 +1858,7 @@ final readonly class AdvanceOrbitLanding
             $artifactSha = $implementation?->payload['artifact_sha'] ?? null;
             $evidence = $removed->toArray();
 
-            if ($phase !== null && $phase->current_block === 'reservation_release'
+            if ($phase !== null && in_array($phase->current_block, ['linear_closeout', 'reservation_release'], true)
                 && is_array($output) && ($output['worktree_cleanup'] ?? null) === $evidence) {
                 return;
             }
@@ -1818,7 +1875,7 @@ final readonly class AdvanceOrbitLanding
                     $intent,
                     $authorization,
                     $evidence,
-                    'reservation_release',
+                    'linear_closeout',
                     $flow,
                     $artifactSha,
                 )
@@ -1828,8 +1885,81 @@ final readonly class AdvanceOrbitLanding
                 );
             }
 
-            $phase->current_block = 'reservation_release';
+            $phase->current_block = 'linear_closeout';
             $phase->output = [...$output, 'worktree_cleanup' => $evidence];
+            $phase->save();
+            $delivery->failure_details = null;
+            $delivery->save();
+        });
+    }
+
+    private function closeLinearIssue(int $deliveryId, int $phaseId): void
+    {
+        $delivery = $this->delivery($deliveryId);
+        $intent = $this->landingIntent($delivery, $phaseId);
+        $phase = $intent[0] ?? null;
+        $expected = $this->preparations->startup($delivery)->snapshot;
+
+        if ($phase === null || $phase->current_block !== 'linear_closeout') {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit issue cannot be completed from its retained landing ledger.',
+            );
+        }
+
+        $completed = $this->issueCompletion->transitionToDone(
+            $expected->issueId,
+            $expected->issueKey,
+            $expected->contractHash,
+        );
+        $state = $completed->payload['state'] ?? null;
+
+        if (! is_array($state)
+            || ! array_key_exists('assignee', $completed->payload)
+            || ! array_key_exists('delegate', $completed->payload)) {
+            throw new OrbitLandingAdvancementFailed(
+                'The completed Orbit issue returned incomplete Linear evidence.',
+            );
+        }
+
+        $evidence = [
+            'schema' => 1,
+            'provider' => OrbitIssueSnapshot::PROVIDER,
+            'issue_id' => $completed->issueId,
+            'issue_key' => $completed->issueKey,
+            'contract_sha256' => $completed->contractHash,
+            'state' => $state,
+            'assignee' => $completed->payload['assignee'],
+            'delegate' => $completed->payload['delegate'],
+            'updated_at' => $completed->payload['updatedAt'] ?? null,
+        ];
+
+        $this->recordLinearCloseout($deliveryId, $phaseId, $evidence);
+    }
+
+    /** @param array<string, mixed> $evidence */
+    private function recordLinearCloseout(int $deliveryId, int $phaseId, array $evidence): void
+    {
+        DB::transaction(function () use ($deliveryId, $phaseId, $evidence): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $intent = $this->landingIntent($delivery, $phaseId);
+            $phase = $intent[0] ?? null;
+            $output = $phase?->output;
+
+            if ($phase !== null && $phase->current_block === 'reservation_release'
+                && is_array($output) && ($output['linear_closeout'] ?? null) === $evidence) {
+                return;
+            }
+
+            if ($phase === null || $phase->current_block !== 'linear_closeout'
+                || ! is_array($output) || array_key_exists('linear_closeout', $output)
+                || ! $this->matchesLinearCloseout($delivery, $evidence)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The completed Orbit issue no longer matches its landing ledger.',
+                );
+            }
+
+            $phase->current_block = 'reservation_release';
+            $phase->output = [...$output, 'linear_closeout' => $evidence];
             $phase->save();
             $delivery->failure_details = null;
             $delivery->save();

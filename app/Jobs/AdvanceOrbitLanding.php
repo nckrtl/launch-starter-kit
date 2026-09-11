@@ -114,6 +114,7 @@ final class AdvanceOrbitLanding implements ShouldQueue, ShouldQueueAfterCommit
                     'workspace_shutdown' => 'landing_workspace_shutdown_required',
                     'proof_closeout' => 'landing_proof_closeout_required',
                     'worktree_cleanup' => 'landing_worktree_cleanup_required',
+                    'linear_closeout' => 'landing_linear_closeout_required',
                     default => 'landing_reservation_release_required',
                 };
                 $delivery->failure_details = [
@@ -157,6 +158,7 @@ final class AdvanceOrbitLanding implements ShouldQueue, ShouldQueueAfterCommit
                 'workspace_shutdown',
                 'proof_closeout',
                 'worktree_cleanup',
+                'linear_closeout',
                 'reservation_release',
             ], true)
             && $phase->finished_at === null;

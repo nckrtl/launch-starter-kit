@@ -92,6 +92,7 @@ final readonly class QueueOrbitMainCacheRefresh
                     'workspace_shutdown',
                     'proof_closeout',
                     'worktree_cleanup',
+                    'linear_closeout',
                     'reservation_release',
                 ], true))
             || ($phase->status === PhaseRunStatus::Completed

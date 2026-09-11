@@ -1,6 +1,7 @@
 <?php
 
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
+use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
@@ -268,6 +269,83 @@ it('keeps new-delivery issue reads restricted while active reads reject unexpect
     expect(fn () => app(OrbitActiveIssueProvider::class)->fetchActive(providerIssueId(), 'ORB-234'))
         ->toThrow(OrbitIssueProviderFailed::class, 'active Orbit issue');
 });
+
+it('reads only known In Review or Done ownership through the closeout boundary', function (array $overrides) {
+    fakeProviderResponse(providerResponse($overrides));
+
+    $snapshot = app(OrbitCloseoutIssueProvider::class)->fetchForCloseout(providerIssueId(), 'ORB-234');
+
+    expect($snapshot->payload['state']['name'])->toBeIn(['In Review', 'Done']);
+})->with([
+    'active landing ownership' => [[
+        'state' => [
+            'id' => '66666666-7777-4888-8999-aaaaaaaaaaaa',
+            'name' => 'In Review',
+            'type' => 'started',
+        ],
+    ]],
+    'completed and cleared' => [[
+        'state' => [
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Done',
+            'type' => 'completed',
+        ],
+        'delegate' => null,
+    ]],
+    'known partial completion ownership' => [[
+        'state' => [
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Done',
+            'type' => 'completed',
+        ],
+        'assignee' => ['id' => '691cb14c-60d5-415a-a5c7-a7c19fe83424'],
+    ]],
+]);
+
+it('does not broaden new-delivery reads to completed issues', function () {
+    fakeProviderResponse(providerResponse([
+        'state' => [
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Done',
+            'type' => 'completed',
+        ],
+        'delegate' => null,
+    ]));
+
+    expect(fn () => app(SshOrbitIssueProvider::class)->fetch(providerIssueId(), 'ORB-234'))
+        ->toThrow(OrbitIssueProviderFailed::class, 'not eligible');
+});
+
+it('rejects unexpected closeout state or ownership', function (array $overrides) {
+    fakeProviderResponse(providerResponse($overrides));
+
+    expect(fn () => app(OrbitCloseoutIssueProvider::class)->fetchForCloseout(providerIssueId(), 'ORB-234'))
+        ->toThrow(OrbitIssueProviderFailed::class, 'closeout issue');
+})->with([
+    'wrong state' => [[
+        'state' => [
+            'id' => '44444444-5555-4666-8777-888888888888',
+            'name' => 'In Progress',
+            'type' => 'started',
+        ],
+    ]],
+    'unexpected delegate' => [[
+        'state' => [
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Done',
+            'type' => 'completed',
+        ],
+        'delegate' => ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ]],
+    'unexpected assignee' => [[
+        'state' => [
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Done',
+            'type' => 'completed',
+        ],
+        'assignee' => ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ]],
+]);
 
 it('rejects a readiness hold', function () {
     fakeProviderResponse(providerResponse(['description' => "## Outcome\n\nNo.\n\n## Readiness\n\nDecision needed."]));

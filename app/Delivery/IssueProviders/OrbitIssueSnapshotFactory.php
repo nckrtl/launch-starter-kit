@@ -62,6 +62,24 @@ final readonly class OrbitIssueSnapshotFactory
             $expectedIssueKey,
             $expectedViewerId,
             $expectedAssigneeId,
+            false,
+        );
+    }
+
+    public function makeForCloseout(
+        mixed $response,
+        string $expectedIssueId,
+        string $expectedIssueKey,
+        string $expectedViewerId,
+        string $expectedAssigneeId,
+    ): OrbitIssueSnapshot {
+        return $this->makeSnapshot(
+            $response,
+            $expectedIssueId,
+            $expectedIssueKey,
+            $expectedViewerId,
+            $expectedAssigneeId,
+            true,
         );
     }
 
@@ -71,6 +89,7 @@ final readonly class OrbitIssueSnapshotFactory
         string $expectedIssueKey,
         string $expectedViewerId,
         ?string $expectedAssigneeId,
+        bool $closeout = false,
     ): OrbitIssueSnapshot {
         $root = $this->map($response);
         $data = $this->map($root['data'] ?? null);
@@ -89,16 +108,28 @@ final readonly class OrbitIssueSnapshotFactory
             throw new OrbitIssueProviderFailed('The Linear issue response does not match the requested Orbit issue.');
         }
 
-        $active = $expectedAssigneeId !== null;
+        $active = $expectedAssigneeId !== null && ! $closeout;
         $validAssignee = $issue['assignee'] === null
-            || ($active && $issue['assignee']['id'] === $expectedAssigneeId);
-        $validState = $active
-            ? in_array($issue['state']['name'], ['In Progress', 'In Review'], true)
-                && $issue['state']['type'] === 'started'
-            : in_array($issue['state']['name'], ['Todo', 'In Progress'], true);
+            || ($expectedAssigneeId !== null && $issue['assignee']['id'] === $expectedAssigneeId);
+        $validState = match (true) {
+            $closeout => ($issue['state']['name'] === 'In Review'
+                    && $issue['state']['type'] === 'started'
+                    && $issue['assignee'] === null
+                    && ($issue['delegate']['id'] ?? null) === $expectedViewerId)
+                || ($issue['state']['name'] === 'Done'
+                    && $issue['state']['type'] === 'completed'
+                    && $validAssignee
+                    && in_array($issue['delegate']['id'] ?? null, [null, $expectedViewerId], true)),
+            $active => in_array($issue['state']['name'], ['In Progress', 'In Review'], true)
+                && $issue['state']['type'] === 'started',
+            default => in_array($issue['state']['name'], ['Todo', 'In Progress'], true),
+        };
+        $validDelegate = $closeout
+            ? $validState
+            : ($issue['delegate']['id'] ?? null) === $expectedViewerId;
 
         if (! $validAssignee
-            || ($issue['delegate']['id'] ?? null) !== $expectedViewerId
+            || ! $validDelegate
             || ! $validState
             || ($issue['description'] !== null && str_contains($issue['description'], '## Readiness'))
             || $issue['children']['nodes'] !== []
@@ -108,9 +139,11 @@ final readonly class OrbitIssueSnapshotFactory
             || $issue['inverseRelations']['pageInfo']['hasNextPage']
             || $this->hasUnfinishedBlocker($issue['inverseRelations']['nodes'])) {
             throw new OrbitIssueProviderFailed(
-                $active
-                    ? 'The active Orbit issue must remain delegated to Tom in In Progress or In Review with no unexpected assignee or contract hold.'
-                    : 'The Orbit issue is not eligible: it must be solely delegated to Tom and be in Todo or In Progress without readiness, children, or unfinished blockers.',
+                match (true) {
+                    $closeout => 'The Orbit closeout issue must be either solely delegated to Tom in In Review or in Done with no unexpected owner or contract hold.',
+                    $active => 'The active Orbit issue must remain delegated to Tom in In Progress or In Review with no unexpected assignee or contract hold.',
+                    default => 'The Orbit issue is not eligible: it must be solely delegated to Tom and be in Todo or In Progress without readiness, children, or unfinished blockers.',
+                },
             );
         }
 
