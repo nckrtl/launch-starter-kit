@@ -14,5 +14,7 @@ final readonly class HerdrAgentIdentifiers
         public ?string $agentId,
         public string $agentName,
         public ?int $stateChangeSeq = null,
+        public ?string $workingDirectory = null,
+        public ?string $agentStatus = null,
     ) {}
 }

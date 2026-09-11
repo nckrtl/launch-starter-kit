@@ -11,7 +11,7 @@ beforeEach(function () {
     $pane = [
         'workspace_id' => 'w1', 'tab_id' => 't1', 'pane_id' => 'p1', 'terminal_id' => 'term1',
         'agent' => 'codex', 'name' => 'commander-1', 'agent_status' => 'working',
-        'focused' => false, 'revision' => 2, 'state_change_seq' => 3,
+        'cwd' => '/tmp/worktree', 'focused' => false, 'revision' => 2, 'state_change_seq' => 3,
     ];
     $this->server = FakeHerdrServer::start([
         'agents' => [], 'workspaces' => [], 'events' => [],
@@ -36,12 +36,19 @@ afterEach(function () {
 
 it('maps protocol 22 orchestration responses and sends exact methods', function () {
     $runtime = new SocketHerdrRuntime(new SocketClient($this->server->socketPath));
+    $opened = $runtime->openWorktree('/tmp/repository', '/tmp/worktree');
+    $pane = $runtime->splitPane('p1', '/tmp/worktree');
+    $started = $runtime->startAgent('p1', 'commander-1');
+    $prompted = $runtime->promptAgent('commander-1', 'safe prompt');
+    $agent = $runtime->getAgent('commander-1');
 
-    expect($runtime->openWorktree('/tmp/repository', '/tmp/worktree')->paneId)->toBe('p1')
-        ->and($runtime->splitPane('p1', '/tmp/worktree')->terminalId)->toBe('term1')
-        ->and($runtime->startAgent('p1', 'commander-1')->stateChangeSeq)->toBe(3)
-        ->and($runtime->promptAgent('commander-1', 'safe prompt')->agentName)->toBe('commander-1')
-        ->and($runtime->getAgent('commander-1')->paneId)->toBe('p1')
+    expect($opened->paneId)->toBe('p1')
+        ->and($pane->terminalId)->toBe('term1')
+        ->and($started->stateChangeSeq)->toBe(3)
+        ->and($prompted->agentName)->toBe('commander-1')
+        ->and($agent->paneId)->toBe('p1')
+        ->and($agent->workingDirectory)->toBe('/tmp/worktree')
+        ->and($agent->agentStatus)->toBe('working')
         ->and(array_column($this->server->requests(), 'method'))->toBe([
             'worktree.open', 'pane.split', 'agent.start', 'agent.prompt', 'agent.get',
         ])

@@ -81,6 +81,68 @@ receipt ID in your final response and stop.
 PROMPT;
     }
 
+    /** @param array<string, mixed> $reviewReceipt */
+    public function planningCorrectionPrompt(
+        string $issueKey,
+        string $worktree,
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        string $receiptCommand,
+        array $reviewReceipt,
+    ): string {
+        $receipt = json_encode(
+            $reviewReceipt,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+
+        return <<<PROMPT
+Correct every finding from the independent plan review for {$issueKey}. Do not implement the feature.
+
+Issue: {$issueKey}
+Worktree: {$worktree}
+Assigned phase: planning
+Flow: discovery
+Delivery: {$deliveryId}
+Phase run: {$phaseRunId}
+Dispatch: {$dispatchId}
+Current process skill: {$worktree}/.agents/skills/planning-features/SKILL.md
+
+Read that process and the assigned worktree guidance. This is the retained Builder;
+preserve the existing work, dependencies, caches, and verified prior checks. Correct
+the plan and maintained documentation using every finding in this immutable review
+receipt:
+
+```json
+{$receipt}
+```
+
+Complete only the planning correction. You may coordinate bounded native helpers
+within this process, but you must integrate their work and stop them before handoff.
+Do not start another delivery role, change Linear or GitHub, merge, implement product
+code, or invoke the legacy Orbit controller's advance command.
+
+Use Orbit's current `bin/plan-lint` and `bin/loop-artifacts save` commands. The revised
+plan must have `Review verdict: PENDING`. Write your complete correction handoff as a
+regular file inside `.loop/runtime/`.
+
+Before ending, run one receipt command from the assigned worktree root.
+
+Ready:
+`{$receiptCommand} --result=ready --handoff=.loop/runtime/planning-correction-handoff.md --artifact=FULL_SHA`
+
+Blocked:
+`{$receiptCommand} --result=blocked --handoff=.loop/runtime/planning-correction-handoff.md`
+
+For ready, replace `FULL_SHA` with the exact SHA printed by the saved artifact command.
+The receipt command validates and records your result; it does not choose your verdict
+or advance the delivery. Correct a reported structural error before returning. If the
+correction cannot complete, use `blocked` and include its classification, evidence,
+and smallest next action in the handoff. Return the receipt ID in your final response
+and stop.
+PROMPT;
+    }
+
     /** @param array<string, mixed> $planningReceipt */
     public function planReviewPrompt(
         string $issueKey,

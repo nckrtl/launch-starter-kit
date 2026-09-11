@@ -18,6 +18,7 @@ use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
+use App\Jobs\DispatchOrbitPlanningCorrection;
 use App\Jobs\DispatchOrbitPlanReview;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -42,6 +43,19 @@ final readonly class AdvanceDeliveryAction
         if ($delivery->workflow_type === OrbitFeatureWorkflow::TYPE
             && $delivery->workflow_version === OrbitFeatureWorkflow::VERSION) {
             if ($delivery->current_phase === OrbitFeatureWorkflow::INITIAL_PHASE) {
+                $planning = $delivery->phaseRuns()
+                    ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+                    ->latest('attempt')
+                    ->first();
+
+                if ($planning?->attempt === 2) {
+                    if (in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
+                        DispatchOrbitPlanningCorrection::dispatch($deliveryId)->afterCommit();
+                    }
+
+                    return false;
+                }
+
                 if ($delivery->status === DeliveryStatus::Queued) {
                     return false;
                 }

@@ -115,6 +115,8 @@ final readonly class SocketHerdrRuntime implements HerdrRuntime
             agentId: Payload::string($agent['agent'] ?? null),
             agentName: Payload::string($agent['name'] ?? null) ?? $fallbackName,
             stateChangeSeq: is_int($agent['state_change_seq'] ?? null) ? $agent['state_change_seq'] : null,
+            workingDirectory: Payload::string($agent['cwd'] ?? null),
+            agentStatus: Payload::string($agent['agent_status'] ?? null),
         );
     }
 
