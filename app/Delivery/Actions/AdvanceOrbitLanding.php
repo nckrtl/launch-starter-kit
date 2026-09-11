@@ -334,11 +334,12 @@ final readonly class AdvanceOrbitLanding
                 && $this->matchesPreMergeOutput($delivery, $phase->output, $published);
         }
 
-        if ($delivery->status !== DeliveryStatus::Landed) {
+        if (! in_array($delivery->status, [DeliveryStatus::Landed, DeliveryStatus::Completed], true)) {
             return false;
         }
 
-        $activeBlock = $phase->status === PhaseRunStatus::Running
+        $activeBlock = $delivery->status === DeliveryStatus::Landed
+            && $phase->status === PhaseRunStatus::Running
             && in_array($phase->current_block, [
                 'merge_verification',
                 'repository_reconciliation',
@@ -349,9 +350,7 @@ final readonly class AdvanceOrbitLanding
                 'reservation_release',
             ], true)
             && $phase->started_at !== null && $phase->finished_at === null;
-        $completed = $phase->status === PhaseRunStatus::Completed
-            && $phase->current_block === null
-            && $phase->started_at !== null && $phase->finished_at !== null;
+        $completed = $this->matchesCommanderCompletion($delivery, $phase);
         $stage = $completed ? 'completed' : $phase->current_block;
 
         return ($activeBlock || $completed)
@@ -2032,6 +2031,12 @@ final readonly class AdvanceOrbitLanding
             $lockedPhase->current_block = null;
             $lockedPhase->finished_at = now();
             $lockedPhase->save();
+            $locked->status = DeliveryStatus::Completed;
+            $locked->completed_at = $lockedPhase->finished_at;
+            $locked->completion_details = [
+                'schema' => 1,
+                'landing_phase_run_id' => $lockedPhase->id,
+            ];
             $locked->failure_details = null;
             $locked->save();
         });
@@ -2174,13 +2179,26 @@ final readonly class AdvanceOrbitLanding
 
     private function isCompleted(Delivery $delivery, PhaseRun $phase): bool
     {
+        return $this->matchesCommanderCompletion($delivery, $phase);
+    }
+
+    private function matchesCommanderCompletion(Delivery $delivery, PhaseRun $phase): bool
+    {
         return $delivery->current_phase === OrbitFeatureWorkflow::LANDING_PHASE
-            && $delivery->status === DeliveryStatus::Landed
+            && $delivery->status === DeliveryStatus::Completed
             && $phase->delivery_id === $delivery->id
             && $phase->phase_name === OrbitFeatureWorkflow::LANDING_PHASE
             && $phase->attempt === 1 && $phase->status === PhaseRunStatus::Completed
             && $phase->current_block === null && $phase->output !== null
-            && $phase->started_at !== null && $phase->finished_at !== null;
+            && $phase->started_at !== null && $phase->finished_at !== null
+            && $delivery->active_issue_key === null
+            && $delivery->failure_details === null
+            && $delivery->completed_at !== null
+            && $delivery->completed_at->equalTo($phase->finished_at)
+            && $delivery->completion_details === [
+                'schema' => 1,
+                'landing_phase_run_id' => $phase->id,
+            ];
     }
 
     private function publishedReviewId(PhaseRun $phase): int

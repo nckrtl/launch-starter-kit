@@ -59,6 +59,7 @@ use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceOrbitLanding as AdvanceLandingJob;
 use App\Jobs\RunOrbitMainCacheRefresh as RunMainCacheRefreshJob;
 use App\Models\AgentDispatch;
+use App\Models\Delivery;
 use App\Models\MaintenanceRun;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
@@ -1384,7 +1385,14 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
     $delivery = $this->delivery->fresh();
     $landing = $this->landing->fresh();
 
-    expect($delivery->status)->toBe(DeliveryStatus::Landed)
+    expect($delivery->status)->toBe(DeliveryStatus::Completed)
+        ->and($delivery->active_issue_key)->toBeNull()
+        ->and($delivery->completed_at)->not->toBeNull()
+        ->and($delivery->completed_at?->equalTo($landing->finished_at))->toBeTrue()
+        ->and($delivery->completion_details)->toBe([
+            'schema' => 1,
+            'landing_phase_run_id' => $landing->id,
+        ])
         ->and($landing->status)->toBe(PhaseRunStatus::Completed)
         ->and($landing->current_block)->toBeNull()
         ->and($landing->output['main_sha'])->toBe(str_repeat('e', 40))
@@ -1495,6 +1503,69 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->issueCompletion->calls)->toBe(1)
         ->and(MaintenanceRun::count())->toBe(1);
     Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
+
+    expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeFalse();
+    Queue::assertNotPushed(AdvanceLandingJob::class);
+});
+
+it('rejects terminal ledger drift without replaying landing mutations', function (string $drift) {
+    $action = app(AdvanceOrbitLanding::class);
+    $action->handle($this->delivery->id, $this->landing->id);
+
+    if ($drift === 'completion metadata') {
+        $delivery = $this->delivery->fresh();
+        $delivery->completion_details = [
+            'schema' => 2,
+            'landing_phase_run_id' => $this->landing->id,
+        ];
+        $delivery->save();
+    } elseif ($drift === 'failure metadata') {
+        $delivery = $this->delivery->fresh();
+        $delivery->failure_details = ['code' => 'stale_failure'];
+        $delivery->save();
+    } else {
+        DB::table('deliveries')->where('id', $this->delivery->id)->update([
+            'active_issue_key' => str_repeat('a', 64),
+        ]);
+    }
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'landing intent is inconsistent');
+    expect($this->gateway->mergeCalls)->toBe(1)
+        ->and($this->worktreeCleaner->calls)->toBe(1)
+        ->and($this->issueCompletion->calls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(1);
+})->with([
+    'completion metadata',
+    'failure metadata',
+    'active issue key',
+]);
+
+it('rolls back phase completion when delivery completion cannot be stored', function () {
+    $rejectCompletion = true;
+    Delivery::saving(function (Delivery $delivery) use (&$rejectCompletion): void {
+        if ($rejectCompletion && $delivery->status === DeliveryStatus::Completed) {
+            $rejectCompletion = false;
+
+            throw new RuntimeException('completion storage failed');
+        }
+    });
+
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(RuntimeException::class, 'completion storage failed');
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->completed_at)->toBeNull()
+        ->and($this->delivery->fresh()->completion_details)->toBeNull()
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->landing->fresh()->current_block)->toBe('reservation_release')
+        ->and($this->landing->fresh()->finished_at)->toBeNull();
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed)
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->gateway->releaseCalls)->toBe(2);
 });
 
 it('closes a retained proof topology before releasing the merge reservation', function () {
@@ -1790,7 +1861,7 @@ it('lands the exact candidate approved by the second pull request review', funct
     promoteLandingToSecondPullRequestReview($this);
 
     expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))->toBeNull()
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed)
         ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($this->gateway->inspectCalls)->toBe(1)
         ->and($this->gateway->mergeCalls)->toBe(1)
@@ -1858,7 +1929,7 @@ it('retains and resumes an unresolved merge without repeating pre-merge verifica
         ->and($this->gateway->releaseCalls)->toBe(0);
 
     expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed)
         ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($this->implementations->calls)->toBe(1)
         ->and($this->main->calls)->toBe(2)
@@ -2194,7 +2265,7 @@ it('completes the delivery-bound main cache refresh request without changing the
             'message' => 'Main cache refresh queued (pid 123); log: /tmp/refresh.log',
         ])
         ->and($requests->calls)->toBe(1)
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed)
         ->and($this->delivery->fresh()->failure_details)->toBeNull();
 
     $job->handle(app(RunOrbitMainCacheRefresh::class));
@@ -2215,14 +2286,14 @@ it('retries an interrupted main cache refresh request from its durable ledger', 
         ->toThrow(OrbitRepositoryFailed::class, 'not accepted');
     expect($run->fresh()->status)->toBe(MaintenanceRunStatus::Running)
         ->and($run->fresh()->attempt)->toBe(1)
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed);
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed);
 
     $action->handle($run->id);
 
     expect($run->fresh()->status)->toBe(MaintenanceRunStatus::Completed)
         ->and($run->fresh()->attempt)->toBe(2)
         ->and($requests->calls)->toBe(2)
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed);
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed);
 });
 
 it('fails only an exhausted maintenance run and keeps the confirmed merge landed', function () {
@@ -2236,7 +2307,7 @@ it('fails only an exhausted maintenance run and keeps the confirmed merge landed
         ->and($run->fresh()->failure_code)->toBe('orbit_main_cache_refresh_enqueue_failed')
         ->and($run->fresh()->failure_message)->toBe('Maintenance retries exhausted.')
         ->and($run->fresh()->finished_at)->not->toBeNull()
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed)
         ->and($this->delivery->fresh()->failure_details)->toBeNull()
         ->and($job->tries)->toBe(0)
         ->and($job->backoff)->toBe([1, 5, 15, 30])

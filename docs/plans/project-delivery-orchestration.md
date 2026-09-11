@@ -74,13 +74,19 @@ contract, state, ownership, and update time in the landing ledger. A retry that
 finds the exact completed issue does not repeat the mutation, and the merge
 reservation remains held until this evidence is retained.
 
+After reservation release, Commander atomically completes the landing phase and
+delivery, records the landing phase reference in `completion_details`, sets the
+completion time, and clears the delivery's active-issue key. Replays validate
+that exact terminal state and do not repeat landing mutations.
+
 Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
 repository checks still support only discovery. Before proof is enabled, move
 the potentially hour-long topology operation out of the 540-second landing job
 envelope and bind every prompt and repository check to the delivery's immutable
-flow. The remaining discovery landing slice is the final Commander `Completed`
-transition. The normal `bin/loop ISSUE` entry point still invokes the legacy
-controller; route it through Commander only after that closeout stage passes.
+flow. The discovery workflow now reaches Commander `Completed`. The normal
+`bin/loop ISSUE` entry point still invokes the legacy controller. Add the
+dedicated Commander queue worker and reconciliation runtime, then route the
+entry point through Commander after live shadow parity passes.
 
 ## Ownership boundaries
 
