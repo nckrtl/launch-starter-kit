@@ -66,7 +66,11 @@ final class AdvanceOrbitImplementation implements ShouldQueue, ShouldQueueAfterC
 
         if ($mergeabilityPending) {
             $this->release(5);
+
+            return;
         }
+
+        $this->queueContinuation();
     }
 
     public function failed(?Throwable $exception): void
@@ -102,5 +106,24 @@ final class AdvanceOrbitImplementation implements ShouldQueue, ShouldQueueAfterC
             ];
             $delivery->save();
         });
+    }
+
+    private function queueContinuation(): void
+    {
+        $delivery = Delivery::query()->find($this->deliveryId);
+        $latestPhaseId = $delivery?->phaseRuns()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->latest('attempt')
+            ->value('id');
+
+        if ($delivery === null
+            || $delivery->status->isTerminal()
+            || in_array($delivery->status, [DeliveryStatus::Blocked, DeliveryStatus::Paused], true)
+            || ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+                && $latestPhaseId === $this->phaseRunId)) {
+            return;
+        }
+
+        AdvanceDelivery::dispatch($delivery->id)->afterCommit();
     }
 }

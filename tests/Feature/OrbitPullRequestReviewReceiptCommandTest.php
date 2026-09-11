@@ -1113,6 +1113,19 @@ it('bounds review advancement and blocks exhausted publication for reconciliatio
         ]);
 });
 
+it('queues delivery continuation after pull request review routing completes', function () {
+    capturePullRequestReviewForAdvancement($this, 'approved');
+
+    (new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id))
+        ->handle(app(AdvanceOrbitPullRequestReview::class));
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::LANDING_PHASE);
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $job): bool => $job->deliveryId === $this->delivery->id,
+    );
+});
+
 it('fails only the exact active review when advancement retries are exhausted', function () {
     $stale = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id + 1);
     $stale->failed(new RuntimeException('Stale queue failure.'));

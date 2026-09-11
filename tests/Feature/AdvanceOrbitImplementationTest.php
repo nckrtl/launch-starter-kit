@@ -27,6 +27,7 @@ use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitImplementationAdvancementFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitImplementation as AdvanceImplementationJob;
 use App\Jobs\DispatchOrbitImplementation as DispatchImplementationJob;
 use App\Models\AgentDispatch;
@@ -896,6 +897,17 @@ it('bounds the implementation advancement job and preserves blocked recovery', f
         ->and($job->retryUntil() > now())->toBeTrue()
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
         ->and($this->delivery->fresh()->failure_details)->toBe(['code' => 'manual_recovery']);
+});
+
+it('queues delivery continuation after implementation routing completes', function () {
+    (new AdvanceImplementationJob($this->delivery->id, $this->phase->id))
+        ->handle(app(AdvanceOrbitImplementation::class));
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE);
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $job): bool => $job->deliveryId === $this->delivery->id,
+    );
 });
 
 it('fails only an active implementation when advancement retries are exhausted', function () {

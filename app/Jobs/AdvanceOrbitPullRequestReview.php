@@ -67,6 +67,8 @@ final class AdvanceOrbitPullRequestReview implements ShouldQueue, ShouldQueueAft
         } finally {
             $lock->release();
         }
+
+        $this->queueContinuation();
     }
 
     public function failed(?Throwable $exception): void
@@ -119,5 +121,19 @@ final class AdvanceOrbitPullRequestReview implements ShouldQueue, ShouldQueueAft
         }
 
         return false;
+    }
+
+    private function queueContinuation(): void
+    {
+        $delivery = Delivery::query()->find($this->deliveryId);
+
+        if ($delivery === null
+            || $delivery->status->isTerminal()
+            || in_array($delivery->status, [DeliveryStatus::Blocked, DeliveryStatus::Paused], true)
+            || $delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE) {
+            return;
+        }
+
+        AdvanceDelivery::dispatch($delivery->id)->afterCommit();
     }
 }

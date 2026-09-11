@@ -942,6 +942,19 @@ it('uses a bounded review-advancement job and preserves completed routing on fai
         ->and($this->delivery->fresh()->failure_details)->toBeNull();
 });
 
+it('queues delivery continuation after plan review routing completes', function () {
+    capturedPlanReviewResult($this, 'pass');
+
+    (new AdvanceOrbitPlanReviewJob($this->delivery->id))
+        ->handle(app(AdvanceOrbitPlanReview::class));
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE);
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $job): bool => $job->deliveryId === $this->delivery->id,
+    );
+});
+
 it('preserves a blocked review state when review advancement exhausts its retries', function () {
     $job = new AdvanceOrbitPlanReviewJob($this->delivery->id);
     $this->delivery->forceFill([
