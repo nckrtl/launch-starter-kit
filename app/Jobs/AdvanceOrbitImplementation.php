@@ -36,8 +36,10 @@ final class AdvanceOrbitImplementation implements ShouldQueue, ShouldQueueAfterC
 
     private CarbonImmutable $retryDeadline;
 
-    public function __construct(public readonly int $deliveryId)
-    {
+    public function __construct(
+        public readonly int $deliveryId,
+        public readonly int $phaseRunId,
+    ) {
         $this->retryDeadline = now()->addMinutes(20)->toImmutable();
     }
 
@@ -57,7 +59,7 @@ final class AdvanceOrbitImplementation implements ShouldQueue, ShouldQueueAfterC
         }
 
         try {
-            $mergeabilityPending = $advance->handle($this->deliveryId);
+            $mergeabilityPending = $advance->handle($this->deliveryId, $this->phaseRunId);
         } finally {
             $lock->release();
         }
@@ -82,11 +84,13 @@ final class AdvanceOrbitImplementation implements ShouldQueue, ShouldQueueAfterC
             $phase = PhaseRun::query()
                 ->where('delivery_id', $delivery->id)
                 ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
-                ->where('attempt', 1)
+                ->latest('attempt')
                 ->lockForUpdate()
                 ->first();
 
-            if ($phase === null || $phase->status !== PhaseRunStatus::Running) {
+            if ($phase === null
+                || $phase->id !== $this->phaseRunId
+                || $phase->status !== PhaseRunStatus::Running) {
                 return;
             }
 

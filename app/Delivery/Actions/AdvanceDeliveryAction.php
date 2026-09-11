@@ -89,8 +89,9 @@ final readonly class AdvanceDeliveryAction
                 DispatchOrbitImplementation::dispatch($deliveryId)->afterCommit();
             }
 
-            if ($implementation?->attempt === 1 && $delivery->status === DeliveryStatus::WaitingForAgent) {
-                AdvanceOrbitImplementationJob::dispatch($deliveryId)->afterCommit();
+            if (in_array($implementation?->attempt, [1, 2], true)
+                && $delivery->status === DeliveryStatus::WaitingForAgent) {
+                AdvanceOrbitImplementationJob::dispatch($deliveryId, $implementation->id)->afterCommit();
             }
 
             return false;

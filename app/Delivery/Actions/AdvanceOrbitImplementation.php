@@ -43,7 +43,7 @@ final readonly class AdvanceOrbitImplementation
     ) {}
 
     /** Return true when GitHub mergeability needs another bounded queue attempt. */
-    public function handle(int $deliveryId): bool
+    public function handle(int $deliveryId, ?int $expectedPhaseId = null): bool
     {
         $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($deliveryId);
 
@@ -56,7 +56,7 @@ final readonly class AdvanceOrbitImplementation
             return false;
         }
 
-        $state = $this->implementationState($delivery);
+        $state = $this->implementationState($delivery, $expectedPhaseId);
 
         if ($state === null) {
             return false;
@@ -91,7 +91,7 @@ final readonly class AdvanceOrbitImplementation
                 return false;
             }
 
-            $state = $this->implementationState($delivery);
+            $state = $this->implementationState($delivery, $expectedPhaseId);
 
             if ($state === null || $state[0]->id !== $phase->id
                 || $state[1]->id !== $dispatch->id || $state[2]->id !== $receipt->id
@@ -139,7 +139,7 @@ final readonly class AdvanceOrbitImplementation
     }
 
     /** @return array{PhaseRun, AgentDispatch, Receipt}|null */
-    private function implementationState(Delivery $delivery): ?array
+    private function implementationState(Delivery $delivery, ?int $expectedPhaseId = null): ?array
     {
         if ($delivery->current_phase !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             || $delivery->status !== DeliveryStatus::WaitingForAgent) {
@@ -148,10 +148,18 @@ final readonly class AdvanceOrbitImplementation
 
         $phase = $delivery->phaseRuns()
             ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
-            ->where('attempt', 1)
+            ->latest('attempt')
             ->first();
 
-        if ($phase === null || $phase->status !== PhaseRunStatus::Running) {
+        if ($phase === null || ! in_array($phase->attempt, [1, 2], true)) {
+            throw new OrbitImplementationAdvancementFailed('The implementation phase is not running.');
+        }
+
+        if ($expectedPhaseId !== null && $phase->id !== $expectedPhaseId) {
+            return null;
+        }
+
+        if ($phase->status !== PhaseRunStatus::Running) {
             throw new OrbitImplementationAdvancementFailed('The implementation phase is not running.');
         }
 
@@ -173,7 +181,9 @@ final readonly class AdvanceOrbitImplementation
             return null;
         }
 
-        if ($receipts->count() !== 1 || ! $this->receipts->matches($delivery, $phase, $dispatch, $receipt)) {
+        if ($receipts->count() !== 1
+            || $delivery->candidate_sha !== $this->expectedActiveCandidate($phase, $receipt)
+            || ! $this->matchesReceipt($delivery, $phase, $dispatch, $receipt)) {
             throw new OrbitImplementationAdvancementFailed(
                 'The implementation receipt does not match the settled dispatch.',
             );
@@ -243,21 +253,28 @@ final readonly class AdvanceOrbitImplementation
             $phase = PhaseRun::query()->whereKey($phaseId)->lockForUpdate()->firstOrFail();
             $dispatch = AgentDispatch::query()->whereKey($dispatchId)->lockForUpdate()->firstOrFail();
             $receipt = Receipt::query()->whereKey($receiptId)->lockForUpdate()->firstOrFail();
+            $latestPhase = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+                ->latest('attempt')
+                ->first();
 
             if ($project->state !== ProjectOrchestrationState::Enabled
                 || $project->config !== $config->toArray()
                 || $delivery->current_phase !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
                 || $delivery->status !== DeliveryStatus::WaitingForAgent
                 || $phase->delivery_id !== $delivery->id
+                || $latestPhase?->id !== $phase->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-                || $phase->attempt !== 1
+                || ! in_array($phase->attempt, [1, 2], true)
                 || $phase->status !== PhaseRunStatus::Running
                 || $dispatch->phase_run_id !== $phase->id
                 || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
                 || $dispatch->status !== AgentDispatchStatus::Settled
                 || $receipt->phase_run_id !== $phase->id
                 || ($receipt->payload['result'] ?? null) !== 'blocked'
-                || ! $this->receipts->matches($delivery, $phase, $dispatch, $receipt)) {
+                || $delivery->candidate_sha !== $this->expectedActiveCandidate($phase, $receipt)
+                || ! $this->matchesReceipt($delivery, $phase, $dispatch, $receipt)) {
                 throw new OrbitImplementationAdvancementFailed('The blocked implementation ledger changed.');
             }
 
@@ -309,21 +326,28 @@ final readonly class AdvanceOrbitImplementation
             $phase = PhaseRun::query()->whereKey($phaseId)->lockForUpdate()->firstOrFail();
             $dispatch = AgentDispatch::query()->whereKey($dispatchId)->lockForUpdate()->firstOrFail();
             $receipt = Receipt::query()->whereKey($receiptId)->lockForUpdate()->firstOrFail();
+            $latestPhase = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+                ->latest('attempt')
+                ->first();
 
             if ($project->state !== ProjectOrchestrationState::Enabled
                 || $project->config !== $config->toArray()
                 || $delivery->current_phase !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
                 || $delivery->status !== DeliveryStatus::WaitingForAgent
                 || $phase->delivery_id !== $delivery->id
+                || $latestPhase?->id !== $phase->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-                || $phase->attempt !== 1
+                || ! in_array($phase->attempt, [1, 2], true)
                 || $phase->status !== PhaseRunStatus::Running
                 || $dispatch->phase_run_id !== $phase->id
                 || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
                 || $dispatch->status !== AgentDispatchStatus::Settled
                 || $receipt->phase_run_id !== $phase->id
                 || ($receipt->payload['result'] ?? null) !== 'ready'
-                || ! $this->receipts->matches($delivery, $phase, $dispatch, $receipt)) {
+                || $delivery->candidate_sha !== $this->expectedActiveCandidate($phase, $receipt)
+                || ! $this->matchesReceipt($delivery, $phase, $dispatch, $receipt)) {
                 throw new OrbitImplementationAdvancementFailed('The implementation ledger changed during advancement.');
             }
 
@@ -332,7 +356,9 @@ final readonly class AdvanceOrbitImplementation
             if ($pullRequest->candidateSha !== $verified->candidateSha
                 || $pullRequest->bodyHash !== $verified->pullRequestBodyHash
                 || $pullRequest->number < 1
-                || $pullRequest->url !== "https://github.com/nckrtl/orbit/pull/{$pullRequest->number}") {
+                || $pullRequest->url !== "https://github.com/nckrtl/orbit/pull/{$pullRequest->number}"
+                || ($phase->attempt === 2 && ($delivery->pull_request_number !== $pullRequest->number
+                    || $delivery->pull_request_url !== $pullRequest->url))) {
                 throw new OrbitImplementationAdvancementFailed(
                     'The published pull request does not match the implementation receipt.',
                 );
@@ -380,7 +406,7 @@ final readonly class AdvanceOrbitImplementation
                     'orbit_pr_review',
                     $pullRequest,
                 );
-            } else {
+            } elseif ($phase->attempt === 1) {
                 $this->createNextIntent(
                     $delivery,
                     $receipt,
@@ -389,6 +415,17 @@ final readonly class AdvanceOrbitImplementation
                     OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
                     strtolower((string) $delivery->external_issue_key).'-loop-builder',
                     'orbit_implementation_correction',
+                    $pullRequest,
+                );
+            } else {
+                $this->createNextIntent(
+                    $delivery,
+                    $receipt,
+                    OrbitFeatureWorkflow::RESOLUTION_PHASE,
+                    1,
+                    OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+                    strtolower((string) $delivery->external_issue_key).'-loop-resolution-1',
+                    'orbit_resolution',
                     $pullRequest,
                 );
             }
@@ -462,52 +499,68 @@ final readonly class AdvanceOrbitImplementation
             return false;
         }
 
-        $phase = $delivery->phaseRuns()
-            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
-            ->where('attempt', 1)
+        $nextAttempt = $delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE ? 2 : 1;
+        $next = $delivery->phaseRuns()
+            ->where('phase_name', $delivery->current_phase)
+            ->where('attempt', $nextAttempt)
             ->first();
-        $dispatches = $phase?->agentDispatches()->get();
-        $receipts = $phase?->receipts()->where('kind', 'orbit_implementation')->get();
-        $dispatch = $dispatches?->first();
-        $receipt = $receipts?->first();
+
+        if ($next === null || ! is_array($next->input)
+            || ! array_key_exists('implementation_receipt_id', $next->input)) {
+            return false;
+        }
+
+        $nextInput = $next->input;
+        $receiptId = $nextInput['implementation_receipt_id'] ?? null;
+        $receipt = is_int($receiptId) ? Receipt::query()->find($receiptId) : null;
+        $phase = $receipt === null ? null : PhaseRun::query()->find($receipt->phase_run_id);
         $project = $delivery->projectOrchestration()->first();
 
-        if ($phase === null || $dispatches?->count() !== 1 || $receipts?->count() !== 1
-            || $dispatch === null || $receipt === null
+        if ($receipt === null || $phase === null
             || $project?->state !== ProjectOrchestrationState::Enabled
-            || $phase->status !== PhaseRunStatus::Completed
-            || $phase->finished_at === null
+            || $phase->delivery_id !== $delivery->id
+            || $phase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+            || ! in_array($phase->attempt, [1, 2], true)
+            || $phase->status !== PhaseRunStatus::Completed || $phase->finished_at === null) {
+            throw new OrbitImplementationAdvancementFailed('The retained implementation transition is inconsistent.');
+        }
+
+        $dispatches = $phase->agentDispatches()->get();
+        $receipts = $phase->receipts()->where('kind', 'orbit_implementation')->get();
+        $dispatch = $dispatches->first();
+        $storedReceipt = $receipts->first();
+
+        if ($dispatches->count() !== 1 || $receipts->count() !== 1
+            || $dispatch === null || $storedReceipt?->id !== $receipt->id
             || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
             || $dispatch->status !== AgentDispatchStatus::Settled
-            || ! $this->receipts->matches($delivery, $phase, $dispatch, $receipt)) {
+            || ! $this->matchesReceipt($delivery, $phase, $dispatch, $receipt)) {
             throw new OrbitImplementationAdvancementFailed('The retained implementation transition is inconsistent.');
         }
 
         $result = $receipt->payload['result'] ?? null;
+        $mergeable = is_array($phase->output) ? ($phase->output['mergeable'] ?? null) : null;
+        $validRoute = ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+                && $result === 'ready'
+                && $phase->attempt === 1
+                && $mergeable === false)
+            || ($delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+                && $result === 'ready'
+                && $mergeable === true)
+            || ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
+                && ($result === 'blocked'
+                    || ($result === 'ready' && $phase->attempt === 2 && $mergeable === false)));
 
-        if (($result === 'blocked' && $delivery->current_phase !== OrbitFeatureWorkflow::RESOLUTION_PHASE)
-            || ($result === 'ready' && ! in_array($delivery->current_phase, [
-                OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
-                OrbitFeatureWorkflow::PR_REVIEW_PHASE,
-            ], true))
-            || ! in_array($result, ['blocked', 'ready'], true)) {
+        if (! $validRoute) {
             throw new OrbitImplementationAdvancementFailed('The retained implementation route is inconsistent.');
         }
 
-        $expectedAttempt = $delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE ? 2 : 1;
-        $next = $delivery->phaseRuns()
-            ->where('phase_name', $delivery->current_phase)
-            ->where('attempt', $expectedAttempt)
-            ->first();
-        $nextDispatches = $next?->agentDispatches()->get();
-        $nextDispatch = $nextDispatches?->first();
-        $expectedMergeable = $delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            ? true
-            : ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE ? false : null);
+        $nextDispatches = $next->agentDispatches()->get();
+        $nextDispatch = $nextDispatches->first();
         $expectedPullRequest = $result === 'blocked' ? null : [
             'number' => $delivery->pull_request_number,
             'url' => $delivery->pull_request_url,
-            'mergeable' => $expectedMergeable,
+            'mergeable' => $mergeable,
         ];
         $expectedInput = [
             'implementation_receipt_id' => $receipt->id,
@@ -536,12 +589,12 @@ final readonly class AdvanceOrbitImplementation
                 'result' => 'ready',
                 'pull_request_number' => $delivery->pull_request_number,
                 'pull_request_url' => $delivery->pull_request_url,
-                'mergeable' => $expectedMergeable,
+                'mergeable' => $mergeable,
             ];
         $expectedCandidate = $result === 'blocked'
             ? ($receipt->payload['reviewed_candidate_sha'] ?? null)
             : ($receipt->payload['candidate_sha'] ?? null);
-        $hasExactPullRequest = $result === 'blocked'
+        $hasExactPullRequest = $result === 'blocked' && $phase->attempt === 1
             ? $delivery->pull_request_number === null && $delivery->pull_request_url === null
             : is_int($delivery->pull_request_number)
                 && $delivery->pull_request_number > 0
@@ -550,9 +603,9 @@ final readonly class AdvanceOrbitImplementation
         if ($delivery->candidate_sha !== $expectedCandidate
             || ! $hasExactPullRequest
             || $phase->output !== $expectedOutput
-            || $next === null || $next->status !== PhaseRunStatus::Pending
+            || $next->status !== PhaseRunStatus::Pending
             || $next->input !== $expectedInput
-            || $nextDispatches?->count() !== 1 || $nextDispatch === null
+            || $nextDispatches->count() !== 1 || $nextDispatch === null
             || $nextDispatch->agent_role !== $expectedRole
             || $nextDispatch->idempotency_key !== IdempotencyKey::forDispatch(
                 $delivery->id,
@@ -569,6 +622,46 @@ final readonly class AdvanceOrbitImplementation
         }
 
         return true;
+    }
+
+    private function matchesReceipt(
+        Delivery $delivery,
+        PhaseRun $phase,
+        AgentDispatch $dispatch,
+        Receipt $receipt,
+    ): bool {
+        if ($phase->attempt !== 2) {
+            return $this->receipts->matches($delivery, $phase, $dispatch, $receipt);
+        }
+
+        $input = $phase->input;
+        $source = is_array($input) ? ($input['implementation_receipt'] ?? null) : null;
+        $sourceCandidate = is_array($source) ? ($source['candidate_sha'] ?? null) : null;
+
+        if (! is_string($sourceCandidate)) {
+            return false;
+        }
+
+        $sourceDelivery = clone $delivery;
+        $sourceDelivery->candidate_sha = $sourceCandidate;
+
+        return $this->receipts->matches($sourceDelivery, $phase, $dispatch, $receipt);
+    }
+
+    private function expectedActiveCandidate(PhaseRun $phase, Receipt $receipt): mixed
+    {
+        if ($phase->current_block === 'mergeability') {
+            return $receipt->payload['candidate_sha'] ?? null;
+        }
+
+        if ($phase->attempt === 1) {
+            return $receipt->payload['reviewed_candidate_sha'] ?? null;
+        }
+
+        $input = $phase->input;
+        $source = is_array($input) ? ($input['implementation_receipt'] ?? null) : null;
+
+        return is_array($source) ? ($source['candidate_sha'] ?? null) : null;
     }
 
     /** @param array<string, mixed> $payload */

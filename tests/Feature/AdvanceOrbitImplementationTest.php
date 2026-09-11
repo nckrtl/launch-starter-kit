@@ -25,6 +25,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitImplementationAdvancementFailed;
+use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceOrbitImplementation as AdvanceImplementationJob;
 use App\Jobs\DispatchOrbitImplementation as DispatchImplementationJob;
@@ -135,6 +136,19 @@ final class ImplementationAdvancementVerifier implements OrbitImplementationRepo
 
     public bool $mismatch = false;
 
+    public string $expectedReviewedCandidateSha;
+
+    public string $expectedCandidateSha;
+
+    public string $expectedArtifactSha;
+
+    public function __construct()
+    {
+        $this->expectedReviewedCandidateSha = str_repeat('a', 40);
+        $this->expectedCandidateSha = str_repeat('b', 40);
+        $this->expectedArtifactSha = str_repeat('c', 40);
+    }
+
     public function verifyImplementationOutcome(
         OrbitProjectConfig $config,
         PreparedWorktree $startupWorktree,
@@ -147,9 +161,9 @@ final class ImplementationAdvancementVerifier implements OrbitImplementationRepo
     ): VerifiedOrbitImplementationOutcome {
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
             ->and($startupWorktree->headSha)->toBe(str_repeat('a', 40))
-            ->and($reviewedCandidateSha)->toBe(str_repeat('a', 40))
-            ->and($candidateSha)->toBe(str_repeat('b', 40))
-            ->and($artifactSha)->toBe(str_repeat('c', 40));
+            ->and($reviewedCandidateSha)->toBe($this->expectedReviewedCandidateSha)
+            ->and($candidateSha)->toBe($this->expectedCandidateSha)
+            ->and($artifactSha)->toBe($this->expectedArtifactSha);
         $this->calls++;
 
         return new VerifiedOrbitImplementationOutcome(
@@ -190,6 +204,15 @@ final class ImplementationAdvancementPullRequests implements OrbitPullRequestPub
 
     public ?bool $mergeable = true;
 
+    public int $number = 42;
+
+    public string $expectedCandidateSha;
+
+    public function __construct()
+    {
+        $this->expectedCandidateSha = str_repeat('b', 40);
+    }
+
     public function publish(
         string $issueKey,
         string $issueTitle,
@@ -199,7 +222,7 @@ final class ImplementationAdvancementPullRequests implements OrbitPullRequestPub
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
             ->and($issueKey)->toBe('ORB-234')
             ->and($issueTitle)->toBe('Build the feature')
-            ->and($candidateSha)->toBe(str_repeat('b', 40));
+            ->and($candidateSha)->toBe($this->expectedCandidateSha);
         $this->calls++;
 
         if ($this->afterPublish instanceof Closure) {
@@ -207,8 +230,8 @@ final class ImplementationAdvancementPullRequests implements OrbitPullRequestPub
         }
 
         return new PublishedOrbitPullRequest(
-            number: 42,
-            url: 'https://github.com/nckrtl/orbit/pull/42',
+            number: $this->number,
+            url: "https://github.com/nckrtl/orbit/pull/{$this->number}",
             candidateSha: $candidateSha,
             bodyHash: hash('sha256', $pullRequestBody),
             mergeable: $this->mergeable,
@@ -291,6 +314,19 @@ beforeEach(function () {
         OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
         'implementer',
     );
+    $this->dispatch->forceFill([
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $this->delivery->id,
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+            1,
+            OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-builder',
+        'prompt_name' => 'orbit_implementation',
+        'prompt_version' => OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION,
+        'prompt_hash' => str_repeat('4', 64),
+        'dispatched_at' => now(),
+    ])->save();
     $this->body = implode("\n", [
         'Issue: ORB-234',
         'Candidate: '.str_repeat('b', 40),
@@ -385,9 +421,76 @@ function advancementComplete(PhaseRun $phase, Receipt $receipt, string $result):
     ])->save();
 }
 
+function promoteImplementationAdvancementToCorrection(object $test, string $result = 'ready'): void
+{
+    $test->pullRequests->mergeable = false;
+    app(AdvanceOrbitImplementation::class)->handle($test->delivery->id);
+
+    $test->correction = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    $test->correctionDispatch = $test->correction->agentDispatches()->sole();
+    $test->correctionDispatch->forceFill([
+        'prompt_hash' => str_repeat('5', 64),
+        'status' => AgentDispatchStatus::Settled,
+        'dispatched_at' => now(),
+        'settled_at' => now(),
+    ])->save();
+    $test->correctionBody = implode("\n", [
+        'Issue: ORB-234',
+        'Candidate: '.str_repeat('e', 40),
+        'Artifact: '.str_repeat('f', 40),
+        'Flow: discovery',
+        'Builder gate: passed (/home/nckrtl/orbit/.git/orbit-checks/correction/result.json)',
+    ]);
+    $test->correctionPayload = [
+        'kind' => 'orbit_implementation', 'schema_version' => 1,
+        'delivery_id' => $test->delivery->id, 'dispatch_id' => $test->correctionDispatch->id,
+        'issue_key' => 'ORB-234', 'phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'attempt' => 2, 'result' => $result, 'worktree' => $test->worktree,
+        'reviewed_candidate_sha' => str_repeat('b', 40),
+        'candidate_sha' => str_repeat('e', 40),
+        'handoff_path' => '.loop/runtime/implementation-correction.md',
+        'handoff' => $result === 'ready' ? 'Merge conflicts resolved.' : 'Correction is blocked.',
+        'artifact_sha' => $result === 'ready' ? str_repeat('f', 40) : null,
+        'gate_receipt_path' => $result === 'ready'
+            ? '/home/nckrtl/orbit/.git/orbit-checks/correction/result.json'
+            : null,
+        'pull_request_body_path' => $result === 'ready' ? '.loop/runtime/pull-request-body.md' : null,
+        'pull_request_body' => $result === 'ready' ? $test->correctionBody : null,
+        'pull_request_body_sha256' => $result === 'ready' ? hash('sha256', $test->correctionBody) : null,
+        'flow' => $result === 'ready' ? 'discovery' : null,
+    ];
+    $test->correctionReceipt = advancementReceipt(
+        $test->correction,
+        'orbit_implementation',
+        $test->correctionPayload,
+    );
+    $test->correction->forceFill([
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now(),
+    ])->save();
+    $test->delivery->refresh()->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'status' => DeliveryStatus::WaitingForAgent,
+    ])->save();
+    $test->verifier->expectedReviewedCandidateSha = str_repeat('b', 40);
+    $test->verifier->expectedCandidateSha = str_repeat('e', 40);
+    $test->verifier->expectedArtifactSha = str_repeat('f', 40);
+    $test->pullRequests->expectedCandidateSha = str_repeat('e', 40);
+    $test->pullRequests->mergeable = true;
+    $test->verifier->calls = 0;
+    $test->issues->calls = 0;
+    $test->pullRequests->calls = 0;
+}
+
 it('queues the dedicated implementation advancement job', function () {
     expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeFalse();
-    Queue::assertPushed(AdvanceImplementationJob::class, 1);
+    Queue::assertPushed(
+        AdvanceImplementationJob::class,
+        fn (AdvanceImplementationJob $job): bool => $job->phaseRunId === $this->phase->id,
+    );
 });
 
 it('routes blocked implementation directly to one resolution intent without external work', function () {
@@ -561,6 +664,195 @@ it('routes an actual merge conflict to one retained-Builder correction intent', 
     Queue::assertPushed(DispatchImplementationJob::class, 1);
 });
 
+it('queues advancement for the exact merge-conflict correction phase', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    Queue::fake();
+
+    expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeFalse();
+
+    Queue::assertPushed(
+        AdvanceImplementationJob::class,
+        fn (AdvanceImplementationJob $job): bool => $job->phaseRunId === $this->correction->id,
+    );
+});
+
+it('publishes the corrected candidate to the same pull request and creates one PR-review intent', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    $action = app(AdvanceOrbitImplementation::class);
+
+    expect($action->handle($this->delivery->id))->toBeFalse();
+    $action->handle($this->delivery->id);
+
+    $review = PhaseRun::query()->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)->sole();
+    $reviewDispatch = $review->agentDispatches()->sole();
+
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->correction->fresh()->output)->toBe([
+            'receipt_id' => $this->correctionReceipt->id,
+            'result' => 'ready',
+            'pull_request_number' => 42,
+            'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+            'mergeable' => true,
+        ])
+        ->and($this->delivery->fresh()->candidate_sha)->toBe(str_repeat('e', 40))
+        ->and($this->delivery->fresh()->pull_request_number)->toBe(42)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->and($review->input)->toBe([
+            'implementation_receipt_id' => $this->correctionReceipt->id,
+            'implementation_receipt' => $this->correctionPayload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => true,
+            ],
+        ])
+        ->and($reviewDispatch->agent_role)->toBe(OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE)
+        ->and($reviewDispatch->status)->toBe(AgentDispatchStatus::Pending)
+        ->and($this->verifier->calls)->toBe(1)
+        ->and($this->issues->calls)->toBe(1)
+        ->and($this->pullRequests->calls)->toBe(1)
+        ->and(PhaseRun::where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)->count())->toBe(1);
+});
+
+it('retries unresolved corrected-candidate mergeability without another Builder attempt', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    $this->pullRequests->mergeable = null;
+    $action = app(AdvanceOrbitImplementation::class);
+
+    expect($action->handle($this->delivery->id))->toBeTrue();
+
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->correction->fresh()->current_block)->toBe('mergeability')
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->candidate_sha)->toBe(str_repeat('e', 40))
+        ->and($this->delivery->fresh()->pull_request_number)->toBe(42)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->where('attempt', 3)
+            ->doesntExist())->toBeTrue();
+
+    $this->pullRequests->mergeable = true;
+    expect($action->handle($this->delivery->id))->toBeFalse();
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->and($this->correction->fresh()->current_block)->toBeNull()
+        ->and($this->pullRequests->calls)->toBe(2);
+});
+
+it('routes a repeated merge conflict to one resolution intent without attempt three', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    $this->pullRequests->mergeable = false;
+    $action = app(AdvanceOrbitImplementation::class);
+
+    expect($action->handle($this->delivery->id))->toBeFalse();
+    $action->handle($this->delivery->id);
+
+    $resolution = PhaseRun::query()->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->correction->fresh()->output['mergeable'])->toBeFalse()
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->and($this->delivery->fresh()->candidate_sha)->toBe(str_repeat('e', 40))
+        ->and($resolution->input)->toBe([
+            'implementation_receipt_id' => $this->correctionReceipt->id,
+            'implementation_receipt' => $this->correctionPayload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => false,
+            ],
+        ])
+        ->and($resolver->agent_role)->toBe(OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE)
+        ->and($resolver->status)->toBe(AgentDispatchStatus::Pending)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->where('attempt', 3)
+            ->doesntExist())->toBeTrue()
+        ->and(PhaseRun::where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)->count())->toBe(1);
+});
+
+it('routes a blocked merge-conflict correction to resolution and preserves the published PR', function () {
+    promoteImplementationAdvancementToCorrection($this, 'blocked');
+    $action = app(AdvanceOrbitImplementation::class);
+
+    expect($action->handle($this->delivery->id))->toBeFalse();
+    $action->handle($this->delivery->id);
+
+    $resolution = PhaseRun::query()->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)->sole();
+
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->correction->fresh()->output)->toBe([
+            'receipt_id' => $this->correctionReceipt->id,
+            'result' => 'blocked',
+        ])
+        ->and($this->delivery->fresh()->candidate_sha)->toBe(str_repeat('b', 40))
+        ->and($this->delivery->fresh()->pull_request_number)->toBe(42)
+        ->and($this->delivery->fresh()->pull_request_url)->toBe('https://github.com/nckrtl/orbit/pull/42')
+        ->and($resolution->input)->toBe([
+            'implementation_receipt_id' => $this->correctionReceipt->id,
+            'implementation_receipt' => $this->correctionPayload,
+            'pull_request' => null,
+        ])
+        ->and($this->verifier->calls)->toBe(0)
+        ->and($this->issues->calls)->toBe(0)
+        ->and($this->pullRequests->calls)->toBe(0);
+});
+
+it('rejects a corrected publication that replaces the recorded pull request identity', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    $this->pullRequests->number = 43;
+
+    expect(fn () => app(AdvanceOrbitImplementation::class)->handle($this->delivery->id))
+        ->toThrow(OrbitImplementationAdvancementFailed::class, 'does not match the implementation receipt');
+
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->delivery->fresh()->pull_request_number)->toBe(42);
+});
+
+it('rejects attempt-two ledger races after corrected pull request publication', function (string $race) {
+    promoteImplementationAdvancementToCorrection($this);
+    $this->pullRequests->afterPublish = function () use ($race): void {
+        if ($race === 'config') {
+            $project = $this->delivery->projectOrchestration;
+            $config = $project->config;
+            $config['concurrency'] = 2;
+            DB::table('project_orchestrations')->where('id', $project->id)->update([
+                'config' => json_encode($config, JSON_THROW_ON_ERROR),
+            ]);
+
+            return;
+        }
+
+        if ($race === 'source receipt') {
+            DB::table('receipts')->where('id', $this->receipt->id)->update([
+                'payload_hash' => str_repeat('0', 64),
+            ]);
+
+            return;
+        }
+
+        if ($race === 'candidate') {
+            DB::table('deliveries')->where('id', $this->delivery->id)->update([
+                'candidate_sha' => str_repeat('0', 40),
+            ]);
+
+            return;
+        }
+
+        DB::table('deliveries')->where('id', $this->delivery->id)->update([
+            'pull_request_number' => 99,
+            'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/99',
+        ]);
+    };
+
+    expect(fn () => app(AdvanceOrbitImplementation::class)->handle($this->delivery->id))
+        ->toThrow(OrbitImplementationAdvancementFailed::class, 'ledger changed during advancement');
+
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->repository->reservationIsHeld())->toBeFalse();
+})->with(['config', 'source receipt', 'candidate', 'pull request identity']);
+
 it('does not consume the receipt when verified implementation evidence differs', function () {
     $this->verifier->mismatch = true;
 
@@ -591,7 +883,7 @@ it('rejects a config race after pull request publication without consuming the r
 });
 
 it('bounds the implementation advancement job and preserves blocked recovery', function () {
-    $job = new AdvanceImplementationJob($this->delivery->id);
+    $job = new AdvanceImplementationJob($this->delivery->id, $this->phase->id);
     $this->delivery->forceFill([
         'status' => DeliveryStatus::Blocked,
         'failure_details' => ['code' => 'manual_recovery'],
@@ -607,7 +899,7 @@ it('bounds the implementation advancement job and preserves blocked recovery', f
 });
 
 it('fails only an active implementation when advancement retries are exhausted', function () {
-    $job = new AdvanceImplementationJob($this->delivery->id);
+    $job = new AdvanceImplementationJob($this->delivery->id, $this->phase->id);
     $job->failed(new RuntimeException('Queue exhausted.'));
 
     expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Failed)
@@ -617,15 +909,44 @@ it('fails only an active implementation when advancement retries are exhausted',
         ]);
 });
 
+it('fails the exact active correction when its advancement retries are exhausted', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    $job = new AdvanceImplementationJob($this->delivery->id, $this->correction->id);
+
+    $job->failed(new RuntimeException('Correction queue exhausted.'));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Failed)
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'implementation_advancement_exhausted',
+            'message' => 'Correction queue exhausted.',
+        ]);
+});
+
 it('does not fail a queued retained-Builder correction from a stale advancement job', function () {
+    $job = new AdvanceImplementationJob($this->delivery->id, $this->phase->id);
     $this->pullRequests->mergeable = false;
     app(AdvanceOrbitImplementation::class)->handle($this->delivery->id);
 
-    (new AdvanceImplementationJob($this->delivery->id))->failed(new RuntimeException('Stale queue failure.'));
+    $job->failed(new RuntimeException('Stale queue failure.'));
 
     expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
         ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
         ->and($this->phase->fresh()->status)->toBe(PhaseRunStatus::Completed);
+});
+
+it('does not advance or fail attempt two from a stale attempt-one job', function () {
+    $job = (new AdvanceImplementationJob($this->delivery->id, $this->phase->id))
+        ->withFakeQueueInteractions();
+    promoteImplementationAdvancementToCorrection($this);
+
+    $job->handle(app(AdvanceOrbitImplementation::class));
+    $job->failed(new RuntimeException('Stale queue failure.'));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->and($this->correction->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->verifier->calls)->toBe(0)
+        ->and($this->pullRequests->calls)->toBe(0);
 });
 
 it('releases a contended implementation-advancement lock for retry', function () {
@@ -636,7 +957,7 @@ it('releases a contended implementation-advancement lock for retry', function ()
     $lock->get();
 
     try {
-        $job = (new AdvanceImplementationJob($this->delivery->id))->withFakeQueueInteractions();
+        $job = (new AdvanceImplementationJob($this->delivery->id, $this->phase->id))->withFakeQueueInteractions();
         $job->handle(app(AdvanceOrbitImplementation::class));
         $job->assertReleased(1);
     } finally {
