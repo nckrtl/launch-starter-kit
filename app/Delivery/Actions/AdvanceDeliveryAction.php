@@ -18,6 +18,7 @@ use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
+use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPlanningCorrection;
 use App\Jobs\DispatchOrbitPlanReview;
 use App\Models\AgentDispatch;
@@ -73,6 +74,11 @@ final readonly class AdvanceDeliveryAction
             if ($delivery->current_phase === OrbitFeatureWorkflow::PLAN_REVIEW_PHASE
                 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 AdvanceOrbitPlanReviewJob::dispatch($deliveryId)->afterCommit();
+            }
+
+            if ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+                && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
+                DispatchOrbitImplementation::dispatch($deliveryId)->afterCommit();
             }
 
             return false;
