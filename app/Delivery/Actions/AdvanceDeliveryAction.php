@@ -14,6 +14,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Workflow\IdempotencyKey;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
 use App\Models\AgentDispatch;
@@ -28,12 +29,18 @@ final readonly class AdvanceDeliveryAction
         private WorkflowRegistry $workflows,
         private HerdrRuntime $herdr,
         private ProjectConfigRegistry $configs,
+        private AdvanceOrbitPlanning $advanceOrbitPlanning,
     ) {}
 
     /** Return true when a continuation should be queued after the caller releases its lock. */
     public function handle(int $deliveryId): bool
     {
         $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($deliveryId);
+
+        if ($delivery->workflow_type === OrbitFeatureWorkflow::TYPE
+            && $delivery->workflow_version === OrbitFeatureWorkflow::VERSION) {
+            return $this->advanceOrbitPlanning->handle($deliveryId);
+        }
 
         if ($delivery->status->isTerminal()
             || $delivery->status === DeliveryStatus::Preparing

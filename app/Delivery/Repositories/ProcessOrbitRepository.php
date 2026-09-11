@@ -12,6 +12,7 @@ use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
+use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use Illuminate\Support\Facades\Process;
@@ -421,6 +422,18 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         }
 
         try {
+            $candidateType = Process::path($path)->timeout(10)->run(['git', 'cat-file', '-t', $worktree->headSha]);
+            $artifactType = Process::path($path)->timeout(10)->run(['git', 'cat-file', '-t', $artifactSha]);
+            $parents = Process::path($path)->timeout(10)->run(['git', 'rev-list', '--parents', '-n', '1', $artifactSha]);
+            $candidateLoop = Process::path($path)->timeout(10)->run([
+                'git', 'ls-tree', '-r', '--name-only', $worktree->headSha, '--', '.loop',
+            ]);
+            $productDiff = Process::path($path)->timeout(10)->run([
+                'git', 'diff', '--name-only', $worktree->headSha, $artifactSha, '--', '.', ':(exclude).loop',
+            ]);
+            $artifactLoop = Process::path($path)->timeout(10)->run([
+                'git', 'ls-tree', '-r', $artifactSha, '--', '.loop',
+            ]);
             $plan = Process::path($path)->timeout(10)->run([
                 'git',
                 'show',
@@ -428,6 +441,21 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             ]);
         } catch (RuntimeException $exception) {
             throw new OrbitRepositoryFailed('The saved Orbit planning artifact could not be read.', 0, $exception);
+        }
+
+        $parentFields = preg_split('/\s+/', trim($parents->output())) ?: [];
+        $loopEntries = preg_split('/\R/', trim($artifactLoop->output())) ?: [];
+        $validLoopEntries = $loopEntries !== [] && collect($loopEntries)->every(
+            static fn (string $entry): bool => preg_match('/^100(?:644|755) blob [a-f0-9]{40}\t\.loop\/.+$/', $entry) === 1,
+        );
+
+        if ($candidateType->failed() || trim($candidateType->output()) !== 'commit'
+            || $artifactType->failed() || trim($artifactType->output()) !== 'commit'
+            || $parents->failed() || $parentFields !== [$artifactSha, $worktree->headSha]
+            || $candidateLoop->failed() || trim($candidateLoop->output()) !== ''
+            || $productDiff->failed() || trim($productDiff->output()) !== ''
+            || $artifactLoop->failed() || ! $validLoopEntries) {
+            throw new OrbitRepositoryFailed('The saved Orbit planning artifact is not bound to the exact candidate.');
         }
 
         $contents = $plan->output();
@@ -438,6 +466,99 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
         }
 
         return new VerifiedOrbitPlanningArtifact($artifactSha, hash('sha256', $contents));
+    }
+
+    public function verifyPlanningOutcome(
+        OrbitProjectConfig $config,
+        PreparedWorktree $startupWorktree,
+        PreparedIssueSnapshot $snapshot,
+        string $candidateSha,
+        ?string $artifactSha,
+    ): VerifiedOrbitPlanningOutcome {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($startupWorktree->path);
+        $configuredCommon = $repository === false ? false : realpath($repository.'/.git');
+        $flow = $repository === false ? false : realpath($repository.'/bin/loop-flow');
+
+        if ($repository === false || $root === false || $path === false || $path !== $startupWorktree->path
+            || $configuredCommon === false || ! is_dir($configuredCommon) || is_link($repository.'/.git')
+            || $flow === false || ! is_executable($flow)
+            || ! str_starts_with($path, $root.'/')
+            || preg_match('/^ORB-[0-9]+$/', $snapshot->issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $startupWorktree->headSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
+            || ($artifactSha !== null && preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1)) {
+            throw new OrbitRepositoryFailed('The Orbit planning outcome metadata is invalid.');
+        }
+
+        try {
+            $inventory = Process::path($repository)->timeout(10)->run(['git', 'worktree', 'list', '--porcelain']);
+            $status = Process::path($path)->timeout(10)->run(['git', 'status', '--porcelain']);
+            $conflicts = Process::path($path)->timeout(10)->run(['git', 'diff', '--name-only', '--diff-filter=U']);
+            $head = Process::path($path)->timeout(10)->run(['git', 'rev-parse', 'HEAD']);
+            $tree = Process::path($path)->timeout(10)->run(['git', 'rev-parse', 'HEAD^{tree}']);
+            $common = Process::path($path)->timeout(10)->run([
+                'git', 'rev-parse', '--path-format=absolute', '--git-common-dir',
+            ]);
+            $ancestor = Process::path($path)->timeout(10)->run([
+                'git', 'merge-base', '--is-ancestor', $startupWorktree->headSha, $candidateSha,
+            ]);
+            $changes = Process::path($path)->timeout(10)->run([
+                'git', 'diff', '--name-only', $startupWorktree->headSha.'..'.$candidateSha,
+            ]);
+            $subjects = Process::path($path)->timeout(10)->run([
+                'git', 'log', '--format=%s', $startupWorktree->headSha.'..'.$candidateSha,
+            ]);
+            $candidateLoop = Process::path($path)->timeout(10)->run([
+                'git', 'ls-tree', '-r', '--name-only', $candidateSha, '--', '.loop',
+            ]);
+            $selectedFlow = Process::path($repository)->timeout(10)->run([$flow, 'status', '--worktree='.$path]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The Orbit planning outcome could not be inspected.', 0, $exception);
+        }
+
+        if ($inventory->failed() || ! $this->hasExactIssueWorktree($inventory->output(), $path, Str::lower($snapshot->issueKey))
+            || $status->failed() || trim($status->output()) !== ''
+            || $conflicts->failed() || trim($conflicts->output()) !== ''
+            || $head->failed() || trim($head->output()) !== $candidateSha
+            || $tree->failed() || preg_match('/^[a-f0-9]{40}$/', trim($tree->output())) !== 1
+            || $ancestor->failed()
+            || $candidateLoop->failed() || trim($candidateLoop->output()) !== ''
+            || $selectedFlow->failed() || trim($selectedFlow->output()) !== 'discovery') {
+            throw new OrbitRepositoryFailed('The Orbit planning outcome no longer matches its issue worktree.');
+        }
+
+        $currentCommon = $common->failed() ? false : realpath(trim($common->output()));
+        $changedPaths = array_values(array_filter(preg_split('/\R/', trim($changes->output())) ?: []));
+        $commitSubjects = array_values(array_filter(preg_split('/\R/', trim($subjects->output())) ?: []));
+
+        if ($currentCommon === false || $currentCommon !== $configuredCommon
+            || $changes->failed() || collect($changedPaths)->contains(
+                static fn (string $changed): bool => ! str_starts_with($changed, 'docs/'),
+            )
+            || $subjects->failed()
+            || ($candidateSha !== $startupWorktree->headSha && $commitSubjects === [])
+            || collect($commitSubjects)->contains(
+                static fn (string $subject): bool => ! str_starts_with($subject, 'docs:'),
+            )) {
+            throw new OrbitRepositoryFailed('Orbit planning may advance only through docs-only planning commits.');
+        }
+
+        $this->verifyIssueSnapshot($config, $startupWorktree, $snapshot);
+        $artifact = $artifactSha === null ? null : $this->verifyPlanningArtifact(
+            $config,
+            new PreparedWorktree($path, $candidateSha),
+            $snapshot->issueKey,
+            $artifactSha,
+        );
+
+        return new VerifiedOrbitPlanningOutcome(
+            candidateSha: $candidateSha,
+            treeSha: trim($tree->output()),
+            artifactSha: $artifact?->artifactSha,
+            planContentsHash: $artifact?->planContentsHash,
+        );
     }
 
     public function writeIssueSnapshot(

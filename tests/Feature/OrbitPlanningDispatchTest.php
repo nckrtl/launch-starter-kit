@@ -18,6 +18,7 @@ use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
+use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
@@ -25,6 +26,8 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPlanningDispatchFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\ExternalEvent;
 use App\Models\PhaseRun;
@@ -112,6 +115,16 @@ final class PlanningDispatchRepository implements OrbitRepository
         string $issueKey,
         string $artifactSha,
     ): VerifiedOrbitPlanningArtifact {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function verifyPlanningOutcome(
+        OrbitProjectConfig $config,
+        PreparedWorktree $startupWorktree,
+        PreparedIssueSnapshot $snapshot,
+        string $candidateSha,
+        ?string $artifactSha,
+    ): VerifiedOrbitPlanningOutcome {
         throw new LogicException('Not used by this test.');
     }
 
@@ -552,7 +565,7 @@ it('stops before prompting when final repository verification changes', function
     Queue::assertNothingPushed();
 });
 
-it('settles live planning events without invoking the shadow workflow advancement job', function () {
+it('settles live planning events and queues the unified advancement job', function () {
     config()->set('herdr.orchestration.enabled', true);
     config()->set('herdr.session', 'orbit');
     $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
@@ -569,10 +582,10 @@ it('settles live planning events without invoking the shadow workflow advancemen
     expect($dispatch->fresh()->status)->toBe(AgentDispatchStatus::Settled)
         ->and(ExternalEvent::sole()->delivery_id)->toBe($this->delivery->id)
         ->and(ExternalEvent::sole()->processed_at)->not->toBeNull();
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
-it('retains a completion event that arrives before the prompt call returns', function () {
+it('does not overwrite a plan-review transition committed before the prompt call returns', function () {
     config()->set('herdr.orchestration.enabled', true);
     config()->set('herdr.session', 'orbit');
     $this->herdr->beforePromptReturn = function (): void {
@@ -586,14 +599,37 @@ it('retains a completion event that arrives before the prompt call returns', fun
                 'agent_status' => 'done',
             ],
         ]);
+
+        $review = PhaseRun::query()->create([
+            'delivery_id' => $this->delivery->id,
+            'phase_name' => OrbitFeatureWorkflow::PLAN_REVIEW_PHASE,
+            'attempt' => 1,
+            'status' => PhaseRunStatus::Pending,
+        ]);
+        AgentDispatch::query()->create([
+            'phase_run_id' => $review->id,
+            'agent_role' => OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE,
+            'idempotency_key' => 'prompt-return-race-review',
+            'herdr_agent_name' => 'orb-234-loop-plan-review',
+            'prompt_name' => 'orbit_plan_review',
+            'prompt_version' => 1,
+            'prompt_hash' => str_repeat('0', 64),
+            'status' => AgentDispatchStatus::Pending,
+        ]);
+        $this->delivery->forceFill([
+            'current_phase' => OrbitFeatureWorkflow::PLAN_REVIEW_PHASE,
+            'status' => DeliveryStatus::Queued,
+        ])->save();
     };
 
     $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
 
     expect($dispatch->status)->toBe(AgentDispatchStatus::Settled)
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($dispatch->error_code)->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
         ->and(ExternalEvent::sole()->agent_dispatch_id)->toBe($dispatch->id)
         ->and(ExternalEvent::sole()->failure_message)->toBeNull()
         ->and(ExternalEvent::sole()->processed_at)->not->toBeNull();
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });

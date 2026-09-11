@@ -124,6 +124,43 @@ function fakePlanningRepositoryInspection(object $test, array $overrides = []): 
     })->preventStrayProcesses();
 }
 
+/** @param array<string, string|int> $overrides */
+function fakePlanningOutcomeInspection(object $test, string $candidateSha, array $overrides = []): void
+{
+    $outputs = [
+        'inventory' => "worktree {$test->repositoryPath}\nHEAD ".str_repeat('d', 40)."\nbranch refs/heads/main\n\n"
+            ."worktree {$test->worktreePath}\nHEAD {$candidateSha}\nbranch refs/heads/orb-234\n",
+        'status' => '',
+        'conflicts' => '',
+        'head' => $candidateSha."\n",
+        'tree' => str_repeat('e', 40)."\n",
+        'common' => $test->commonDirectory."\n",
+        'ancestor_exit' => 0,
+        'changes' => $candidateSha === $test->headSha ? '' : "docs/reference/example.md\n",
+        'subjects' => $candidateSha === $test->headSha ? '' : "docs: describe planned behavior\n",
+        'candidate_loop' => '',
+        'flow' => "discovery\n",
+        ...$overrides,
+    ];
+
+    Process::fake(function ($process) use ($test, $candidateSha, $outputs) {
+        return match ($process->command) {
+            ['git', 'worktree', 'list', '--porcelain'] => Process::result(output: (string) $outputs['inventory']),
+            ['git', 'status', '--porcelain'] => Process::result(output: (string) $outputs['status']),
+            ['git', 'diff', '--name-only', '--diff-filter=U'] => Process::result(output: (string) $outputs['conflicts']),
+            ['git', 'rev-parse', 'HEAD'] => Process::result(output: (string) $outputs['head']),
+            ['git', 'rev-parse', 'HEAD^{tree}'] => Process::result(output: (string) $outputs['tree']),
+            ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'] => Process::result(output: (string) $outputs['common']),
+            ['git', 'merge-base', '--is-ancestor', $test->headSha, $candidateSha] => Process::result(exitCode: (int) $outputs['ancestor_exit']),
+            ['git', 'diff', '--name-only', $test->headSha.'..'.$candidateSha] => Process::result(output: (string) $outputs['changes']),
+            ['git', 'log', '--format=%s', $test->headSha.'..'.$candidateSha] => Process::result(output: (string) $outputs['subjects']),
+            ['git', 'ls-tree', '-r', '--name-only', $candidateSha, '--', '.loop'] => Process::result(output: (string) $outputs['candidate_loop']),
+            [realpath($test->repositoryPath.'/bin/loop-flow'), 'status', '--worktree='.$test->worktreePath] => Process::result(output: (string) $outputs['flow']),
+            default => throw new RuntimeException('Unexpected planning outcome command.'),
+        };
+    })->preventStrayProcesses();
+}
+
 it('verifies the exact retained Orbit planning repository state without rerunning checks', function () {
     fakePlanningRepositoryInspection($this);
 
@@ -247,6 +284,43 @@ it('rejects changed retained issue snapshot state', function (string $case) {
     ))->toThrow(OrbitRepositoryFailed::class);
 })->with(['bytes', 'mode', 'symlink']);
 
+it('accepts an exact descendant made only of planner-owned docs commits', function () {
+    $candidateSha = str_repeat('f', 40);
+    fakePlanningOutcomeInspection($this, $candidateSha);
+
+    $verified = app(ProcessOrbitRepository::class)->verifyPlanningOutcome(
+        $this->config,
+        $this->worktree,
+        $this->snapshot,
+        $candidateSha,
+        null,
+    );
+
+    expect($verified->candidateSha)->toBe($candidateSha)
+        ->and($verified->treeSha)->toBe(str_repeat('e', 40))
+        ->and($verified->artifactSha)->toBeNull()
+        ->and($verified->planContentsHash)->toBeNull();
+    Process::assertRanTimes(fn () => true, 11);
+});
+
+it('rejects planning candidates outside the docs-only descendant boundary', function (array $overrides) {
+    $candidateSha = str_repeat('f', 40);
+    fakePlanningOutcomeInspection($this, $candidateSha, $overrides);
+
+    expect(fn () => app(ProcessOrbitRepository::class)->verifyPlanningOutcome(
+        $this->config,
+        $this->worktree,
+        $this->snapshot,
+        $candidateSha,
+        null,
+    ))->toThrow(OrbitRepositoryFailed::class);
+})->with([
+    'product change' => [['changes' => "apps/gateway/app/Changed.php\n"]],
+    'non-docs commit subject' => [['subjects' => "feat: changed behavior\n"]],
+    'unrelated candidate' => [['ancestor_exit' => 1]],
+    'tracked loop artifact' => [['candidate_loop' => ".loop/plan.md\n"]],
+]);
+
 it('verifies a saved planning artifact and its pending verdict through Orbit plan-lint', function () {
     $artifactSha = str_repeat('d', 40);
     $plan = "Plan format: 1\nIssue: ORB-234\nFlow: discovery\nReview verdict: PENDING\n";
@@ -255,6 +329,14 @@ it('verifies a saved planning artifact and its pending verdict through Orbit pla
     Process::fake(function ($process) use ($artifactSha, $plan, $validator) {
         return match ($process->command) {
             [$validator, 'verify', 'ORB-234', '--worktree='.$this->worktreePath, '--artifact='.$artifactSha] => Process::result(output: "passed\n"),
+            ['git', 'cat-file', '-t', $this->headSha],
+            ['git', 'cat-file', '-t', $artifactSha] => Process::result(output: "commit\n"),
+            ['git', 'rev-list', '--parents', '-n', '1', $artifactSha] => Process::result(output: "{$artifactSha} {$this->headSha}\n"),
+            ['git', 'ls-tree', '-r', '--name-only', $this->headSha, '--', '.loop'] => Process::result(),
+            ['git', 'diff', '--name-only', $this->headSha, $artifactSha, '--', '.', ':(exclude).loop'] => Process::result(),
+            ['git', 'ls-tree', '-r', $artifactSha, '--', '.loop'] => Process::result(
+                output: '100644 blob '.str_repeat('e', 40)."\t.loop/plan.md\n",
+            ),
             ['git', 'show', $artifactSha.':.loop/plan.md'] => Process::result(output: $plan),
             default => throw new RuntimeException('Unexpected planning artifact command.'),
         };
@@ -269,7 +351,7 @@ it('verifies a saved planning artifact and its pending verdict through Orbit pla
 
     expect($verified->artifactSha)->toBe($artifactSha)
         ->and($verified->planContentsHash)->toBe(hash('sha256', $plan));
-    Process::assertRanTimes(fn () => true, 2);
+    Process::assertRanTimes(fn () => true, 8);
 });
 
 it('rejects a failed Orbit plan-lint verification', function () {
@@ -307,6 +389,14 @@ it('rejects a saved planning artifact without an exact pending verdict', functio
     Process::fake(function ($process) use ($artifactSha, $validator) {
         return match ($process->command) {
             [$validator, 'verify', 'ORB-234', '--worktree='.$this->worktreePath, '--artifact='.$artifactSha] => Process::result(output: "passed\n"),
+            ['git', 'cat-file', '-t', $this->headSha],
+            ['git', 'cat-file', '-t', $artifactSha] => Process::result(output: "commit\n"),
+            ['git', 'rev-list', '--parents', '-n', '1', $artifactSha] => Process::result(output: "{$artifactSha} {$this->headSha}\n"),
+            ['git', 'ls-tree', '-r', '--name-only', $this->headSha, '--', '.loop'] => Process::result(),
+            ['git', 'diff', '--name-only', $this->headSha, $artifactSha, '--', '.', ':(exclude).loop'] => Process::result(),
+            ['git', 'ls-tree', '-r', $artifactSha, '--', '.loop'] => Process::result(
+                output: '100644 blob '.str_repeat('e', 40)."\t.loop/plan.md\n",
+            ),
             ['git', 'show', $artifactSha.':.loop/plan.md'] => Process::result(output: "Review verdict: PASS\n"),
             default => throw new RuntimeException('Unexpected planning artifact command.'),
         };
@@ -318,4 +408,70 @@ it('rejects a saved planning artifact without an exact pending verdict', functio
         'ORB-234',
         $artifactSha,
     ))->toThrow(OrbitRepositoryFailed::class, 'must have a PENDING review verdict');
+});
+
+it('rejects a planning artifact whose sole parent is not the submitted candidate', function () {
+    $artifactSha = str_repeat('d', 40);
+    $validator = realpath($this->repositoryPath.'/bin/plan-lint');
+
+    Process::fake(function ($process) use ($artifactSha, $validator) {
+        return match ($process->command) {
+            [$validator, 'verify', 'ORB-234', '--worktree='.$this->worktreePath, '--artifact='.$artifactSha] => Process::result(output: "passed\n"),
+            ['git', 'cat-file', '-t', $this->headSha],
+            ['git', 'cat-file', '-t', $artifactSha] => Process::result(output: "commit\n"),
+            ['git', 'rev-list', '--parents', '-n', '1', $artifactSha] => Process::result(
+                output: $artifactSha.' '.str_repeat('0', 40)."\n",
+            ),
+            ['git', 'ls-tree', '-r', '--name-only', $this->headSha, '--', '.loop'],
+            ['git', 'diff', '--name-only', $this->headSha, $artifactSha, '--', '.', ':(exclude).loop'] => Process::result(),
+            ['git', 'ls-tree', '-r', $artifactSha, '--', '.loop'] => Process::result(
+                output: '100644 blob '.str_repeat('e', 40)."\t.loop/plan.md\n",
+            ),
+            ['git', 'show', $artifactSha.':.loop/plan.md'] => Process::result(
+                output: "Review verdict: PENDING\n",
+            ),
+            default => throw new RuntimeException('Unexpected planning artifact command.'),
+        };
+    })->preventStrayProcesses();
+
+    expect(fn () => app(ProcessOrbitRepository::class)->verifyPlanningArtifact(
+        $this->config,
+        $this->worktree,
+        'ORB-234',
+        $artifactSha,
+    ))->toThrow(OrbitRepositoryFailed::class, 'not bound to the exact candidate');
+});
+
+it('rejects a planning artifact that changes the candidate product tree', function () {
+    $artifactSha = str_repeat('d', 40);
+    $validator = realpath($this->repositoryPath.'/bin/plan-lint');
+
+    Process::fake(function ($process) use ($artifactSha, $validator) {
+        return match ($process->command) {
+            [$validator, 'verify', 'ORB-234', '--worktree='.$this->worktreePath, '--artifact='.$artifactSha] => Process::result(output: "passed\n"),
+            ['git', 'cat-file', '-t', $this->headSha],
+            ['git', 'cat-file', '-t', $artifactSha] => Process::result(output: "commit\n"),
+            ['git', 'rev-list', '--parents', '-n', '1', $artifactSha] => Process::result(
+                output: "{$artifactSha} {$this->headSha}\n",
+            ),
+            ['git', 'ls-tree', '-r', '--name-only', $this->headSha, '--', '.loop'] => Process::result(),
+            ['git', 'diff', '--name-only', $this->headSha, $artifactSha, '--', '.', ':(exclude).loop'] => Process::result(
+                output: "app/Changed.php\n",
+            ),
+            ['git', 'ls-tree', '-r', $artifactSha, '--', '.loop'] => Process::result(
+                output: '100644 blob '.str_repeat('e', 40)."\t.loop/plan.md\n",
+            ),
+            ['git', 'show', $artifactSha.':.loop/plan.md'] => Process::result(
+                output: "Review verdict: PENDING\n",
+            ),
+            default => throw new RuntimeException('Unexpected planning artifact command.'),
+        };
+    })->preventStrayProcesses();
+
+    expect(fn () => app(ProcessOrbitRepository::class)->verifyPlanningArtifact(
+        $this->config,
+        $this->worktree,
+        'ORB-234',
+        $artifactSha,
+    ))->toThrow(OrbitRepositoryFailed::class, 'not bound to the exact candidate');
 });

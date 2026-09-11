@@ -6,10 +6,11 @@ namespace App\Delivery\Actions;
 
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
-use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
+use App\Models\Delivery;
 use App\Models\ExternalEvent;
+use App\Models\PhaseRun;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
@@ -76,8 +77,35 @@ final readonly class CaptureHerdrEvent
             return;
         }
 
-        $shouldAdvance = DB::transaction(function () use ($event, $dispatch): bool {
-            $locked = AgentDispatch::query()->whereKey($dispatch->id)->lockForUpdate()->firstOrFail();
+        $deliveryId = PhaseRun::query()->whereKey($dispatch->phase_run_id)->value('delivery_id');
+
+        if (! is_int($deliveryId)) {
+            $event->failure_message = 'unmatched_dispatch';
+            $event->save();
+
+            return;
+        }
+
+        $shouldAdvance = DB::transaction(function () use ($event, $dispatch, $deliveryId): bool {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $phaseRun = PhaseRun::query()
+                ->whereKey($dispatch->phase_run_id)
+                ->where('delivery_id', $delivery->id)
+                ->lockForUpdate()
+                ->first();
+            $locked = AgentDispatch::query()
+                ->whereKey($dispatch->id)
+                ->where('phase_run_id', $dispatch->phase_run_id)
+                ->lockForUpdate()
+                ->first();
+
+            if ($phaseRun === null || $locked === null) {
+                $event->failure_message = 'unmatched_dispatch';
+                $event->save();
+
+                return false;
+            }
+
             $promptWasAttempted = $locked->status === AgentDispatchStatus::Starting
                 && $locked->error_code === 'herdr_prompt_attempted';
 
@@ -95,20 +123,18 @@ final readonly class CaptureHerdrEvent
                 $locked->save();
             }
 
-            $phaseRun = $locked->phaseRun()->with('delivery')->firstOrFail();
             $event->delivery_id = $phaseRun->delivery_id;
             $event->agent_dispatch_id = $locked->id;
             $event->failure_message = null;
             $event->save();
 
             if ($promptWasAttempted
-                && $phaseRun->delivery->status === DeliveryStatus::Preparing) {
-                $phaseRun->delivery->status = DeliveryStatus::WaitingForAgent;
-                $phaseRun->delivery->save();
+                && $delivery->status === DeliveryStatus::Preparing) {
+                $delivery->status = DeliveryStatus::WaitingForAgent;
+                $delivery->save();
             }
 
-            return $phaseRun->delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
-                || $phaseRun->delivery->workflow_version !== OrbitFeatureWorkflow::VERSION;
+            return true;
         });
 
         if ($shouldAdvance) {

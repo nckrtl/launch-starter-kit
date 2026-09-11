@@ -9,6 +9,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitPlanningReceiptFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
@@ -21,7 +22,7 @@ final readonly class CaptureOrbitPlanningReceipt
     {
         $hash = hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR));
 
-        return DB::transaction(function () use ($phaseRun, $dispatch, $payload, $hash): Receipt {
+        $receipt = DB::transaction(function () use ($phaseRun, $dispatch, $payload, $hash): Receipt {
             $lockedPhase = PhaseRun::query()->with('delivery')->lockForUpdate()->find($phaseRun->id);
             $lockedDispatch = AgentDispatch::query()
                 ->whereKey($dispatch->id)
@@ -61,13 +62,17 @@ final readonly class CaptureOrbitPlanningReceipt
                 'schema_version' => 1,
                 'payload' => $payload,
                 'payload_hash' => $hash,
-                'candidate_sha' => $lockedPhase->delivery->candidate_sha,
+                'candidate_sha' => $payload['candidate_sha'],
                 'validation_status' => ReceiptValidationStatus::Valid,
                 'validation_errors' => null,
                 'captured_at' => now(),
                 'validated_at' => now(),
             ]);
         });
+
+        AdvanceDelivery::dispatch($phaseRun->delivery_id)->afterCommit();
+
+        return $receipt;
     }
 
     /** @param array<string, mixed> $payload */
@@ -90,7 +95,8 @@ final readonly class CaptureOrbitPlanningReceipt
             && ($payload['attempt'] ?? null) === $phaseRun->attempt
             && in_array($payload['result'] ?? null, ['ready', 'blocked'], true)
             && ($payload['worktree'] ?? null) === $delivery->worktree_path
-            && ($payload['candidate_sha'] ?? null) === $delivery->candidate_sha
+            && is_string($payload['candidate_sha'] ?? null)
+            && preg_match('/^[a-f0-9]{40}$/', $payload['candidate_sha']) === 1
             && is_string($payload['handoff_path'] ?? null)
             && str_starts_with($payload['handoff_path'], '.loop/')
             && is_string($payload['handoff'] ?? null)

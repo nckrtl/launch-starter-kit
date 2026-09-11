@@ -386,17 +386,21 @@ final readonly class DispatchOrbitPlanning
             }
 
             $lockedDispatch->state_change_seq = $prompted->stateChangeSeq;
+            $lockedDispatch->error_code = null;
+            $lockedDispatch->error_message = null;
 
             if ($promptWasAttempted) {
                 $lockedDispatch->status = AgentDispatchStatus::Waiting;
-                $lockedDispatch->error_code = null;
-                $lockedDispatch->error_message = null;
             }
 
             $lockedDispatch->save();
-            $lockedDelivery->status = DeliveryStatus::WaitingForAgent;
-            $lockedDelivery->failure_details = null;
-            $lockedDelivery->save();
+
+            if ($lockedDelivery->current_phase === OrbitFeatureWorkflow::INITIAL_PHASE
+                && in_array($lockedDelivery->status, [DeliveryStatus::Preparing, DeliveryStatus::WaitingForAgent], true)) {
+                $lockedDelivery->status = DeliveryStatus::WaitingForAgent;
+                $lockedDelivery->failure_details = null;
+                $lockedDelivery->save();
+            }
         });
 
         return $dispatch->refresh();

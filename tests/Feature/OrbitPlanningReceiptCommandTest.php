@@ -6,6 +6,7 @@ use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
+use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
@@ -98,11 +99,20 @@ afterEach(function () {
 function fakeOrbitPlanningReceiptProcesses(object $test, ?string $head = null): void
 {
     $validator = realpath($test->repositoryPath.'/bin/plan-lint');
+    $candidate = $head ?? $test->headSha;
 
-    Process::fake(function ($process) use ($test, $head, $validator) {
+    Process::fake(function ($process) use ($test, $candidate, $validator) {
         return match ($process->command) {
-            ['git', 'rev-parse', 'HEAD'] => Process::result(output: ($head ?? $test->headSha)."\n"),
+            ['git', 'rev-parse', 'HEAD'] => Process::result(output: $candidate."\n"),
             [$validator, 'verify', 'ORB-234', '--worktree='.$test->worktreePath, '--artifact='.$test->artifactSha] => Process::result(output: "passed\n"),
+            ['git', 'cat-file', '-t', $candidate],
+            ['git', 'cat-file', '-t', $test->artifactSha] => Process::result(output: "commit\n"),
+            ['git', 'rev-list', '--parents', '-n', '1', $test->artifactSha] => Process::result(output: "{$test->artifactSha} {$candidate}\n"),
+            ['git', 'ls-tree', '-r', '--name-only', $candidate, '--', '.loop'] => Process::result(),
+            ['git', 'diff', '--name-only', $candidate, $test->artifactSha, '--', '.', ':(exclude).loop'] => Process::result(),
+            ['git', 'ls-tree', '-r', $test->artifactSha, '--', '.loop'] => Process::result(
+                output: '100644 blob '.str_repeat('f', 40)."\t.loop/plan.md\n",
+            ),
             ['git', 'show', $test->artifactSha.':.loop/plan.md'] => Process::result(output: $test->plan),
             default => throw new RuntimeException('Unexpected Orbit planning receipt command.'),
         };
@@ -136,14 +146,14 @@ it('captures one immutable idempotent ready planning receipt', function () {
             'artifact_sha' => $this->artifactSha,
             'plan_sha256' => hash('sha256', $this->plan),
         ]);
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 
     $this->artisan('delivery:submit-orbit-receipt', $this->arguments)
         ->expectsOutput('Orbit planning receipt 1 was already captured.')
         ->assertSuccessful();
 
     expect(Receipt::count())->toBe(1);
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 2);
 });
 
 it('rejects a different second planning receipt', function () {
@@ -156,7 +166,7 @@ it('rejects a different second planning receipt', function () {
 
     expect(Receipt::count())->toBe(1)
         ->and(Receipt::sole()->payload['handoff'])->toBe('Planning completed.');
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('captures a blocked planning receipt without an artifact or plan validation', function () {
@@ -172,7 +182,7 @@ it('captures a blocked planning receipt without an artifact or plan validation',
         ->and(Receipt::sole()->payload['artifact_sha'])->toBeNull()
         ->and(Receipt::sole()->payload['plan_sha256'])->toBeNull();
     Process::assertNotRan(fn ($process): bool => str_contains(implode(' ', $process->command), 'plan-lint'));
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('accepts a valid receipt after Herdr settles the exact planning dispatch', function () {
@@ -185,7 +195,7 @@ it('accepts a valid receipt after Herdr settles the exact planning dispatch', fu
 
     expect(Receipt::sole()->payload['dispatch_id'])->toBe($this->dispatch->id)
         ->and(Receipt::sole()->validation_status)->toBe(ReceiptValidationStatus::Valid);
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('accepts a receipt that proves a prompt reached the worker before the prompt RPC returns', function () {
@@ -198,7 +208,7 @@ it('accepts a receipt that proves a prompt reached the worker before the prompt 
 
     expect(Receipt::sole()->payload['dispatch_id'])->toBe($this->dispatch->id)
         ->and(Receipt::sole()->validation_status)->toBe(ReceiptValidationStatus::Valid);
-    Queue::assertNothingPushed();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('requires the exact active planning dispatch', function () {
@@ -269,14 +279,15 @@ it('requires a ready artifact and forbids one for blocked planning', function (s
     'blocked with artifact' => ['blocked', str_repeat('c', 40)],
 ]);
 
-it('rejects a worktree head that no longer matches the recorded candidate', function () {
-    fakeOrbitPlanningReceiptProcesses($this, str_repeat('e', 40));
+it('captures a docs-updated planning candidate for advancement verification', function () {
+    $candidate = str_repeat('e', 40);
+    fakeOrbitPlanningReceiptProcesses($this, $candidate);
 
     $this->artisan('delivery:submit-orbit-receipt', $this->arguments)
-        ->expectsOutput('The worktree HEAD does not match the recorded planning candidate.')
-        ->assertFailed();
+        ->assertSuccessful();
 
-    expect(Receipt::count())->toBe(0);
-    Process::assertRanTimes(fn () => true, 1);
-    Queue::assertNothingPushed();
+    expect(Receipt::sole()->candidate_sha)->toBe($candidate)
+        ->and(Receipt::sole()->payload['candidate_sha'])->toBe($candidate);
+    Process::assertRanTimes(fn () => true, 9);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });

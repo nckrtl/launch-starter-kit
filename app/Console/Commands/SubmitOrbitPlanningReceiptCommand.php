@@ -108,8 +108,8 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
 
         $headSha = trim($head->output());
 
-        if ($head->failed() || $headSha !== $phaseRun->delivery->candidate_sha) {
-            $this->error('The worktree HEAD does not match the recorded planning candidate.');
+        if ($head->failed() || preg_match('/^[a-f0-9]{40}$/', $headSha) !== 1) {
+            $this->error('The worktree HEAD is not a valid planning candidate.');
 
             return self::FAILURE;
         }

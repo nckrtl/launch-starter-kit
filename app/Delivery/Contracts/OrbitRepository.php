@@ -11,6 +11,7 @@ use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
+use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 
 interface OrbitRepository
@@ -34,6 +35,14 @@ interface OrbitRepository
         string $issueKey,
         string $artifactSha,
     ): VerifiedOrbitPlanningArtifact;
+
+    public function verifyPlanningOutcome(
+        OrbitProjectConfig $config,
+        PreparedWorktree $startupWorktree,
+        PreparedIssueSnapshot $snapshot,
+        string $candidateSha,
+        ?string $artifactSha,
+    ): VerifiedOrbitPlanningOutcome;
 
     public function writeIssueSnapshot(
         OrbitProjectConfig $config,
