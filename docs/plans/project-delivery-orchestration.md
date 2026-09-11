@@ -98,6 +98,16 @@ matched, none were missing, and none had a pending Tom notification. This
 proves live listener-capture parity only. End-to-end issue delivery parity is
 still required before the normal entry point can move.
 
+Live canaries use the `controller:commander` Linear label as an explicit
+ownership handoff. Commander requires a complete, valid label page before
+preparation, rejects a concurrent `maintenance:monorepo` label, and checks the
+handoff again on the final issue read. The legacy semantic monitor excludes
+only complete, non-conflicting Commander ownership from its active, Todo,
+maintenance, capacity, and recovery routing. Unlabeled or conflicting issues
+remain on the legacy path, while an incomplete or malformed page exposing the
+Commander label is held from legacy Todo admission. This boundary remains in
+place until the normal entry point is deliberately cut over.
+
 ## Ownership boundaries
 
 ### Commander

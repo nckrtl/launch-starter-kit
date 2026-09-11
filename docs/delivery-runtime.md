@@ -51,9 +51,15 @@ Start a deliberate live canary without changing the normal Orbit entry point:
 php artisan delivery:start-orbit orbit ORB-234
 ```
 
-The command resolves the stable Linear UUID from the issue key, uses the same
-controller reservation as the legacy loop, runs the trusted worktree and
-candidate checks, writes the live ledger, and queues `AdvanceDelivery`.
+The issue must have a complete Linear label page containing
+`controller:commander` and must not also have `maintenance:monorepo`. That is
+the exclusive ownership handoff: the legacy semantic monitor omits only valid
+Commander-owned issues from its queue, capacity, and recovery state, while
+Commander rejects missing, incomplete, malformed, or conflicting ownership.
+It checks ownership again on the final issue read before writing the delivery
+ledger. The command resolves the stable Linear UUID from the issue key, uses
+the same controller reservation as the legacy loop, runs the trusted worktree
+and candidate checks, writes the live ledger, and queues `AdvanceDelivery`.
 
 This worker does not cut over Orbit's feature loop. Until shadow parity and the
 reconciliation runtime are proven, `/home/nckrtl/orbit/bin/loop` continues to

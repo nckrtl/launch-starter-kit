@@ -97,7 +97,15 @@ beforeEach(function () {
     $this->issueProvider = new ShadowCommandIssueProvider(new OrbitIssueSnapshot(
         issueId: shadowIssueId(),
         issueKey: 'ORB-234',
-        payload: ['id' => shadowIssueId(), 'identifier' => 'ORB-234', 'title' => 'Test issue'],
+        payload: [
+            'id' => shadowIssueId(),
+            'identifier' => 'ORB-234',
+            'title' => 'Test issue',
+            'labels' => [
+                'nodes' => [['name' => 'controller:commander'], ['name' => 'docs']],
+                'pageInfo' => ['hasNextPage' => false],
+            ],
+        ],
         contractHash: str_repeat('e', 64),
     ));
     app()->instance(OrbitIssueProvider::class, $this->issueProvider);
@@ -154,6 +162,25 @@ function runOrbitCommand(string $project, string $issueKey): array
 function shadowIssueId(): string
 {
     return '11111111-2222-4333-8444-555555555555';
+}
+
+function expectOrbitControllerReservationReleased(string $commonDirectory): void
+{
+    $handle = fopen($commonDirectory.'/orbit-delivery/v1/orb-234/controller.lock', 'c+');
+
+    if ($handle === false) {
+        throw new RuntimeException('Could not inspect the released legacy controller lock.');
+    }
+
+    $acquired = flock($handle, LOCK_EX | LOCK_NB);
+
+    if ($acquired) {
+        flock($handle, LOCK_UN);
+    }
+
+    fclose($handle);
+
+    expect($acquired)->toBeTrue();
 }
 
 /** @return array<string, mixed> */
@@ -315,11 +342,141 @@ it('does not start a live Orbit delivery when key resolution fails', function ()
     Process::assertNothingRan();
 });
 
+it('does not start a live Orbit delivery without explicit Commander ownership', function () {
+    $this->issueProvider = new ShadowCommandIssueProvider(new OrbitIssueSnapshot(
+        issueId: shadowIssueId(),
+        issueKey: 'ORB-234',
+        payload: [
+            'id' => shadowIssueId(),
+            'identifier' => 'ORB-234',
+            'title' => 'Legacy-owned issue',
+            'labels' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
+        ],
+        contractHash: str_repeat('e', 64),
+    ));
+    app()->instance(OrbitIssueProvider::class, $this->issueProvider);
+    app()->instance(OrbitIssueResolver::class, $this->issueProvider);
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('Orbit issue [ORB-234] is not labeled [controller:commander].')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234'])
+        ->and($this->issueProvider->requests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
+});
+
+it('rejects incomplete or invalid ownership label data before preparation', function (mixed $labels) {
+    $payload = [
+        'id' => shadowIssueId(),
+        'identifier' => 'ORB-234',
+        'title' => 'Untrusted labels',
+    ];
+
+    if ($labels !== null) {
+        $payload['labels'] = $labels;
+    }
+
+    $this->issueProvider = new ShadowCommandIssueProvider(new OrbitIssueSnapshot(
+        issueId: shadowIssueId(),
+        issueKey: 'ORB-234',
+        payload: $payload,
+        contractHash: str_repeat('e', 64),
+    ));
+    app()->instance(OrbitIssueProvider::class, $this->issueProvider);
+    app()->instance(OrbitIssueResolver::class, $this->issueProvider);
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('Orbit issue [ORB-234] has incomplete or invalid label data.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234'])
+        ->and($this->issueProvider->requests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
+})->with([
+    'missing labels' => [null],
+    'labels are not an object' => ['invalid'],
+    'nodes are not a list' => [['nodes' => ['name' => 'controller:commander'], 'pageInfo' => ['hasNextPage' => false]]],
+    'label node is malformed' => [['nodes' => [['name' => 'controller:commander'], []], 'pageInfo' => ['hasNextPage' => false]]],
+    'pagination metadata is missing' => [['nodes' => [['name' => 'controller:commander']]]],
+    'label page is incomplete' => [['nodes' => [['name' => 'controller:commander']], 'pageInfo' => ['hasNextPage' => true]]],
+    'pagination flag is not boolean' => [['nodes' => [['name' => 'controller:commander']], 'pageInfo' => ['hasNextPage' => 0]]],
+]);
+
+it('rejects conflicting Commander and monorepo maintenance ownership before preparation', function (array $nodes) {
+    $this->issueProvider = new ShadowCommandIssueProvider(new OrbitIssueSnapshot(
+        issueId: shadowIssueId(),
+        issueKey: 'ORB-234',
+        payload: [
+            'id' => shadowIssueId(),
+            'identifier' => 'ORB-234',
+            'title' => 'Conflicting ownership',
+            'labels' => ['nodes' => $nodes, 'pageInfo' => ['hasNextPage' => false]],
+        ],
+        contractHash: str_repeat('e', 64),
+    ));
+    app()->instance(OrbitIssueProvider::class, $this->issueProvider);
+    app()->instance(OrbitIssueResolver::class, $this->issueProvider);
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('Orbit issue [ORB-234] has conflicting [controller:commander] and [maintenance:monorepo] labels.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234'])
+        ->and($this->issueProvider->requests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
+})->with([
+    'Commander label first' => [[['name' => 'controller:commander'], ['name' => 'maintenance:monorepo']]],
+    'maintenance label first' => [[['name' => 'maintenance:monorepo'], ['name' => 'controller:commander']]],
+]);
+
+it('rechecks Commander ownership on the final issue read', function () {
+    $this->issueProvider->freshSnapshot = new OrbitIssueSnapshot(
+        issueId: shadowIssueId(),
+        issueKey: 'ORB-234',
+        payload: [
+            'id' => shadowIssueId(),
+            'identifier' => 'ORB-234',
+            'title' => 'Ownership removed',
+            'labels' => ['nodes' => [['name' => 'docs']], 'pageInfo' => ['hasNextPage' => false]],
+        ],
+        contractHash: str_repeat('e', 64),
+    );
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('Orbit issue [ORB-234] is not labeled [controller:commander].')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234'])
+        ->and($this->issueProvider->requests)->toHaveCount(1);
+    Queue::assertNothingPushed();
+    Process::assertRanTimes(fn () => true, 5);
+    expectOrbitControllerReservationReleased($this->commonDirectory);
+});
+
 it('does not start a live Orbit delivery when its contract changes during preparation', function () {
     $this->issueProvider->freshSnapshot = new OrbitIssueSnapshot(
         issueId: shadowIssueId(),
         issueKey: 'ORB-234',
-        payload: ['id' => shadowIssueId(), 'identifier' => 'ORB-234', 'title' => 'Changed issue'],
+        payload: [
+            'id' => shadowIssueId(),
+            'identifier' => 'ORB-234',
+            'title' => 'Changed issue',
+            'labels' => [
+                'nodes' => [['name' => 'controller:commander']],
+                'pageInfo' => ['hasNextPage' => false],
+            ],
+        ],
         contractHash: str_repeat('f', 64),
     );
 
@@ -394,21 +551,7 @@ it('stops before worktree preparation when the issue snapshot cannot be trusted'
     Queue::assertNothingPushed();
     Process::assertNothingRan();
 
-    $handle = fopen($this->commonDirectory.'/orbit-delivery/v1/orb-234/controller.lock', 'c+');
-
-    if ($handle === false) {
-        throw new RuntimeException('Could not inspect the released legacy controller lock.');
-    }
-
-    $acquired = flock($handle, LOCK_EX | LOCK_NB);
-
-    if ($acquired) {
-        flock($handle, LOCK_UN);
-    }
-
-    fclose($handle);
-
-    expect($acquired)->toBeTrue();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
 });
 
 it('stops before fetching when the legacy controller owns the issue lock', function () {
