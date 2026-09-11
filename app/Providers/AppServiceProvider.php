@@ -8,12 +8,14 @@ use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
+use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
 use App\Delivery\IssueProviders\SshOrbitIssueTransitioner;
+use App\Delivery\PullRequests\SshOrbitPullRequestLandingGateway;
 use App\Delivery\PullRequests\SshOrbitPullRequestPublisher;
 use App\Delivery\PullRequests\SshOrbitPullRequestReviewPublisher;
 use App\Delivery\Repositories\ProcessOrbitRepository;
@@ -38,6 +40,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitIssueTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitReviewIssueTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitPullRequestInspector::class, SshOrbitPullRequestPublisher::class);
+        $this->app->bind(OrbitPullRequestLandingGateway::class, SshOrbitPullRequestLandingGateway::class);
         $this->app->bind(OrbitPullRequestPublisher::class, SshOrbitPullRequestPublisher::class);
         $this->app->bind(OrbitPullRequestReviewPublisher::class, SshOrbitPullRequestReviewPublisher::class);
 
