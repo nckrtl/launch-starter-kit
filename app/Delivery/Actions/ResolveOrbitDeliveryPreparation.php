@@ -18,6 +18,17 @@ final readonly class ResolveOrbitDeliveryPreparation
 {
     public function handle(Delivery $delivery): OrbitDeliveryPreparation
     {
+        $preparation = $this->startup($delivery);
+
+        if ($preparation->candidate->candidateSha !== $delivery->candidate_sha) {
+            throw new OrbitPlanningHandoffFailed('The Orbit preparation record does not match its delivery.');
+        }
+
+        return $preparation;
+    }
+
+    public function startup(Delivery $delivery): OrbitDeliveryPreparation
+    {
         $phase = $delivery->phaseRuns()->oldest('id')->first();
         $input = $phase?->input;
         $snapshot = is_array($input) ? ($input['issue_snapshot'] ?? null) : null;
@@ -66,13 +77,12 @@ final readonly class ResolveOrbitDeliveryPreparation
             || $preparedSnapshot->provider !== $delivery->external_issue_provider
             || preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $issueId) !== 1
             || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
-            || $preparedSnapshot->path !== rtrim($worktreePath, '/').'/.loop/issue.json'
-            || $candidateCheck->candidateSha !== $candidateSha) {
+            || $preparedSnapshot->path !== rtrim($worktreePath, '/').'/.loop/issue.json') {
             throw new OrbitPlanningHandoffFailed('The Orbit preparation record does not match its delivery.');
         }
 
         return new OrbitDeliveryPreparation(
-            new PreparedWorktree($worktreePath, $candidateSha),
+            new PreparedWorktree($worktreePath, $candidateCheck->candidateSha),
             $preparedSnapshot,
             $candidateCheck,
         );

@@ -20,6 +20,8 @@ final readonly class OrbitFeatureWorkflow
 
     public const int PLANNING_PROMPT_VERSION = 1;
 
+    public const int PLAN_REVIEW_PROMPT_VERSION = 1;
+
     public function planningPrompt(
         string $issueKey,
         string $worktree,
@@ -68,6 +70,63 @@ your verdict or advance the delivery. Correct a reported structural error before
 returning. If planning cannot complete, use `blocked` and include its
 classification, evidence, and smallest next action in the handoff. Return the
 receipt ID in your final response and stop.
+PROMPT;
+    }
+
+    /** @param array<string, mixed> $planningReceipt */
+    public function planReviewPrompt(
+        string $issueKey,
+        string $worktree,
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        string $receiptCommand,
+        array $planningReceipt,
+    ): string {
+        $receipt = json_encode(
+            $planningReceipt,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+
+        return <<<PROMPT
+Independently review the submitted implementation plan for {$issueKey}. Do not implement or rewrite the plan.
+
+Issue: {$issueKey}
+Worktree: {$worktree}
+Assigned phase: plan_review
+Flow: discovery
+Delivery: {$deliveryId}
+Phase run: {$phaseRunId}
+Dispatch: {$dispatchId}
+Current process skill: /home/nckrtl/orbit/.agents/skills/reviewing-feature-plans/SKILL.md
+
+Read that process and the assigned worktree guidance. Review the exact candidate and
+planning artifact identified by this immutable planning receipt:
+
+```json
+{$receipt}
+```
+
+Complete only the independent plan review. Do not edit documentation, product code,
+tests, the issue contract, Linear, or GitHub. Use Orbit's current `bin/plan-lint` and
+`bin/loop-artifacts save` commands as directed by the review skill. Write your complete
+handoff as a regular file inside `.loop/runtime/`.
+
+Before ending, run one receipt command from the assigned worktree root.
+
+Pass:
+`{$receiptCommand} --result=pass --handoff=.loop/runtime/plan-review-handoff.md --artifact=FULL_SHA`
+
+Fix:
+`{$receiptCommand} --result=fix --handoff=.loop/runtime/plan-review-handoff.md --artifact=FULL_SHA`
+
+Blocked:
+`{$receiptCommand} --result=blocked --handoff=.loop/runtime/plan-review-handoff.md`
+
+For pass or fix, replace `FULL_SHA` with the exact SHA printed by the saved artifact
+command. The receipt command validates and records your result; it does not choose the
+verdict or advance the delivery. Correct a reported structural error before returning.
+Return the receipt ID in your final response and stop.
 PROMPT;
     }
 }

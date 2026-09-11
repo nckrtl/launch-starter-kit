@@ -58,7 +58,7 @@ processes:
             - package.json
 
     Queue:
-        command: php artisan queue:listen --tries=1 --timeout=0
+        command: php artisan queue:listen --tries=0 --timeout=0
         auto_start: true
 
     Logs:

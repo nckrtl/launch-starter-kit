@@ -4,10 +4,13 @@ declare(strict_types=1);
 
 namespace App\Jobs;
 
-use App\Delivery\Actions\AdvanceDeliveryAction;
+use App\Delivery\Actions\DispatchOrbitPlanReview as DispatchAction;
 use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Models\Delivery;
 use Carbon\CarbonImmutable;
+use DateTimeInterface;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Contracts\Queue\ShouldQueueAfterCommit;
 use Illuminate\Foundation\Queue\Queueable;
@@ -15,11 +18,11 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
-final class AdvanceDelivery implements ShouldQueue, ShouldQueueAfterCommit
+final class DispatchOrbitPlanReview implements ShouldQueue, ShouldQueueAfterCommit
 {
     use Queueable;
 
-    public int $timeout = 45;
+    public int $timeout = 240;
 
     public int $tries = 0;
 
@@ -30,17 +33,17 @@ final class AdvanceDelivery implements ShouldQueue, ShouldQueueAfterCommit
 
     public function __construct(public readonly int $deliveryId)
     {
-        $this->retryDeadline = now()->addMinutes(5)->toImmutable();
+        $this->retryDeadline = now()->addMinutes(10)->toImmutable();
     }
 
-    public function retryUntil(): \DateTimeInterface
+    public function retryUntil(): DateTimeInterface
     {
         return $this->retryDeadline;
     }
 
-    public function handle(AdvanceDeliveryAction $advance): void
+    public function handle(DispatchAction $dispatch): void
     {
-        $lock = Cache::lock("delivery:advance:{$this->deliveryId}", 60);
+        $lock = Cache::lock("delivery:plan-review-dispatch:{$this->deliveryId}", 270);
 
         if (! $lock->get()) {
             $this->release(1);
@@ -49,13 +52,15 @@ final class AdvanceDelivery implements ShouldQueue, ShouldQueueAfterCommit
         }
 
         try {
-            $continue = $advance->handle($this->deliveryId);
+            $dispatch->handle($this->deliveryId);
+        } catch (OrbitPlanReviewDispatchFailed $exception) {
+            $delivery = Delivery::query()->find($this->deliveryId);
+
+            if ($delivery?->status !== DeliveryStatus::Blocked) {
+                throw $exception;
+            }
         } finally {
             $lock->release();
-        }
-
-        if ($continue) {
-            self::dispatch($this->deliveryId)->afterCommit();
         }
     }
 
@@ -66,14 +71,15 @@ final class AdvanceDelivery implements ShouldQueue, ShouldQueueAfterCommit
 
             if ($delivery === null
                 || $delivery->status->isTerminal()
-                || in_array($delivery->status, [DeliveryStatus::Blocked, DeliveryStatus::Paused], true)) {
+                || in_array($delivery->status, [DeliveryStatus::Blocked, DeliveryStatus::Paused], true)
+                || $delivery->current_phase !== OrbitFeatureWorkflow::PLAN_REVIEW_PHASE) {
                 return;
             }
 
             $delivery->status = DeliveryStatus::Failed;
             $delivery->failed_at = now();
             $delivery->failure_details = [
-                'code' => 'advancement_exhausted',
+                'code' => 'plan_review_dispatch_exhausted',
                 'message' => $exception?->getMessage(),
             ];
             $delivery->save();

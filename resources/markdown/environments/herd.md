@@ -64,7 +64,7 @@ bun run dev
 If you also want the queue worker and log tailer, start them separately:
 
 ```bash
-php artisan queue:listen --tries=1 --timeout=0
+php artisan queue:listen --tries=0 --timeout=0
 php artisan pail --timeout=0
 ```
 

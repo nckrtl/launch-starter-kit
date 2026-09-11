@@ -337,5 +337,19 @@ it('uses an after-commit job with a timeout below the database retry window', fu
     $job = new AdvanceDelivery($this->delivery->getKey());
 
     expect($job)->toBeInstanceOf(ShouldQueueAfterCommit::class)
+        ->and($job->tries)->toBe(0)
+        ->and($job->retryUntil() > now())->toBeTrue()
         ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'));
+});
+
+it('does not overwrite a specific blocked recovery state when advancement retries expire', function () {
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => ['code' => 'herdr_prompt_ambiguous'],
+    ])->save();
+
+    (new AdvanceDelivery($this->delivery->id))->failed(new RuntimeException('Queue exhausted.'));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details)->toBe(['code' => 'herdr_prompt_ambiguous']);
 });

@@ -60,7 +60,7 @@ rather than starting them by hand, in Solo, or through `composer dev`:
 orbit process:add vite 'vp dev --host' \
   --instance=my-app.development --restart-policy=on_failure
 
-orbit process:add queue 'php artisan queue:work --tries=3' \
+orbit process:add queue 'php artisan queue:work --tries=0' \
   --instance=my-app.development --restart-policy=always
 ```
 

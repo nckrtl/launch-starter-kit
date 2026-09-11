@@ -2,6 +2,7 @@
 
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
+use App\Delivery\Actions\DispatchOrbitPlanReview;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitRepository;
@@ -20,6 +21,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanningAdvancementFailed;
+use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
@@ -357,8 +359,8 @@ it('rejects inconsistent retained review intent instead of creating another atte
         ->forceFill(['prompt_name' => 'wrong'])
         ->save();
 
-    expect(fn () => $action->handle($this->delivery->id))
-        ->toThrow(OrbitPlanningAdvancementFailed::class, 'retained plan-review transition is inconsistent');
+    expect(fn () => app(DispatchOrbitPlanReview::class)->handle($this->delivery->id))
+        ->toThrow(OrbitPlanReviewDispatchFailed::class, 'retained Orbit plan-review intent is inconsistent');
 
     expect(PhaseRun::count())->toBe(2)
         ->and(AgentDispatch::count())->toBe(2);
@@ -373,8 +375,8 @@ it('rejects a retained review intent whose embedded receipt changed', function (
     $input['planning_receipt']['handoff'] = 'Changed after the transition.';
     $review->forceFill(['input' => $input])->save();
 
-    expect(fn () => $action->handle($this->delivery->id))
-        ->toThrow(OrbitPlanningAdvancementFailed::class, 'retained plan-review transition is inconsistent');
+    expect(fn () => app(DispatchOrbitPlanReview::class)->handle($this->delivery->id))
+        ->toThrow(OrbitPlanReviewDispatchFailed::class, 'immutable planning receipt');
 
     expect(PhaseRun::count())->toBe(2)
         ->and(AgentDispatch::count())->toBe(2);
