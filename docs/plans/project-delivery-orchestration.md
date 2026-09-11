@@ -84,9 +84,10 @@ repository checks still support only discovery. Before proof is enabled, move
 the potentially hour-long topology operation out of the 540-second landing job
 envelope and bind every prompt and repository check to the delivery's immutable
 flow. The discovery workflow now reaches Commander `Completed`. The normal
-`bin/loop ISSUE` entry point still invokes the legacy controller. Add the
-dedicated Commander queue worker and reconciliation runtime, then route the
-entry point through Commander after live shadow parity passes.
+`bin/loop ISSUE` entry point still invokes the legacy controller. Commander now
+ships a dedicated, restartable systemd queue-worker unit with timeouts bounded
+below the database queue reservation. Add the reconciliation runtime next, then
+route the entry point through Commander after live shadow parity passes.
 
 ## Ownership boundaries
 
