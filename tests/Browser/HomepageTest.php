@@ -1,9 +1,23 @@
 <?php
 
+use Illuminate\Cache\Repository;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Route;
 
 beforeEach(function () {
     config(['commander.herdr.sessions' => []]);
+    Cache::put('commander:hermes:snapshot', [
+        'status' => 'online',
+        'node' => 'mini',
+        'profiles' => [],
+        'boards' => [],
+        'signals' => [],
+    ], 60);
+    Cache::put(
+        Repository::FLEXIBLE_CREATED_KEY_PREFIX.'commander:hermes:snapshot',
+        now()->getTimestamp(),
+        60,
+    );
 });
 
 it('renders the Commander operations dashboard without javascript errors', function () {

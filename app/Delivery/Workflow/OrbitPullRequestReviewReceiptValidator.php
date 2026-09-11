@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Delivery\Workflow;
 
+use App\Delivery\Enums\AgentDispatchStatus;
+use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -22,27 +24,46 @@ final readonly class OrbitPullRequestReviewReceiptValidator
         PhaseRun $phase,
         AgentDispatch $dispatch,
         Receipt $receipt,
+        bool $retainedTransition = false,
     ): bool {
         return $receipt->phase_run_id === $phase->id
             && $receipt->kind === 'orbit_pr_review'
             && $receipt->schema_version === 1
             && $receipt->validation_status === ReceiptValidationStatus::Valid
+            && $receipt->validated_at !== null
             && hash_equals(
                 $receipt->payload_hash,
                 hash('sha256', json_encode($receipt->payload, JSON_THROW_ON_ERROR)),
             )
             && $receipt->candidate_sha === ($receipt->payload['candidate_sha'] ?? null)
-            && $this->matchesPayload($delivery, $phase, $dispatch, $receipt->payload);
+            && $this->matchesPayload(
+                $delivery,
+                $phase,
+                $dispatch,
+                $receipt->payload,
+                $retainedTransition,
+            );
     }
 
-    public function matchesInput(Delivery $delivery, PhaseRun $phase, AgentDispatch $dispatch): bool
-    {
-        $source = $this->sources->sourceReceipt($delivery, $phase);
+    public function matchesInput(
+        Delivery $delivery,
+        PhaseRun $phase,
+        AgentDispatch $dispatch,
+        bool $retainedTransition = false,
+    ): bool {
+        $source = $this->sources->sourceReceipt($delivery, $phase, $retainedTransition);
         $pullRequest = $this->pullRequestInput($phase);
 
         return $source !== null
             && $pullRequest !== null
-            && $this->matchesDispatch($delivery, $phase, $dispatch, $source, $pullRequest);
+            && $this->matchesDispatch(
+                $delivery,
+                $phase,
+                $dispatch,
+                $source,
+                $pullRequest,
+                $retainedTransition,
+            );
     }
 
     /** @param array<string, mixed> $payload */
@@ -51,8 +72,9 @@ final readonly class OrbitPullRequestReviewReceiptValidator
         PhaseRun $phase,
         AgentDispatch $dispatch,
         array $payload,
+        bool $retainedTransition = false,
     ): bool {
-        $source = $this->sources->sourceReceipt($delivery, $phase);
+        $source = $this->sources->sourceReceipt($delivery, $phase, $retainedTransition);
         $sourcePayload = $source?->payload;
         $artifact = is_array($sourcePayload) ? ($sourcePayload['artifact_sha'] ?? null) : null;
         $gate = is_array($sourcePayload) ? ($sourcePayload['gate_receipt_path'] ?? null) : null;
@@ -85,7 +107,7 @@ final readonly class OrbitPullRequestReviewReceiptValidator
             && str_starts_with($payload['handoff_path'], '.loop/')
             && is_string($payload['handoff'] ?? null)
             && trim($payload['handoff']) !== ''
-            && $this->matchesInput($delivery, $phase, $dispatch)
+            && $this->matchesInput($delivery, $phase, $dispatch, $retainedTransition)
             && $this->matchesBody($delivery, $payload, $artifact, $gate);
     }
 
@@ -96,6 +118,7 @@ final readonly class OrbitPullRequestReviewReceiptValidator
         AgentDispatch $dispatch,
         Receipt $source,
         array $pullRequest,
+        bool $retainedTransition,
     ): bool {
         $config = $delivery->projectOrchestration->config;
         $expectedPrompt = $this->workflow->pullRequestReviewPrompt(
@@ -132,12 +155,18 @@ final readonly class OrbitPullRequestReviewReceiptValidator
             && $dispatch->prompt_version === 1
             && hash_equals($dispatch->prompt_hash, hash('sha256', $expectedPrompt))
             && $dispatch->herdr_session === ($config['herdrSession'] ?? null)
-            && is_string($dispatch->herdr_workspace_id)
-            && is_string($dispatch->herdr_tab_id)
-            && is_string($dispatch->herdr_pane_id)
-            && is_string($dispatch->herdr_terminal_id)
-            && is_string($dispatch->herdr_agent_id)
+            && is_string($dispatch->herdr_workspace_id) && trim($dispatch->herdr_workspace_id) !== ''
+            && is_string($dispatch->herdr_tab_id) && trim($dispatch->herdr_tab_id) !== ''
+            && is_string($dispatch->herdr_pane_id) && trim($dispatch->herdr_pane_id) !== ''
+            && is_string($dispatch->herdr_terminal_id) && trim($dispatch->herdr_terminal_id) !== ''
+            && is_string($dispatch->herdr_agent_id) && trim($dispatch->herdr_agent_id) !== ''
             && $dispatch->dispatched_at !== null
+            && (! $retainedTransition || (
+                $phase->status === PhaseRunStatus::Completed
+                && $phase->finished_at !== null
+                && $dispatch->status === AgentDispatchStatus::Settled
+                && $dispatch->settled_at !== null
+            ))
             && $this->isIndependentFromBuilders($delivery, $dispatch);
     }
 

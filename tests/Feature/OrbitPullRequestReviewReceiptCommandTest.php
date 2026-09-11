@@ -1,30 +1,47 @@
 <?php
 
+use App\Delivery\Actions\AdvanceDeliveryAction;
+use App\Delivery\Actions\AdvanceOrbitPullRequestReview;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\StartOrbitDelivery;
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
+use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
+use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\OrbitDeliveryReservation;
+use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\PublishedOrbitPullRequest;
+use App\Delivery\Data\PublishedOrbitPullRequestReview;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
+use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
+use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
+use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
+use App\Delivery\Exceptions\OrbitIssueContractChanged;
+use App\Delivery\Exceptions\OrbitPullRequestReviewAdvancementFailed;
+use App\Delivery\Exceptions\OrbitPullRequestReviewPublicationFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPullRequestReviewReceiptValidator;
 use App\Jobs\AdvanceDelivery;
+use App\Jobs\AdvanceOrbitPullRequestReview as AdvancePullRequestReviewJob;
+use App\Jobs\DispatchOrbitImplementation;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
@@ -115,6 +132,177 @@ final class PullRequestReviewReceiptPullRequests implements OrbitPullRequestInsp
             candidateSha: $candidateSha,
             bodyHash: hash('sha256', $pullRequestBody),
             mergeable: $this->mergeable,
+        );
+    }
+}
+
+final class PullRequestReviewAdvanceRepository implements OrbitRepository
+{
+    public int $transactionLevel = 0;
+
+    public mixed $reservationHandle = null;
+
+    public ?Closure $afterReserve = null;
+
+    public function reserveDelivery(OrbitProjectConfig $config, string $issueKey): OrbitDeliveryReservation
+    {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($issueKey)->toBe('ORB-234');
+        $handle = tmpfile();
+
+        if ($handle === false || ! flock($handle, LOCK_EX)) {
+            throw new RuntimeException('Could not reserve review advancement.');
+        }
+
+        $this->reservationHandle = $handle;
+
+        if ($this->afterReserve instanceof Closure) {
+            ($this->afterReserve)();
+        }
+
+        return new OrbitDeliveryReservation($handle, 'pr-review-advance.lock');
+    }
+
+    public function prepareWorktree(OrbitProjectConfig $config, string $issueKey): PreparedWorktree
+    {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function checkCandidate(OrbitProjectConfig $config, PreparedWorktree $worktree): CandidateCheck
+    {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function verifyPlanningHandoff(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        CandidateCheck $candidate,
+        PreparedIssueSnapshot $snapshot,
+    ): VerifiedOrbitPlanningRepository {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function verifyPlanningArtifact(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        string $issueKey,
+        string $artifactSha,
+        string $expectedVerdict,
+    ): VerifiedOrbitPlanningArtifact {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function verifyPlanningOutcome(
+        OrbitProjectConfig $config,
+        PreparedWorktree $startupWorktree,
+        PreparedIssueSnapshot $snapshot,
+        string $candidateSha,
+        ?string $artifactSha,
+    ): VerifiedOrbitPlanningOutcome {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function writeIssueSnapshot(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        OrbitIssueSnapshot $snapshot,
+    ): PreparedIssueSnapshot {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function verifyIssueSnapshot(
+        OrbitProjectConfig $config,
+        PreparedWorktree $worktree,
+        PreparedIssueSnapshot $snapshot,
+    ): void {
+        throw new LogicException('Not used by this test.');
+    }
+
+    public function reservationIsHeld(): bool
+    {
+        return is_resource($this->reservationHandle);
+    }
+}
+
+final class PullRequestReviewAdvanceIssues implements OrbitActiveIssueProvider
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public ?string $state = 'In Review';
+
+    public mixed $assignee = null;
+
+    public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($issueId)->toBe('11111111-2222-4333-8444-555555555555')
+            ->and($issueKey)->toBe('ORB-234');
+        $this->calls++;
+
+        return new OrbitIssueSnapshot(
+            $issueId,
+            $issueKey,
+            [
+                'id' => $issueId,
+                'identifier' => $issueKey,
+                'state' => ['id' => 'state-review', 'name' => $this->state, 'type' => 'started'],
+                'assignee' => $this->assignee,
+                'delegate' => ['id' => config('commander.hermes.tom_linear_viewer_id')],
+            ],
+            str_repeat('d', 64),
+        );
+    }
+}
+
+final class PullRequestReviewAdvancePublisher implements OrbitPullRequestReviewPublisher
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public bool $mismatch = false;
+
+    public ?Closure $afterPublish = null;
+
+    public string $approvedBody;
+
+    public string $submittedBody;
+
+    public function publishReview(
+        int $number,
+        string $issueKey,
+        string $candidateSha,
+        string $submittedPullRequestBody,
+        string $result,
+        string $handoff,
+        ?string $approvedPullRequestBody,
+    ): PublishedOrbitPullRequestReview {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($number)->toBe(42)
+            ->and($issueKey)->toBe('ORB-234')
+            ->and($candidateSha)->toBe(str_repeat('b', 40))
+            ->and($submittedPullRequestBody)->toBe($this->submittedBody)
+            ->and($handoff)->toBe('All acceptance items passed.')
+            ->and($approvedPullRequestBody)->toBe($result === 'approved' ? $this->approvedBody : null);
+        $this->calls++;
+
+        if ($this->afterPublish instanceof Closure) {
+            ($this->afterPublish)();
+        }
+
+        $body = $result === 'approved' ? 'Approved.' : $handoff;
+        $pullRequestBody = $result === 'approved' ? $this->approvedBody : $this->submittedBody;
+
+        return new PublishedOrbitPullRequestReview(
+            id: 901,
+            pullRequestNumber: $this->mismatch ? 43 : $number,
+            reviewerLogin: 'tom-nckrtl[bot]',
+            candidateSha: $candidateSha,
+            state: $result === 'approved' ? 'APPROVED' : 'CHANGES_REQUESTED',
+            reviewBodyHash: hash('sha256', $body),
+            pullRequestBodyHash: hash('sha256', $pullRequestBody),
         );
     }
 }
@@ -351,11 +539,22 @@ beforeEach(function () {
     $this->repository->expectedBody = $this->approvedBody;
     $this->pullRequests = new PullRequestReviewReceiptPullRequests;
     $this->pullRequests->submittedBody = $this->submittedBody;
+    $this->advanceRepository = new PullRequestReviewAdvanceRepository;
+    $this->advanceIssues = new PullRequestReviewAdvanceIssues;
+    $this->reviewPublisher = new PullRequestReviewAdvancePublisher;
+    $this->reviewPublisher->approvedBody = $this->approvedBody;
+    $this->reviewPublisher->submittedBody = $this->submittedBody;
     $transactionLevel = DB::transactionLevel();
     $this->repository->transactionLevel = $transactionLevel;
     $this->pullRequests->transactionLevel = $transactionLevel;
+    $this->advanceRepository->transactionLevel = $transactionLevel;
+    $this->advanceIssues->transactionLevel = $transactionLevel;
+    $this->reviewPublisher->transactionLevel = $transactionLevel;
     app()->instance(OrbitImplementationRepository::class, $this->repository);
     app()->instance(OrbitPullRequestInspector::class, $this->pullRequests);
+    app()->instance(OrbitRepository::class, $this->advanceRepository);
+    app()->instance(OrbitActiveIssueProvider::class, $this->advanceIssues);
+    app()->instance(OrbitPullRequestReviewPublisher::class, $this->reviewPublisher);
 
     chdir($this->worktreePath);
     Queue::fake();
@@ -624,4 +823,323 @@ it('rejects a live config race after external verification', function () {
         ->assertFailed();
 
     expect(Receipt::query()->where('kind', 'orbit_pr_review')->doesntExist())->toBeTrue();
+});
+
+function capturePullRequestReviewForAdvancement(object $test, string $result): Receipt
+{
+    $arguments = [...$test->arguments, '--result' => $result];
+
+    if ($result !== 'approved') {
+        unset($arguments['--body']);
+        $test->repository->expectedBody = $test->submittedBody;
+    }
+
+    $test->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)->assertSuccessful();
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    $test->repository->expectedBody = $test->submittedBody;
+
+    return Receipt::query()->where('kind', 'orbit_pr_review')->sole();
+}
+
+it('queues advancement for the exact settled pull request review phase', function () {
+    capturePullRequestReviewForAdvancement($this, 'approved');
+
+    expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeFalse();
+    Queue::assertPushed(
+        AdvancePullRequestReviewJob::class,
+        fn (AdvancePullRequestReviewJob $job): bool => $job->deliveryId === $this->delivery->id
+            && $job->phaseRunId === $this->phaseRun->id,
+    );
+});
+
+it('publishes approval once and creates one system-owned landing intent', function () {
+    $receipt = capturePullRequestReviewForAdvancement($this, 'approved');
+    $action = app(AdvanceOrbitPullRequestReview::class);
+
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+
+    $landing = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::LANDING_PHASE)
+        ->sole();
+    $published = [
+        'id' => 901,
+        'reviewer_login' => 'tom-nckrtl[bot]',
+        'candidate_sha' => $this->candidateSha,
+        'state' => 'APPROVED',
+        'review_body_sha256' => hash('sha256', 'Approved.'),
+        'pull_request_body_sha256' => hash('sha256', $this->approvedBody),
+    ];
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->phaseRun->fresh()->output)->toBe([
+            'receipt_id' => $receipt->id,
+            'result' => 'approved',
+            'published_review' => $published,
+        ])
+        ->and($landing->status)->toBe(PhaseRunStatus::Pending)
+        ->and($landing->input['pr_review_receipt_id'])->toBe($receipt->id)
+        ->and($landing->input['implementation_receipt_id'])->toBe($this->implementationReceipt->id)
+        ->and($landing->input['published_review'])->toBe($published)
+        ->and($landing->agentDispatches()->doesntExist())->toBeTrue()
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::LANDING_PHASE)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::ReadyToMerge)
+        ->and($this->reviewPublisher->calls)->toBe(1)
+        ->and($this->advanceIssues->calls)->toBe(2)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+});
+
+it('publishes changes and creates an inert retained-Builder correction intent', function () {
+    $receipt = capturePullRequestReviewForAdvancement($this, 'changes');
+
+    app(AdvanceOrbitPullRequestReview::class)->handle($this->delivery->id, $this->phaseRun->id);
+
+    $correction = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    $builder = $correction->agentDispatches()->sole();
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($correction->status)->toBe(PhaseRunStatus::Pending)
+        ->and($correction->input['pr_review_receipt_id'])->toBe($receipt->id)
+        ->and($correction->input['implementation_receipt_id'])->toBe($this->implementationReceipt->id)
+        ->and($correction->input['published_review']['state'])->toBe('CHANGES_REQUESTED')
+        ->and($builder->agent_role)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE)
+        ->and($builder->herdr_agent_name)->toBe('orb-234-loop-builder')
+        ->and($builder->prompt_name)->toBe('orbit_pr_review_correction')
+        ->and($builder->status)->toBe(AgentDispatchStatus::Pending)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->reviewPublisher->calls)->toBe(1);
+
+    app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
+    Queue::assertNotPushed(DispatchOrbitImplementation::class);
+});
+
+it('routes blocked review to resolution without any GitHub publication', function () {
+    $receipt = capturePullRequestReviewForAdvancement($this, 'blocked');
+    $action = app(AdvanceOrbitPullRequestReview::class);
+
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+
+    expect($this->phaseRun->fresh()->output)->toBe([
+        'receipt_id' => $receipt->id,
+        'result' => 'blocked',
+        'published_review' => null,
+    ])
+        ->and($resolution->status)->toBe(PhaseRunStatus::Pending)
+        ->and($resolution->input['pr_review_receipt_id'])->toBe($receipt->id)
+        ->and($resolution->input['published_review'])->toBeNull()
+        ->and($resolver->agent_role)->toBe(OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE)
+        ->and($resolver->status)->toBe(AgentDispatchStatus::Pending)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->and($this->reviewPublisher->calls)->toBe(0)
+        ->and($this->advanceIssues->calls)->toBe(1)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+});
+
+it('rejects changed In Review ownership before publication', function () {
+    capturePullRequestReviewForAdvancement($this, 'approved');
+    $this->advanceIssues->assignee = ['id' => config('commander.hermes.nick_linear_user_id')];
+
+    expect(fn () => app(AdvanceOrbitPullRequestReview::class)->handle(
+        $this->delivery->id,
+        $this->phaseRun->id,
+    ))->toThrow(OrbitIssueContractChanged::class, 'changed before pull request review advancement');
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->reviewPublisher->calls)->toBe(0)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+});
+
+it('does not consume a review when published evidence differs', function () {
+    capturePullRequestReviewForAdvancement($this, 'changes');
+    $this->reviewPublisher->mismatch = true;
+
+    expect(fn () => app(AdvanceOrbitPullRequestReview::class)->handle(
+        $this->delivery->id,
+        $this->phaseRun->id,
+    ))->toThrow(OrbitPullRequestReviewAdvancementFailed::class, 'does not match');
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+});
+
+it('revalidates the complete review ledger before publication', function (string $record) {
+    $receipt = capturePullRequestReviewForAdvancement($this, 'approved');
+    $this->repository->afterVerify = function () use ($record, $receipt): void {
+        if ($record === 'review dispatch') {
+            DB::table('agent_dispatches')->where('id', $this->dispatch->id)->update([
+                'prompt_hash' => str_repeat('0', 64),
+            ]);
+        } elseif ($record === 'review receipt') {
+            DB::table('receipts')->where('id', $receipt->id)->update([
+                'payload_hash' => str_repeat('0', 64),
+            ]);
+        } else {
+            DB::table('receipts')->where('id', $this->implementationReceipt->id)->update([
+                'payload_hash' => str_repeat('0', 64),
+            ]);
+        }
+    };
+
+    expect(fn () => app(AdvanceOrbitPullRequestReview::class)->handle(
+        $this->delivery->id,
+        $this->phaseRun->id,
+    ))->toThrow(OrbitPullRequestReviewAdvancementFailed::class, 'ledger changed before publication');
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->phaseRun->fresh()->current_block)->toBeNull()
+        ->and($this->reviewPublisher->calls)->toBe(0)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+})->with(['review dispatch', 'review receipt', 'source receipt']);
+
+it('detects a live config race after review publication without consuming the receipt', function () {
+    capturePullRequestReviewForAdvancement($this, 'approved');
+    $this->reviewPublisher->afterPublish = function (): void {
+        $project = $this->delivery->projectOrchestration;
+        $config = $project->config;
+        $config['concurrency'] = 2;
+        DB::table('project_orchestrations')->where('id', $project->id)->update([
+            'config' => json_encode($config, JSON_THROW_ON_ERROR),
+        ]);
+    };
+
+    expect(fn () => app(AdvanceOrbitPullRequestReview::class)->handle(
+        $this->delivery->id,
+        $this->phaseRun->id,
+    ))->toThrow(OrbitPullRequestReviewAdvancementFailed::class, 'ledger changed during advancement');
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->phaseRun->fresh()->current_block)->toBe('review_publication')
+        ->and($this->reviewPublisher->calls)->toBe(1)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+
+    $job = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id);
+    $job->failed(new RuntimeException('Retries exhausted after publication.'));
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details['code'])
+        ->toBe('pr_review_publication_reconciliation_required');
+});
+
+it('detects a Linear race after review publication without consuming the receipt', function () {
+    capturePullRequestReviewForAdvancement($this, 'changes');
+    $this->reviewPublisher->afterPublish = function (): void {
+        $this->advanceIssues->state = 'In Progress';
+    };
+
+    expect(fn () => app(AdvanceOrbitPullRequestReview::class)->handle(
+        $this->delivery->id,
+        $this->phaseRun->id,
+    ))->toThrow(OrbitIssueContractChanged::class, 'changed before pull request review advancement');
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->phaseRun->fresh()->current_block)->toBe('review_publication')
+        ->and($this->advanceIssues->calls)->toBe(2)
+        ->and($this->reviewPublisher->calls)->toBe(1)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+});
+
+it('rejects corrupted retained correction identity during replay', function (string $field, mixed $value) {
+    capturePullRequestReviewForAdvancement($this, 'changes');
+    $action = app(AdvanceOrbitPullRequestReview::class);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+    $correction = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    $builder = $correction->agentDispatches()->sole();
+    DB::table('agent_dispatches')->where('id', $builder->id)->update([$field => $value]);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->phaseRun->id))
+        ->toThrow(OrbitPullRequestReviewAdvancementFailed::class, 'retained pull request review transition');
+
+    expect($this->reviewPublisher->calls)->toBe(1);
+})->with([
+    'role' => ['agent_role', OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE],
+    'agent' => ['herdr_agent_name', 'orb-234-loop-other'],
+    'prompt' => ['prompt_name', 'orbit_implementation_correction'],
+]);
+
+it('rejects corrupted completed review identity during replay', function (string $field, mixed $value) {
+    capturePullRequestReviewForAdvancement($this, 'changes');
+    $action = app(AdvanceOrbitPullRequestReview::class);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+    DB::table('agent_dispatches')->where('id', $this->dispatch->id)->update([$field => $value]);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->phaseRun->id))
+        ->toThrow(OrbitPullRequestReviewAdvancementFailed::class, 'retained pull request review transition');
+
+    expect($this->reviewPublisher->calls)->toBe(1);
+})->with([
+    'idempotency key' => ['idempotency_key', 'tampered-review-dispatch'],
+    'agent' => ['herdr_agent_name', 'orb-234-loop-builder'],
+    'prompt' => ['prompt_name', 'orbit_other_review'],
+    'prompt hash' => ['prompt_hash', str_repeat('0', 64)],
+    'Herdr session' => ['herdr_session', 'other-session'],
+    'Herdr workspace' => ['herdr_workspace_id', null],
+    'Herdr pane' => ['herdr_pane_id', 'builder-pane'],
+    'status' => ['status', AgentDispatchStatus::Failed->value],
+    'settled timestamp' => ['settled_at', null],
+]);
+
+it('bounds review advancement and blocks exhausted publication for reconciliation', function () {
+    $job = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id);
+    $job->failed(new RuntimeException(
+        'Worker exhausted.',
+        0,
+        new OrbitPullRequestReviewPublicationFailed('Publication outcome is unresolved.'),
+    ));
+
+    expect($job->tries)->toBe(0)
+        ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
+        ->and(AdvancePullRequestReviewJob::LOCK_SECONDS)->toBeGreaterThan($job->timeout)
+        ->and($job->retryUntil() > now())->toBeTrue()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'pr_review_publication_reconciliation_required',
+            'message' => 'Worker exhausted.',
+        ]);
+});
+
+it('fails only the exact active review when advancement retries are exhausted', function () {
+    $stale = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id + 1);
+    $stale->failed(new RuntimeException('Stale queue failure.'));
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
+
+    $active = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id);
+    $active->failed(new RuntimeException('Queue exhausted.'));
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Failed)
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'pr_review_advancement_exhausted',
+            'message' => 'Queue exhausted.',
+        ]);
+});
+
+it('releases a contended phase-scoped review advancement lock for retry', function () {
+    $lock = Cache::lock(
+        "delivery:pr-review-advance:{$this->delivery->id}:{$this->phaseRun->id}",
+        AdvancePullRequestReviewJob::LOCK_SECONDS,
+    );
+    expect($lock->get())->toBeTrue();
+
+    try {
+        $job = (new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id))
+            ->withFakeQueueInteractions();
+        $job->handle(app(AdvanceOrbitPullRequestReview::class));
+        $job->assertReleased(1);
+    } finally {
+        $lock->release();
+    }
 });

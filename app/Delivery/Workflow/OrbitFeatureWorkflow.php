@@ -18,6 +18,8 @@ final readonly class OrbitFeatureWorkflow
 
     public const string PR_REVIEW_PHASE = 'pr_review';
 
+    public const string LANDING_PHASE = 'landing';
+
     public const string RESOLUTION_PHASE = 'resolution';
 
     public const string PLANNING_AGENT_ROLE = 'planner';

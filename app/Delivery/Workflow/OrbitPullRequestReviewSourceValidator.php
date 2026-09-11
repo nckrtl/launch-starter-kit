@@ -15,8 +15,11 @@ final readonly class OrbitPullRequestReviewSourceValidator
 {
     public function __construct(private OrbitImplementationReceiptValidator $receipts) {}
 
-    public function sourceReceipt(Delivery $delivery, PhaseRun $review): ?Receipt
-    {
+    public function sourceReceipt(
+        Delivery $delivery,
+        PhaseRun $review,
+        bool $retainedTransition = false,
+    ): ?Receipt {
         $input = $review->input;
         $receiptId = is_array($input) ? ($input['implementation_receipt_id'] ?? null) : null;
         $payload = is_array($input) ? ($input['implementation_receipt'] ?? null) : null;
@@ -51,7 +54,14 @@ final readonly class OrbitPullRequestReviewSourceValidator
             || $implementation->delivery_id !== $delivery->id
             || $implementation->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             || ! in_array($implementation->attempt, [1, 2], true)
-            || $latest?->id !== $implementation->id
+            || ! ($latest?->id === $implementation->id
+                || ($retainedTransition && $this->matchesRetainedSuccessor(
+                    $delivery,
+                    $review,
+                    $receipt,
+                    $implementation,
+                    $latest,
+                )))
             || $implementation->status !== PhaseRunStatus::Completed
             || $implementation->finished_at === null
             || $implementation->output !== [
@@ -62,7 +72,7 @@ final readonly class OrbitPullRequestReviewSourceValidator
                 'mergeable' => true,
             ]
             || $implementation->agentDispatches->count() !== 1
-            || $implementation->receipts()->where('kind', 'orbit_implementation')->count() !== 1
+            || $implementation->receipts()->count() !== 1
             || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
             || $dispatch->status !== AgentDispatchStatus::Settled
             || $dispatch->idempotency_key !== IdempotencyKey::forDispatch(
@@ -77,6 +87,7 @@ final readonly class OrbitPullRequestReviewSourceValidator
             || preg_match('/^[a-f0-9]{64}$/', $dispatch->prompt_hash) !== 1
             || $dispatch->prompt_hash === str_repeat('0', 64)
             || $dispatch->dispatched_at === null || $dispatch->settled_at === null
+            || $receipt->validated_at === null
             || $receipt->payload !== $payload
             || ($payload['result'] ?? null) !== 'ready'
             || ($payload['candidate_sha'] ?? null) !== $delivery->candidate_sha
@@ -90,6 +101,46 @@ final readonly class OrbitPullRequestReviewSourceValidator
         }
 
         return $receipt;
+    }
+
+    private function matchesRetainedSuccessor(
+        Delivery $delivery,
+        PhaseRun $review,
+        Receipt $source,
+        PhaseRun $implementation,
+        ?PhaseRun $latest,
+    ): bool {
+        $input = $latest?->input;
+        $reviewReceipts = $review->receipts()->get();
+        $reviewReceipt = $reviewReceipts->first();
+
+        return $latest !== null && is_array($input)
+            && $reviewReceipts->count() === 1
+            && $reviewReceipt !== null
+            && $latest->delivery_id === $delivery->id
+            && $latest->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+            && $latest->attempt === $implementation->attempt + 1
+            && $latest->status === PhaseRunStatus::Pending
+            && $latest->current_block === null
+            && $latest->output === null
+            && $latest->failure_code === null
+            && $latest->failure_message === null
+            && $latest->failure_details === null
+            && $latest->started_at === null
+            && $latest->finished_at === null
+            && array_diff(array_keys($input), [
+                'pr_review_receipt_id',
+                'pr_review_receipt',
+                'implementation_receipt_id',
+                'implementation_receipt',
+                'pull_request',
+                'published_review',
+            ]) === []
+            && count($input) === 6
+            && ($input['pr_review_receipt_id'] ?? null) === $reviewReceipt->id
+            && ($input['pr_review_receipt'] ?? null) === $reviewReceipt->payload
+            && ($input['implementation_receipt_id'] ?? null) === $source->id
+            && ($input['implementation_receipt'] ?? null) === $source->payload;
     }
 
     private function matchesReceipt(

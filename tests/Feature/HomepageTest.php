@@ -1,6 +1,7 @@
 <?php
 
 use App\Providers\ToolbarConfigProvider;
+use Illuminate\Cache\Repository;
 use Inertia\Testing\AssertableInertia as Assert;
 use NckRtl\Toolbar\Toolbar;
 
@@ -14,6 +15,11 @@ beforeEach(function () {
         'boards' => [],
         'signals' => [],
     ], 60);
+    cache()->put(
+        Repository::FLEXIBLE_CREATED_KEY_PREFIX.'commander:hermes:snapshot',
+        now()->getTimestamp(),
+        60,
+    );
 });
 
 it('renders the homepage with the Home inertia component', function () {

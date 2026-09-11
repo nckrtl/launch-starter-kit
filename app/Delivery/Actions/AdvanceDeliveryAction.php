@@ -19,6 +19,7 @@ use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
 use App\Jobs\AdvanceOrbitImplementation as AdvanceOrbitImplementationJob;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
+use App\Jobs\AdvanceOrbitPullRequestReview as AdvanceOrbitPullRequestReviewJob;
 use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPlanningCorrection;
 use App\Jobs\DispatchOrbitPlanReview;
@@ -84,13 +85,18 @@ final readonly class AdvanceDeliveryAction
                     ->latest('attempt')
                     ->first()
                 : null;
+            $implementationInput = $implementation?->input;
+            $isPullRequestCorrection = is_array($implementationInput)
+                && array_key_exists('pr_review_receipt_id', $implementationInput);
 
             if (in_array($implementation?->attempt, [1, 2], true)
+                && ! $isPullRequestCorrection
                 && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                 DispatchOrbitImplementation::dispatch($deliveryId)->afterCommit();
             }
 
             if (in_array($implementation?->attempt, [1, 2], true)
+                && ! $isPullRequestCorrection
                 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 AdvanceOrbitImplementationJob::dispatch($deliveryId, $implementation->id)->afterCommit();
             }
@@ -105,6 +111,11 @@ final readonly class AdvanceDeliveryAction
             if ($pullRequestReview?->attempt === 1
                 && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                 DispatchOrbitPullRequestReview::dispatch($deliveryId, $pullRequestReview->id)->afterCommit();
+            }
+
+            if ($pullRequestReview?->attempt === 1
+                && $delivery->status === DeliveryStatus::WaitingForAgent) {
+                AdvanceOrbitPullRequestReviewJob::dispatch($deliveryId, $pullRequestReview->id)->afterCommit();
             }
 
             return false;
