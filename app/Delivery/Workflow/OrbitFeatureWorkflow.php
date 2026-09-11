@@ -340,4 +340,82 @@ before returning. If correction cannot complete, use `blocked` and record its cl
 evidence, and smallest next action in the handoff. Return the receipt ID and stop.
 PROMPT;
     }
+
+    /**
+     * @param  array<string, mixed>  $implementationReceipt
+     * @param  array<string, mixed>  $pullRequest
+     */
+    public function pullRequestReviewPrompt(
+        string $issueKey,
+        string $worktree,
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        string $receiptCommand,
+        array $implementationReceipt,
+        array $pullRequest,
+    ): string {
+        $artifactSha = $implementationReceipt['artifact_sha'] ?? null;
+
+        if (! is_string($artifactSha) || preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1) {
+            throw new \InvalidArgumentException('The implementation receipt has an invalid artifact SHA.');
+        }
+
+        $receipt = json_encode(
+            $implementationReceipt,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+        $published = json_encode(
+            $pullRequest,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+
+        return <<<PROMPT
+Independently review the exact published pull request for {$issueKey}.
+
+Issue: {$issueKey}
+Worktree: {$worktree}
+Assigned phase: pr_review
+Flow: discovery
+Delivery: {$deliveryId}
+Phase run: {$phaseRunId}
+Dispatch: {$dispatchId}
+Current process skill: {$worktree}/.agents/skills/reviewing-pull-requests/SKILL.md
+
+Read that process and the assigned worktree guidance. Review the exact candidate, artifact,
+Builder gate, pull request body, and published pull request identified below:
+
+```json
+{$receipt}
+```
+
+```json
+{$published}
+```
+
+Complete one independent formal review and return every blocking finding in one pass. Use
+focused diagnostics only for a concrete uncertainty. Do not edit product code, change Linear,
+mutate GitHub, merge, or invoke the legacy Orbit controller's advance command. The external
+orchestrator owns review publication and every pull request mutation.
+
+Write the complete review handoff inside `.loop/runtime/`. For approval, also write the complete
+final pull request body there, starting from the submitted body and preserving its exact Builder
+gate line and evidence bindings. Keep `.loop` untracked.
+
+Before ending, run one receipt command from the assigned worktree root.
+
+Approved:
+`{$receiptCommand} --result=approved --handoff=.loop/runtime/pr-review-handoff.md --artifact={$artifactSha} --body=.loop/runtime/pull-request-body.md`
+
+Changes requested:
+`{$receiptCommand} --result=changes --handoff=.loop/runtime/pr-review-handoff.md --artifact={$artifactSha}`
+
+Blocked:
+`{$receiptCommand} --result=blocked --handoff=.loop/runtime/pr-review-handoff.md --artifact={$artifactSha}`
+
+The receipt command independently validates the unchanged candidate, published artifact,
+submitted Builder gate, and review binding. It does not publish the GitHub review or advance the
+delivery. Correct a reported structural error before returning. Return the receipt ID and stop.
+PROMPT;
+    }
 }

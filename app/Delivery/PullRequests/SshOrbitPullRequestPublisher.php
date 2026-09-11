@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Delivery\PullRequests;
 
+use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Data\PublishedOrbitPullRequest;
 use App\Delivery\Exceptions\OrbitPullRequestPublicationFailed;
@@ -12,7 +13,7 @@ use Illuminate\Support\Sleep;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitPullRequestPublisher implements OrbitPullRequestPublisher
+final readonly class SshOrbitPullRequestPublisher implements OrbitPullRequestInspector, OrbitPullRequestPublisher
 {
     public function publish(
         string $issueKey,
@@ -82,6 +83,31 @@ final readonly class SshOrbitPullRequestPublisher implements OrbitPullRequestPub
         );
     }
 
+    public function inspect(
+        int $number,
+        string $issueKey,
+        string $candidateSha,
+        string $pullRequestBody,
+    ): PublishedOrbitPullRequest {
+        $this->assertInspectionInput($number, $issueKey, $candidateSha, $pullRequestBody);
+        $pullRequest = $this->pullRequest($number);
+        $this->assertReadBack($pullRequest, $number, strtolower($issueKey), $candidateSha, $pullRequestBody);
+        $mergeable = $this->mergeable($pullRequest);
+        $url = $pullRequest['html_url'] ?? null;
+
+        if (! is_string($url)) {
+            throw new OrbitPullRequestPublicationFailed('GitHub returned an invalid Orbit pull request URL.');
+        }
+
+        return new PublishedOrbitPullRequest(
+            number: $number,
+            url: $url,
+            candidateSha: $candidateSha,
+            bodyHash: hash('sha256', $pullRequestBody),
+            mergeable: $mergeable,
+        );
+    }
+
     private function assertInput(
         string $issueKey,
         string $issueTitle,
@@ -97,6 +123,34 @@ final readonly class SshOrbitPullRequestPublisher implements OrbitPullRequestPub
             || trim($pullRequestBody) === '') {
             throw new OrbitPullRequestPublicationFailed('The Orbit pull request publication input is invalid.');
         }
+    }
+
+    private function assertInspectionInput(
+        int $number,
+        string $issueKey,
+        string $candidateSha,
+        string $pullRequestBody,
+    ): void {
+        [$target, $profile] = $this->configuration();
+
+        if ($target === '' || $profile === '' || $number < 1
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
+            || trim($pullRequestBody) === '') {
+            throw new OrbitPullRequestPublicationFailed('The Orbit pull request inspection input is invalid.');
+        }
+    }
+
+    /** @param array<string, mixed> $pullRequest */
+    private function mergeable(array $pullRequest): ?bool
+    {
+        $mergeable = $pullRequest['mergeable'] ?? null;
+
+        if (! is_bool($mergeable) && $mergeable !== null) {
+            throw new OrbitPullRequestPublicationFailed('GitHub returned invalid Orbit mergeability metadata.');
+        }
+
+        return $mergeable;
     }
 
     /** @return list<array<string, mixed>> */

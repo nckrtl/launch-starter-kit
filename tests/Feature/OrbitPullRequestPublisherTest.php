@@ -1,5 +1,6 @@
 <?php
 
+use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Exceptions\OrbitPullRequestPublicationFailed;
 use Illuminate\Support\Facades\Process;
@@ -104,6 +105,26 @@ it('creates and reads back one exact Orbit pull request', function () {
         ->and($published->bodyHash)->toBe(hash('sha256', $this->body))
         ->and($published->mergeable)->toBeTrue();
     Process::assertRanTimes(fn () => true, 3);
+});
+
+it('inspects one exact pull request without mutation or mergeability polling', function () {
+    fakeOrbitPullRequestPublisher([[
+        'path' => 'pulls/42',
+        'output' => orbitPullRequestDetails($this->candidate, $this->body, null),
+    ]]);
+
+    $inspected = app(OrbitPullRequestInspector::class)->inspect(
+        42,
+        'ORB-234',
+        $this->candidate,
+        $this->body,
+    );
+
+    expect($inspected->number)->toBe(42)
+        ->and($inspected->candidateSha)->toBe($this->candidate)
+        ->and($inspected->mergeable)->toBeNull();
+    Process::assertRanTimes(fn () => true, 1);
+    Sleep::assertNeverSlept();
 });
 
 it('updates an existing pull request and accepts a lost patch response only after exact read-back', function () {

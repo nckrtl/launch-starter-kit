@@ -22,6 +22,7 @@ use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
 use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPlanningCorrection;
 use App\Jobs\DispatchOrbitPlanReview;
+use App\Jobs\DispatchOrbitPullRequestReview;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -92,6 +93,18 @@ final readonly class AdvanceDeliveryAction
             if (in_array($implementation?->attempt, [1, 2], true)
                 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 AdvanceOrbitImplementationJob::dispatch($deliveryId, $implementation->id)->afterCommit();
+            }
+
+            $pullRequestReview = $delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+                ? $delivery->phaseRuns()
+                    ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+                    ->latest('attempt')
+                    ->first()
+                : null;
+
+            if ($pullRequestReview?->attempt === 1
+                && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
+                DispatchOrbitPullRequestReview::dispatch($deliveryId, $pullRequestReview->id)->afterCommit();
             }
 
             return false;
