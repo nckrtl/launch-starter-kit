@@ -21,7 +21,7 @@ use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
-use App\Delivery\Workflow\OrbitPlanningReceiptValidator;
+use App\Delivery\Workflow\OrbitPlanReviewReceiptValidator;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -38,7 +38,7 @@ final readonly class DispatchOrbitPlanReview
         private OrbitIssueProvider $issues,
         private HerdrRuntime $herdr,
         private OrbitFeatureWorkflow $workflow,
-        private OrbitPlanningReceiptValidator $planningReceipts,
+        private OrbitPlanReviewReceiptValidator $reviewReceipts,
     ) {}
 
     public function handle(int $deliveryId): AgentDispatch
@@ -93,7 +93,7 @@ final readonly class DispatchOrbitPlanReview
         $project = $delivery->projectOrchestration;
         $existing = $delivery->phaseRuns()
             ->where('phase_name', OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
-            ->where('attempt', 1)
+            ->latest('attempt')
             ->first()?->agentDispatches()
             ->first();
 
@@ -122,7 +122,7 @@ final readonly class DispatchOrbitPlanReview
             $phase = PhaseRun::query()
                 ->where('delivery_id', $locked->id)
                 ->where('phase_name', OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
-                ->where('attempt', 1)
+                ->latest('attempt')
                 ->lockForUpdate()
                 ->firstOrFail();
             $dispatch = AgentDispatch::query()
@@ -544,7 +544,7 @@ final readonly class DispatchOrbitPlanReview
         if ($receipt === null || $phase === null || $dispatch === null
             || $phase->delivery_id !== $delivery->id
             || $phase->phase_name !== OrbitFeatureWorkflow::INITIAL_PHASE
-            || $phase->attempt !== 1
+            || $phase->attempt !== $review->attempt
             || $phase->status !== PhaseRunStatus::Completed
             || $phase->output !== ['receipt_id' => $receipt->id, 'result' => 'ready']
             || $phase->agentDispatches->count() !== 1
@@ -553,7 +553,7 @@ final readonly class DispatchOrbitPlanReview
             || $receipt->payload !== $payload
             || ($payload['result'] ?? null) !== 'ready'
             || ($payload['candidate_sha'] ?? null) !== $delivery->candidate_sha
-            || ! $this->planningReceipts->matches($delivery, $phase, $dispatch, $receipt)) {
+            || ! $this->reviewReceipts->matchesInput($delivery, $review)) {
             throw new OrbitPlanReviewDispatchFailed('The immutable planning receipt no longer matches the review intent.');
         }
 

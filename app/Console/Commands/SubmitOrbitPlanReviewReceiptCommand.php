@@ -61,7 +61,6 @@ final class SubmitOrbitPlanReviewReceiptCommand extends Command
                     && $dispatch->status === AgentDispatchStatus::Starting
                     && $dispatch->error_code === 'herdr_prompt_attempted'))
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::PLAN_REVIEW_PHASE
-            || $phaseRun->attempt !== 1
             || $phaseRun->status !== PhaseRunStatus::Running
             || $dispatch->agent_role !== OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE
             || (! ($dispatch->status === AgentDispatchStatus::Starting

@@ -14,9 +14,17 @@ final readonly class OrbitFeatureWorkflow
 
     public const string PLAN_REVIEW_PHASE = 'plan_review';
 
+    public const string IMPLEMENTATION_PHASE = 'implementing';
+
+    public const string RESOLUTION_PHASE = 'resolution';
+
     public const string PLANNING_AGENT_ROLE = 'planner';
 
     public const string PLAN_REVIEW_AGENT_ROLE = 'plan-reviewer';
+
+    public const string IMPLEMENTATION_AGENT_ROLE = 'implementer';
+
+    public const string RESOLUTION_AGENT_ROLE = 'resolver';
 
     public const int PLANNING_PROMPT_VERSION = 1;
 
