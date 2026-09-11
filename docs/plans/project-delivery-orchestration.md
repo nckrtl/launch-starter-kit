@@ -91,6 +91,13 @@ reconciliation that wakes the existing advancement path for recoverable
 deliveries on enabled projects. Route the entry point through Commander only
 after live shadow parity passes.
 
+The read-only `delivery:shadow-parity` gate now compares each legacy debounced
+Herdr notification with one raw Commander event. A live run on 2026-09-11
+passed: every compatibility notification in the observed capture window
+matched, none were missing, and none had a pending Tom notification. This
+proves live listener-capture parity only. End-to-end issue delivery parity is
+still required before the normal entry point can move.
+
 ## Ownership boundaries
 
 ### Commander

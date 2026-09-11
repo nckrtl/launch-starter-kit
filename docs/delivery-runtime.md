@@ -44,3 +44,20 @@ a second workflow state machine.
 This worker does not cut over Orbit's feature loop. Until shadow parity and the
 reconciliation runtime are proven, `/home/nckrtl/orbit/bin/loop` continues to
 invoke the legacy controller.
+
+Run the read-only listener parity gate with:
+
+```bash
+php artisan delivery:shadow-parity
+php artisan delivery:shadow-parity --since=2026-09-11T00:00:00Z
+```
+
+The report fails closed when no compatibility notifications exist in the
+window, when a legacy debounced notification has no matching raw Commander
+event, or when the legacy Tom notification is still pending. Correlated and
+unmatched raw terminal events are reported separately; unmatched legacy-loop
+agents are expected before cutover and do not fail capture parity.
+
+Without `--since`, the gate observes the later of raw capture startup and the
+past 24 hours. This keeps the live report bounded while still covering the
+lookback needed to match notifications at the start of the window.
