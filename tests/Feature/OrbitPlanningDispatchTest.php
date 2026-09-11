@@ -203,6 +203,10 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
 
     public ?HerdrAgentLaunch $launch = null;
 
+    public ?string $startedAgentId = 'codex-session-1';
+
+    public ?string $promptedAgentId = 'codex-session-1';
+
     /** @var list<string> */
     public array $prompts = [];
 
@@ -243,7 +247,7 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
         $this->startedName = $name;
         $this->call('herdr.start');
 
-        return $this->identifiers($name);
+        return $this->identifiers($name, 40, $this->startedAgentId);
     }
 
     public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers
@@ -259,14 +263,14 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
             ($this->beforePromptReturn)();
         }
 
-        return $this->identifiers($name, 42);
+        return $this->identifiers($name, 42, $this->promptedAgentId);
     }
 
     public function getAgent(string $name): HerdrAgentIdentifiers
     {
         $this->call('herdr.get');
 
-        return $this->identifiers($name);
+        return $this->identifiers($name, 40, $this->startedAgentId);
     }
 
     private function call(string $event): void
@@ -282,14 +286,17 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
         }
     }
 
-    private function identifiers(string $name, int $sequence = 40): HerdrAgentIdentifiers
-    {
+    private function identifiers(
+        string $name,
+        int $sequence = 40,
+        ?string $agentId = 'codex-session-1',
+    ): HerdrAgentIdentifiers {
         return new HerdrAgentIdentifiers(
             'workspace-1',
             'tab-1',
             'worker-pane',
             'worker-terminal',
-            'codex-session-1',
+            $agentId,
             $name,
             $sequence,
         );
@@ -415,6 +422,30 @@ it('dispatches one verified planner while retaining the controller reservation t
     expect($this->log->events)->toHaveCount(10)
         ->and(AgentDispatch::count())->toBe(1);
     Queue::assertNothingPushed();
+});
+
+it('retains an agent session identity first reported by the successful prompt', function () {
+    $this->herdr->startedAgentId = null;
+    $this->herdr->promptedAgentId = 'codex-session-after-prompt';
+
+    $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+
+    expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->herdr_agent_id)->toBe('codex-session-after-prompt')
+        ->and($dispatch->state_change_seq)->toBe(42)
+        ->and($this->herdr->prompts)->toHaveCount(1);
+});
+
+it('blocks a prompt that reports a different known agent session', function () {
+    $this->herdr->startedAgentId = 'codex-session-before-prompt';
+    $this->herdr->promptedAgentId = 'different-codex-session';
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->handle($this->delivery->id))
+        ->toThrow(OrbitPlanningDispatchFailed::class, 'outside the recorded planning dispatch');
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and(AgentDispatch::sole()->status)->toBe(AgentDispatchStatus::Ambiguous)
+        ->and(AgentDispatch::sole()->error_code)->toBe('herdr_prompt_identity_ambiguous');
 });
 
 it('exposes the verified live planning dispatch through its explicit command', function () {

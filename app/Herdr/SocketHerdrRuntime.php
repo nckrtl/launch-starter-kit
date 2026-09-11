@@ -229,12 +229,28 @@ final readonly class SocketHerdrRuntime implements HerdrRuntime, HerdrWorkspaceR
             tabId: $this->requiredString($agent, 'tab_id'),
             paneId: $this->requiredString($agent, 'pane_id'),
             terminalId: $this->requiredString($agent, 'terminal_id'),
-            agentId: Payload::string($agent['agent'] ?? null),
+            agentId: $this->agentSessionId($agent),
             agentName: Payload::string($agent['name'] ?? null) ?? $fallbackName,
             stateChangeSeq: is_int($agent['state_change_seq'] ?? null) ? $agent['state_change_seq'] : null,
             workingDirectory: Payload::string($agent['cwd'] ?? null),
             agentStatus: Payload::string($agent['agent_status'] ?? null),
         );
+    }
+
+    /** @param array<string, mixed> $agent */
+    private function agentSessionId(array $agent): ?string
+    {
+        $session = $agent['agent_session'] ?? null;
+
+        if ($session === null) {
+            return null;
+        }
+
+        if (! is_array($session) || array_is_list($session)) {
+            throw new InvalidArgumentException('Herdr returned an invalid agent session identity.');
+        }
+
+        return $this->requiredString(Payload::assoc($session), 'value');
     }
 
     private function snapshotWorkspace(mixed $value): HerdrSnapshotWorkspace

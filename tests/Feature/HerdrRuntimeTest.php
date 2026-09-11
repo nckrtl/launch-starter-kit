@@ -11,6 +11,9 @@ beforeEach(function () {
     $pane = [
         'workspace_id' => 'w1', 'tab_id' => 't1', 'pane_id' => 'p1', 'terminal_id' => 'term1',
         'agent' => 'codex', 'name' => 'commander-1', 'agent_status' => 'working',
+        'agent_session' => [
+            'agent' => 'codex', 'kind' => 'thread', 'source' => 'herdr:codex', 'value' => 'thread-1',
+        ],
         'cwd' => '/tmp/worktree', 'focused' => false, 'revision' => 2, 'state_change_seq' => 3,
     ];
     $this->server = FakeHerdrServer::start([
@@ -44,6 +47,7 @@ it('maps protocol 22 orchestration responses and sends exact methods', function 
 
     expect($opened->paneId)->toBe('p1')
         ->and($pane->terminalId)->toBe('term1')
+        ->and($started->agentId)->toBe('thread-1')
         ->and($started->stateChangeSeq)->toBe(3)
         ->and($prompted->agentName)->toBe('commander-1')
         ->and($agent->paneId)->toBe('p1')

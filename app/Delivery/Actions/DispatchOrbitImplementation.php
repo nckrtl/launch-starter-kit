@@ -539,6 +539,7 @@ final readonly class DispatchOrbitImplementation
                 throw new OrbitImplementationDispatchFailed('The implementation changed while its prompt was submitted.');
             }
 
+            $lockedDispatch->herdr_agent_id = $prompted->agentId ?? $lockedDispatch->herdr_agent_id;
             $lockedDispatch->state_change_seq = $prompted->stateChangeSeq;
             $lockedDispatch->error_code = null;
             $lockedDispatch->error_message = null;
@@ -947,7 +948,9 @@ final readonly class DispatchOrbitImplementation
             && $agent->tabId === $dispatch->herdr_tab_id
             && $agent->paneId === $dispatch->herdr_pane_id
             && $agent->terminalId === $dispatch->herdr_terminal_id
-            && $agent->agentId === $dispatch->herdr_agent_id
+            && ($agent->agentId === null
+                || $dispatch->herdr_agent_id === null
+                || $agent->agentId === $dispatch->herdr_agent_id)
             && $agent->agentName === $dispatch->herdr_agent_name;
     }
 
