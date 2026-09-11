@@ -3,6 +3,7 @@
 namespace App\Providers;
 
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitRepository;
@@ -24,6 +25,7 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->bind(OrbitRepository::class, ProcessOrbitRepository::class);
+        $this->app->bind(OrbitImplementationRepository::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitIssueProvider::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitIssueTransitioner::class, SshOrbitIssueTransitioner::class);
 

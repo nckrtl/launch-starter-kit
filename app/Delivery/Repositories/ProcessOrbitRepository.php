@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Delivery\Repositories;
 
+use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitDeliveryReservation;
@@ -11,6 +12,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
@@ -20,7 +22,7 @@ use Illuminate\Support\Str;
 use JsonException;
 use RuntimeException;
 
-final readonly class ProcessOrbitRepository implements OrbitRepository
+final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitRepository
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -561,6 +563,144 @@ final readonly class ProcessOrbitRepository implements OrbitRepository
             treeSha: trim($tree->output()),
             artifactSha: $artifact?->artifactSha,
             planContentsHash: $artifact?->planContentsHash,
+        );
+    }
+
+    public function verifyImplementationOutcome(
+        OrbitProjectConfig $config,
+        PreparedWorktree $startupWorktree,
+        PreparedIssueSnapshot $snapshot,
+        string $reviewedCandidateSha,
+        string $candidateSha,
+        string $artifactSha,
+        string $gateReceiptPath,
+        string $pullRequestBody,
+    ): VerifiedOrbitImplementationOutcome {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($startupWorktree->path);
+        $common = $repository === false ? false : realpath($repository.'/.git');
+        $flow = $repository === false ? false : realpath($repository.'/bin/loop-flow');
+        $artifacts = $repository === false ? false : realpath($repository.'/bin/loop-artifacts');
+
+        if ($repository === false || $root === false || $path === false || $path !== $startupWorktree->path
+            || $common === false || ! is_dir($common) || is_link($repository.'/.git')
+            || $flow === false || ! is_executable($flow)
+            || $artifacts === false || ! is_executable($artifacts)
+            || ! str_starts_with($path, $root.'/')
+            || preg_match('/^ORB-[0-9]+$/', $snapshot->issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $startupWorktree->headSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $reviewedCandidateSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $artifactSha) !== 1
+            || trim($gateReceiptPath) === '' || trim($pullRequestBody) === '') {
+            throw new OrbitRepositoryFailed('The Orbit implementation outcome metadata is invalid.');
+        }
+
+        $branch = Str::lower($snapshot->issueKey);
+
+        try {
+            $inventory = Process::path($repository)->timeout(10)->run(['git', 'worktree', 'list', '--porcelain']);
+            $status = Process::path($path)->timeout(10)->run(['git', 'status', '--porcelain']);
+            $conflicts = Process::path($path)->timeout(10)->run(['git', 'diff', '--name-only', '--diff-filter=U']);
+            $head = Process::path($path)->timeout(10)->run(['git', 'rev-parse', 'HEAD']);
+            $tree = Process::path($path)->timeout(10)->run(['git', 'rev-parse', 'HEAD^{tree}']);
+            $actualCommon = Process::path($path)->timeout(10)->run([
+                'git', 'rev-parse', '--path-format=absolute', '--git-common-dir',
+            ]);
+            $startupAncestor = Process::path($path)->timeout(10)->run([
+                'git', 'merge-base', '--is-ancestor', $startupWorktree->headSha, $candidateSha,
+            ]);
+            $reviewedAncestor = Process::path($path)->timeout(10)->run([
+                'git', 'merge-base', '--is-ancestor', $reviewedCandidateSha, $candidateSha,
+            ]);
+            $candidateLoop = Process::path($path)->timeout(10)->run([
+                'git', 'ls-tree', '-r', '--name-only', $candidateSha, '--', '.loop',
+            ]);
+            $selectedFlow = Process::path($repository)->timeout(10)->run([$flow, 'status', '--worktree='.$path]);
+            $remote = Process::path($path)->timeout(30)->run([
+                'git', 'ls-remote', 'origin', 'refs/heads/'.$branch,
+            ]);
+            $publishedArtifact = Process::path($path)->timeout(120)->run([
+                $artifacts,
+                'fetch',
+                $snapshot->issueKey,
+                '--candidate='.$candidateSha,
+                '--expected-artifact='.$artifactSha,
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The Orbit implementation outcome could not be inspected.', 0, $exception);
+        }
+
+        if ($inventory->failed() || ! $this->hasExactIssueWorktree($inventory->output(), $path, $branch)
+            || $status->failed() || trim($status->output()) !== ''
+            || $conflicts->failed() || trim($conflicts->output()) !== ''
+            || $head->failed() || trim($head->output()) !== $candidateSha
+            || $tree->failed() || preg_match('/^[a-f0-9]{40}$/', trim($tree->output())) !== 1
+            || $startupAncestor->failed() || $reviewedAncestor->failed()
+            || $candidateLoop->failed() || trim($candidateLoop->output()) !== ''
+            || $selectedFlow->failed() || trim($selectedFlow->output()) !== 'discovery') {
+            throw new OrbitRepositoryFailed('The Orbit implementation outcome no longer matches its issue worktree.');
+        }
+
+        $resolvedCommon = $actualCommon->failed() ? false : realpath(trim($actualCommon->output()));
+        $remoteFields = preg_split('/\s+/', trim($remote->output())) ?: [];
+
+        if ($resolvedCommon === false || $resolvedCommon !== $common
+            || $remote->failed() || $remoteFields !== [$candidateSha, 'refs/heads/'.$branch]) {
+            throw new OrbitRepositoryFailed('The pushed Orbit implementation candidate does not match its branch.');
+        }
+
+        if ($publishedArtifact->failed()) {
+            $details = trim($publishedArtifact->errorOutput()) ?: trim($publishedArtifact->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit implementation artifact verification failed: '.$details);
+        }
+
+        try {
+            $artifact = json_decode($publishedArtifact->output(), true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The Orbit implementation artifact result is invalid.', 0, $exception);
+        }
+
+        $expectedRef = 'refs/tags/loop/'.$branch.'/'.$candidateSha;
+
+        if (! is_array($artifact) || array_is_list($artifact)
+            || $artifact !== [
+                'candidate' => $candidateSha,
+                'ref' => $expectedRef,
+                'artifacts' => $artifactSha,
+            ]) {
+            throw new OrbitRepositoryFailed('The published Orbit implementation artifact does not match its candidate.');
+        }
+
+        $candidate = new PreparedWorktree($path, $candidateSha);
+        $treeSha = trim($tree->output());
+        $gate = $this->validatedCandidateReceiptPath($gateReceiptPath, $candidate, $treeSha, $path, $common);
+        $requiredBodyBindings = [
+            'Issue: '.$snapshot->issueKey,
+            $candidateSha,
+            $artifactSha,
+            'discovery',
+            'Builder gate: passed ('.$gate.')',
+        ];
+
+        if (collect($requiredBodyBindings)->contains(
+            static fn (string $binding): bool => ! str_contains($pullRequestBody, $binding),
+        )) {
+            throw new OrbitRepositoryFailed('The Orbit pull request body is missing an implementation binding.');
+        }
+
+        $this->verifyIssueSnapshot($config, $startupWorktree, $snapshot);
+
+        return new VerifiedOrbitImplementationOutcome(
+            candidateSha: $candidateSha,
+            treeSha: $treeSha,
+            artifactSha: $artifactSha,
+            gateReceiptPath: $gate,
+            pullRequestBodyHash: hash('sha256', $pullRequestBody),
+            flow: 'discovery',
         );
     }
 
