@@ -345,6 +345,90 @@ PROMPT;
 
     /**
      * @param  array<string, mixed>  $implementationReceipt
+     * @param  array<string, mixed>  $reviewReceipt
+     * @param  array<string, mixed>  $pullRequest
+     * @param  array<string, mixed>  $publishedReview
+     */
+    public function pullRequestCorrectionPrompt(
+        string $issueKey,
+        string $worktree,
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        string $receiptCommand,
+        array $implementationReceipt,
+        array $reviewReceipt,
+        array $pullRequest,
+        array $publishedReview,
+    ): string {
+        $implementation = json_encode(
+            $implementationReceipt,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+        $review = json_encode(
+            $reviewReceipt,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+        $published = json_encode(
+            ['pull_request' => $pullRequest, 'published_review' => $publishedReview],
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+
+        return <<<PROMPT
+Address every independent pull request review finding for {$issueKey} in the retained Builder.
+
+Issue: {$issueKey}
+Worktree: {$worktree}
+Assigned phase: implementing
+Flow: discovery
+Delivery: {$deliveryId}
+Phase run: {$phaseRunId}
+Dispatch: {$dispatchId}
+Current process skill: {$worktree}/.agents/skills/developing-features/SKILL.md
+
+Preserve the approved plan and prior implementation evidence. The independent reviewer
+published changes for this exact implementation:
+
+```json
+{$implementation}
+```
+
+```json
+{$review}
+```
+
+```json
+{$published}
+```
+
+Address every review finding. You may coordinate bounded native helpers within this process,
+but you must integrate their work and stop them before handoff. Do not change Linear, create or
+merge a GitHub pull request, publish a review, or invoke the legacy Orbit controller's advance
+command.
+
+Run the required checks through the retained Builder, commit the correction, push the exact
+issue branch, and publish the corrected candidate artifact. Update the complete pull request
+body inside `.loop/runtime/` and write the complete correction handoff there. Keep `.loop`
+untracked.
+
+Before ending, run one receipt command from the assigned worktree root.
+
+Ready:
+`{$receiptCommand} --result=ready --handoff=.loop/runtime/implementation-handoff.md --artifact=FULL_SHA --gate=ABSOLUTE_GATE_PATH --body=.loop/runtime/pull-request-body.md`
+
+Blocked:
+`{$receiptCommand} --result=blocked --handoff=.loop/runtime/implementation-handoff.md`
+
+For ready, replace `FULL_SHA` and `ABSOLUTE_GATE_PATH` with the exact corrected artifact SHA
+and successful Builder gate receipt. The receipt command independently verifies the clean
+pushed candidate, artifact, gate, and pull request body. Correct a reported structural error
+before returning. If correction cannot complete, use `blocked` and record its classification,
+evidence, and smallest next action in the handoff. Return the receipt ID and stop.
+PROMPT;
+    }
+
+    /**
+     * @param  array<string, mixed>  $implementationReceipt
      * @param  array<string, mixed>  $pullRequest
      */
     public function pullRequestReviewPrompt(

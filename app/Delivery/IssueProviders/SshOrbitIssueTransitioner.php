@@ -53,7 +53,7 @@ GRAPHQL;
             $expectedContractHash,
             $clearNickAssignee,
         );
-        $targetStateId = $this->targetStateId($current, $targetState, $clearNickAssignee);
+        $targetStateId = $this->targetStateId($current, $targetState);
         $state = $current->payload['state'] ?? null;
         $assignee = $current->payload['assignee'] ?? null;
         $attemptedMutation = is_array($state) && (
@@ -145,20 +145,19 @@ GRAPHQL;
     private function targetStateId(
         OrbitIssueSnapshot $current,
         string $targetState,
-        bool $active,
     ): string {
         $team = $current->payload['team'] ?? null;
         $states = is_array($team) ? ($team['states'] ?? null) : null;
         $nodes = is_array($states) ? ($states['nodes'] ?? null) : null;
         $currentState = $current->payload['state'] ?? null;
 
+        $allowedCurrentStates = $targetState === 'In Progress'
+            ? ['Todo', 'In Progress', 'In Review']
+            : ['In Progress', 'In Review'];
+
         if (! is_array($nodes) || ! is_array($currentState)
             || ! $this->isUuid($currentState['id'] ?? null)
-            || ! in_array(
-                $currentState['name'] ?? null,
-                $active ? ['In Progress', 'In Review'] : ['Todo', 'In Progress'],
-                true,
-            )) {
+            || ! in_array($currentState['name'] ?? null, $allowedCurrentStates, true)) {
             throw new OrbitIssueTransitionFailed('The Orbit issue has invalid workflow state metadata.');
         }
 

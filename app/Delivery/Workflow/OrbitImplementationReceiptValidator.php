@@ -14,7 +14,10 @@ use App\Models\Receipt;
 
 final readonly class OrbitImplementationReceiptValidator
 {
-    public function __construct(private OrbitPlanReviewReceiptValidator $reviewReceipts) {}
+    public function __construct(
+        private OrbitPlanReviewReceiptValidator $reviewReceipts,
+        private OrbitFeatureWorkflow $workflow,
+    ) {}
 
     public function matches(
         Delivery $delivery,
@@ -94,15 +97,28 @@ final readonly class OrbitImplementationReceiptValidator
         $receiptId = is_array($input) ? ($input['implementation_receipt_id'] ?? null) : null;
         $payload = is_array($input) ? ($input['implementation_receipt'] ?? null) : null;
         $pullRequest = is_array($input) ? ($input['pull_request'] ?? null) : null;
-
-        if (! is_int($receiptId) || ! is_array($payload) || array_is_list($payload)
-            || ! is_array($pullRequest) || array_is_list($pullRequest)
-            || array_diff(array_keys($input), [
+        $isPullRequestReviewCorrection = is_array($input)
+            && array_key_exists('pr_review_receipt_id', $input);
+        $allowed = $isPullRequestReviewCorrection
+            ? [
+                'pr_review_receipt_id',
+                'pr_review_receipt',
                 'implementation_receipt_id',
                 'implementation_receipt',
                 'pull_request',
-            ]) !== []
-            || count($input) !== 3) {
+                'published_review',
+            ]
+            : [
+                'implementation_receipt_id',
+                'implementation_receipt',
+                'pull_request',
+            ];
+        $expectedMergeable = $isPullRequestReviewCorrection;
+
+        if (! is_int($receiptId) || ! is_array($payload) || array_is_list($payload)
+            || ! is_array($pullRequest) || array_is_list($pullRequest)
+            || array_diff(array_keys($input), $allowed) !== []
+            || count($input) !== count($allowed)) {
             return false;
         }
 
@@ -128,7 +144,7 @@ final readonly class OrbitImplementationReceiptValidator
                 'result' => 'ready',
                 'pull_request_number' => $delivery->pull_request_number,
                 'pull_request_url' => $delivery->pull_request_url,
-                'mergeable' => false,
+                'mergeable' => $expectedMergeable,
             ]
             && $sourceDispatches->count() === 1
             && $sourceDispatch->agent_role === OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
@@ -156,9 +172,160 @@ final readonly class OrbitImplementationReceiptValidator
             && $pullRequest === [
                 'number' => $delivery->pull_request_number,
                 'url' => $delivery->pull_request_url,
-                'mergeable' => false,
+                'mergeable' => $expectedMergeable,
             ]
-            && $this->matches($sourceDelivery, $source, $sourceDispatch, $receipt);
+            && $this->matches($sourceDelivery, $source, $sourceDispatch, $receipt)
+            && (! $isPullRequestReviewCorrection || $this->matchesPullRequestReviewCorrection(
+                $delivery,
+                $correction,
+                $receipt,
+            ));
+    }
+
+    private function matchesPullRequestReviewCorrection(
+        Delivery $delivery,
+        PhaseRun $correction,
+        Receipt $implementationReceipt,
+    ): bool {
+        $input = $correction->input;
+        $reviewReceiptId = is_array($input) ? ($input['pr_review_receipt_id'] ?? null) : null;
+        $reviewPayload = is_array($input) ? ($input['pr_review_receipt'] ?? null) : null;
+        $published = is_array($input) ? ($input['published_review'] ?? null) : null;
+
+        if (! is_int($reviewReceiptId) || ! is_array($reviewPayload) || array_is_list($reviewPayload)
+            || ! is_array($published) || array_is_list($published)) {
+            return false;
+        }
+
+        $pullRequest = $this->associativeArray($input['pull_request'] ?? null);
+
+        if ($pullRequest === null) {
+            return false;
+        }
+
+        $reviewReceipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($reviewReceiptId);
+        $review = $reviewReceipt?->phaseRun;
+        $reviewDispatches = $review?->agentDispatches;
+        $reviewDispatch = $reviewDispatches?->first();
+        $implementationPayload = $implementationReceipt->payload;
+        $expectedReviewPrompt = $review === null || $reviewDispatch === null
+            ? null
+            : $this->workflow->pullRequestReviewPrompt(
+                (string) $delivery->external_issue_key,
+                (string) $delivery->worktree_path,
+                $delivery->id,
+                $review->id,
+                $reviewDispatch->id,
+                sprintf(
+                    '%s %s delivery:submit-orbit-pr-review-receipt %d %d',
+                    escapeshellarg(PHP_BINARY),
+                    escapeshellarg(base_path('artisan')),
+                    $review->id,
+                    $reviewDispatch->id,
+                ),
+                $implementationPayload,
+                $pullRequest,
+            );
+        $reviewAllowed = [
+            'kind', 'schema_version', 'delivery_id', 'dispatch_id', 'issue_key', 'phase', 'attempt',
+            'result', 'worktree', 'candidate_sha', 'handoff_path', 'handoff', 'artifact_sha',
+            'pull_request_body_path', 'pull_request_body', 'pull_request_body_sha256',
+        ];
+        $reviewHandoff = $reviewPayload['handoff'] ?? null;
+
+        return $reviewReceipt !== null && $review !== null
+            && $reviewDispatches !== null && $reviewDispatch !== null
+            && $review->delivery_id === $delivery->id
+            && $review->phase_name === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            && $review->attempt === 1
+            && $review->status === PhaseRunStatus::Completed
+            && $review->finished_at !== null
+            && $review->current_block === null
+            && $reviewDispatches->count() === 1
+            && $reviewDispatch->agent_role === OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
+            && $reviewDispatch->status === AgentDispatchStatus::Settled
+            && $reviewDispatch->settled_at !== null
+            && $reviewDispatch->idempotency_key === IdempotencyKey::forDispatch(
+                $delivery->id,
+                OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+                1,
+                OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+            )->value
+            && $reviewDispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-pr-review-1'
+            && $reviewDispatch->prompt_name === 'orbit_pr_review'
+            && $reviewDispatch->prompt_version === 1
+            && is_string($expectedReviewPrompt)
+            && hash_equals($reviewDispatch->prompt_hash, hash('sha256', $expectedReviewPrompt))
+            && $reviewDispatch->dispatched_at !== null
+            && $review->receipts()->where('kind', 'orbit_pr_review')->count() === 1
+            && $reviewReceipt->kind === 'orbit_pr_review'
+            && $reviewReceipt->schema_version === 1
+            && $reviewReceipt->validation_status === ReceiptValidationStatus::Valid
+            && $reviewReceipt->validated_at !== null
+            && hash_equals(
+                $reviewReceipt->payload_hash,
+                hash('sha256', json_encode($reviewReceipt->payload, JSON_THROW_ON_ERROR)),
+            )
+            && $reviewReceipt->payload === $reviewPayload
+            && $reviewReceipt->candidate_sha === ($implementationPayload['candidate_sha'] ?? null)
+            && array_diff(array_keys($reviewPayload), $reviewAllowed) === []
+            && count($reviewPayload) === count($reviewAllowed)
+            && ($reviewPayload['kind'] ?? null) === 'orbit_pr_review'
+            && ($reviewPayload['schema_version'] ?? null) === 1
+            && ($reviewPayload['delivery_id'] ?? null) === $delivery->id
+            && ($reviewPayload['dispatch_id'] ?? null) === $reviewDispatch->id
+            && ($reviewPayload['issue_key'] ?? null) === $delivery->external_issue_key
+            && ($reviewPayload['phase'] ?? null) === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            && ($reviewPayload['attempt'] ?? null) === 1
+            && ($reviewPayload['result'] ?? null) === 'changes'
+            && ($reviewPayload['worktree'] ?? null) === $delivery->worktree_path
+            && ($reviewPayload['candidate_sha'] ?? null) === ($implementationPayload['candidate_sha'] ?? null)
+            && ($reviewPayload['artifact_sha'] ?? null) === ($implementationPayload['artifact_sha'] ?? null)
+            && is_string($reviewPayload['handoff_path'] ?? null)
+            && str_starts_with($reviewPayload['handoff_path'], '.loop/')
+            && is_string($reviewHandoff) && trim($reviewHandoff) !== ''
+            && ($reviewPayload['pull_request_body_path'] ?? null) === null
+            && ($reviewPayload['pull_request_body'] ?? null) === null
+            && ($reviewPayload['pull_request_body_sha256'] ?? null) === null
+            && $review->input === [
+                'implementation_receipt_id' => $implementationReceipt->id,
+                'implementation_receipt' => $implementationPayload,
+                'pull_request' => $pullRequest,
+            ]
+            && $published === [
+                'id' => $published['id'] ?? null,
+                'reviewer_login' => 'tom-nckrtl[bot]',
+                'candidate_sha' => $implementationPayload['candidate_sha'] ?? null,
+                'state' => 'CHANGES_REQUESTED',
+                'review_body_sha256' => hash('sha256', $reviewHandoff),
+                'pull_request_body_sha256' => $implementationPayload['pull_request_body_sha256'] ?? null,
+            ]
+            && is_int($published['id'] ?? null) && $published['id'] > 0
+            && $review->output === [
+                'receipt_id' => $reviewReceipt->id,
+                'result' => 'changes',
+                'published_review' => $published,
+            ];
+    }
+
+    /** @return array<string, mixed>|null */
+    private function associativeArray(mixed $value): ?array
+    {
+        if (! is_array($value) || array_is_list($value)) {
+            return null;
+        }
+
+        $normalized = [];
+
+        foreach ($value as $key => $item) {
+            if (! is_string($key)) {
+                return null;
+            }
+
+            $normalized[$key] = $item;
+        }
+
+        return $normalized;
     }
 
     /** @param array<string, mixed> $payload */

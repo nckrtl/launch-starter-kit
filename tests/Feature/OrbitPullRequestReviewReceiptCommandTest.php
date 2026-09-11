@@ -61,6 +61,19 @@ final class PullRequestReviewReceiptRepository implements OrbitImplementationRep
 
     public string $expectedBody;
 
+    public string $expectedReviewedCandidateSha;
+
+    public string $expectedCandidateSha;
+
+    public string $expectedArtifactSha;
+
+    public function __construct()
+    {
+        $this->expectedReviewedCandidateSha = str_repeat('a', 40);
+        $this->expectedCandidateSha = str_repeat('b', 40);
+        $this->expectedArtifactSha = str_repeat('c', 40);
+    }
+
     public function verifyImplementationOutcome(
         OrbitProjectConfig $config,
         PreparedWorktree $startupWorktree,
@@ -74,9 +87,9 @@ final class PullRequestReviewReceiptRepository implements OrbitImplementationRep
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
             ->and($startupWorktree->headSha)->toBe(str_repeat('a', 40))
             ->and($snapshot->issueKey)->toBe('ORB-234')
-            ->and($reviewedCandidateSha)->toBe(str_repeat('a', 40))
-            ->and($candidateSha)->toBe(str_repeat('b', 40))
-            ->and($artifactSha)->toBe(str_repeat('c', 40))
+            ->and($reviewedCandidateSha)->toBe($this->expectedReviewedCandidateSha)
+            ->and($candidateSha)->toBe($this->expectedCandidateSha)
+            ->and($artifactSha)->toBe($this->expectedArtifactSha)
             ->and($pullRequestBody)->toBe($this->expectedBody);
         $this->calls++;
 
@@ -111,6 +124,13 @@ final class PullRequestReviewReceiptPullRequests implements OrbitPullRequestInsp
 
     public string $submittedBody;
 
+    public string $expectedCandidateSha;
+
+    public function __construct()
+    {
+        $this->expectedCandidateSha = str_repeat('b', 40);
+    }
+
     public function inspect(
         int $number,
         string $issueKey,
@@ -120,7 +140,7 @@ final class PullRequestReviewReceiptPullRequests implements OrbitPullRequestInsp
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
             ->and($number)->toBe(42)
             ->and($issueKey)->toBe('ORB-234')
-            ->and($candidateSha)->toBe(str_repeat('b', 40))
+            ->and($candidateSha)->toBe($this->expectedCandidateSha)
             ->and($pullRequestBody)->toBe($this->submittedBody);
         $this->calls++;
 
@@ -614,6 +634,135 @@ function prReviewReceiptComplete(PhaseRun $phase, Receipt $receipt, array $outpu
     ])->save();
 }
 
+function promotePullRequestReviewReceiptToSecondRound(object $test): void
+{
+    $arguments = [...$test->arguments, '--result' => 'changes'];
+    unset($arguments['--body']);
+    $test->repository->expectedBody = $test->submittedBody;
+    $test->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)->assertSuccessful();
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    app(AdvanceOrbitPullRequestReview::class)->handle($test->delivery->id, $test->phaseRun->id);
+
+    $correction = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    $builder = $correction->agentDispatches()->sole();
+    $builder->forceFill([
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'workspace',
+        'herdr_tab_id' => 'tab',
+        'herdr_pane_id' => 'builder-pane',
+        'herdr_terminal_id' => 'builder-terminal',
+        'herdr_agent_id' => 'builder-agent',
+        'prompt_hash' => str_repeat('5', 64),
+        'status' => AgentDispatchStatus::Settled,
+        'dispatched_at' => now(),
+        'settled_at' => now(),
+    ])->save();
+    $correctionPayload = [
+        'kind' => 'orbit_implementation', 'schema_version' => 1,
+        'delivery_id' => $test->delivery->id, 'dispatch_id' => $builder->id,
+        'issue_key' => 'ORB-234', 'phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'attempt' => 2, 'result' => 'ready', 'worktree' => $test->worktreePath,
+        'reviewed_candidate_sha' => $test->candidateSha,
+        'candidate_sha' => $test->candidateSha,
+        'handoff_path' => '.loop/runtime/implementation-correction.md',
+        'handoff' => 'The review finding was corrected.',
+        'artifact_sha' => $test->artifactSha,
+        'gate_receipt_path' => $test->gatePath,
+        'pull_request_body_path' => '.loop/runtime/submitted-body.md',
+        'pull_request_body' => $test->submittedBody,
+        'pull_request_body_sha256' => hash('sha256', $test->submittedBody),
+        'flow' => 'discovery',
+    ];
+    $correctionReceipt = prReviewStoredReceipt($correction, 'orbit_implementation', $correctionPayload);
+    $correction->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'output' => [
+            'receipt_id' => $correctionReceipt->id,
+            'result' => 'ready',
+            'pull_request_number' => 42,
+            'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+            'mergeable' => true,
+        ],
+        'started_at' => now(),
+        'finished_at' => now(),
+    ])->save();
+    $secondReview = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Running,
+        'input' => [
+            'implementation_receipt_id' => $correctionReceipt->id,
+            'implementation_receipt' => $correctionPayload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => true,
+            ],
+        ],
+        'started_at' => now(),
+    ]);
+    $reviewer = AgentDispatch::query()->create([
+        'phase_run_id' => $secondReview->id,
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $test->delivery->id,
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+            2,
+            OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-pr-review-2',
+        'prompt_name' => 'orbit_pr_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Waiting,
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'workspace',
+        'herdr_tab_id' => 'tab',
+        'herdr_pane_id' => 'reviewer-pane-2',
+        'herdr_terminal_id' => 'reviewer-terminal-2',
+        'herdr_agent_id' => 'reviewer-agent-2',
+        'dispatched_at' => now(),
+    ]);
+    $prompt = app(OrbitFeatureWorkflow::class)->pullRequestReviewPrompt(
+        'ORB-234',
+        $test->worktreePath,
+        $test->delivery->id,
+        $secondReview->id,
+        $reviewer->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-pr-review-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $secondReview->id,
+            $reviewer->id,
+        ),
+        $correctionPayload,
+        $secondReview->input['pull_request'],
+    );
+    $reviewer->forceFill(['prompt_hash' => hash('sha256', $prompt)])->save();
+    $test->phaseRun = $secondReview;
+    $test->dispatch = $reviewer;
+    $test->delivery->refresh()->forceFill([
+        'candidate_sha' => $test->candidateSha,
+        'current_phase' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'status' => DeliveryStatus::WaitingForAgent,
+    ])->save();
+    $test->arguments['phase-run'] = (string) $secondReview->id;
+    $test->arguments['dispatch'] = (string) $reviewer->id;
+    $test->repository->expectedReviewedCandidateSha = $test->candidateSha;
+    $test->repository->expectedBody = $test->approvedBody;
+    $test->repository->calls = 0;
+    $test->pullRequests->calls = 0;
+    $test->reviewPublisher->calls = 0;
+}
+
 it('captures one immutable approved pull request review receipt', function () {
     $this->artisan('delivery:submit-orbit-pr-review-receipt', $this->arguments)->assertSuccessful();
 
@@ -648,6 +797,86 @@ it('captures one immutable approved pull request review receipt', function () {
         ->and($this->repository->calls)->toBe(1)
         ->and($this->pullRequests->calls)->toBe(1);
     Queue::assertPushed(AdvanceDelivery::class, 1);
+});
+
+it('captures and validates the second independent pull request review receipt', function () {
+    promotePullRequestReviewReceiptToSecondRound($this);
+
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $this->arguments)->assertSuccessful();
+
+    $receipt = Receipt::query()
+        ->where('phase_run_id', $this->phaseRun->id)
+        ->where('kind', 'orbit_pr_review')
+        ->sole();
+
+    expect($receipt->payload['attempt'])->toBe(2)
+        ->and($receipt->payload['result'])->toBe('approved')
+        ->and(app(OrbitPullRequestReviewReceiptValidator::class)->matches(
+            $this->delivery->fresh(),
+            $this->phaseRun->fresh(),
+            $this->dispatch->fresh(),
+            $receipt,
+        ))->toBeTrue()
+        ->and($this->repository->calls)->toBe(1)
+        ->and($this->pullRequests->calls)->toBe(1);
+});
+
+it('routes second-round approval to landing', function () {
+    promotePullRequestReviewReceiptToSecondRound($this);
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $this->arguments)->assertSuccessful();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    $this->repository->expectedBody = $this->submittedBody;
+
+    $action = app(AdvanceOrbitPullRequestReview::class);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+
+    $landing = PhaseRun::query()->where('phase_name', OrbitFeatureWorkflow::LANDING_PHASE)->sole();
+    $reviewReceipt = $this->phaseRun->receipts()->where('kind', 'orbit_pr_review')->sole();
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->phaseRun->fresh()->output['result'])->toBe('approved')
+        ->and($landing->input['pr_review_receipt_id'])->toBe($reviewReceipt->id)
+        ->and($landing->input['implementation_receipt']['attempt'])->toBe(2)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::LANDING_PHASE)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::ReadyToMerge)
+        ->and($this->reviewPublisher->calls)->toBe(1)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->where('attempt', 3)
+            ->doesntExist())->toBeTrue();
+});
+
+it('routes repeated pull request findings to resolution without a third Builder attempt', function () {
+    promotePullRequestReviewReceiptToSecondRound($this);
+    $arguments = [...$this->arguments, '--result' => 'changes'];
+    unset($arguments['--body']);
+    $this->repository->expectedBody = $this->submittedBody;
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)->assertSuccessful();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+
+    $action = app(AdvanceOrbitPullRequestReview::class);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+    $action->handle($this->delivery->id, $this->phaseRun->id);
+
+    $resolution = PhaseRun::query()->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)->sole();
+
+    expect($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->phaseRun->fresh()->output['result'])->toBe('changes')
+        ->and($resolution->input['pr_review_receipt']['attempt'])->toBe(2)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->reviewPublisher->calls)->toBe(1)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->where('attempt', 3)
+            ->doesntExist())->toBeTrue();
 });
 
 it('captures changes and blocked without a replacement pull request body', function (string $result) {
@@ -892,7 +1121,7 @@ it('publishes approval once and creates one system-owned landing intent', functi
         ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
 });
 
-it('publishes changes and creates an inert retained-Builder correction intent', function () {
+it('publishes changes and queues the retained Builder correction', function () {
     $receipt = capturePullRequestReviewForAdvancement($this, 'changes');
 
     app(AdvanceOrbitPullRequestReview::class)->handle($this->delivery->id, $this->phaseRun->id);
@@ -917,7 +1146,10 @@ it('publishes changes and creates an inert retained-Builder correction intent', 
         ->and($this->reviewPublisher->calls)->toBe(1);
 
     app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
-    Queue::assertNotPushed(DispatchOrbitImplementation::class);
+    Queue::assertPushed(
+        DispatchOrbitImplementation::class,
+        fn (DispatchOrbitImplementation $job): bool => $job->deliveryId === $this->delivery->id,
+    );
 });
 
 it('routes blocked review to resolution without any GitHub publication', function () {

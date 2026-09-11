@@ -97,7 +97,7 @@ final readonly class OrbitPullRequestReviewReceiptValidator
             && ($payload['dispatch_id'] ?? null) === $dispatch->id
             && ($payload['issue_key'] ?? null) === $delivery->external_issue_key
             && ($payload['phase'] ?? null) === OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            && ($payload['attempt'] ?? null) === 1
+            && ($payload['attempt'] ?? null) === $phase->attempt
             && in_array($payload['result'] ?? null, ['approved', 'changes', 'blocked'], true)
             && ($payload['worktree'] ?? null) === $delivery->worktree_path
             && ($payload['candidate_sha'] ?? null) === $delivery->candidate_sha
@@ -140,17 +140,17 @@ final readonly class OrbitPullRequestReviewReceiptValidator
 
         return $phase->delivery_id === $delivery->id
             && $phase->phase_name === OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            && $phase->attempt === 1
+            && in_array($phase->attempt, [1, 2], true)
             && $phase->agentDispatches()->count() === 1
             && $dispatch->phase_run_id === $phase->id
             && $dispatch->agent_role === OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
             && $dispatch->idempotency_key === IdempotencyKey::forDispatch(
                 $delivery->id,
                 OrbitFeatureWorkflow::PR_REVIEW_PHASE,
-                1,
+                $phase->attempt,
                 OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
             )->value
-            && $dispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-pr-review-1'
+            && $dispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-pr-review-'.$phase->attempt
             && $dispatch->prompt_name === 'orbit_pr_review'
             && $dispatch->prompt_version === 1
             && hash_equals($dispatch->prompt_hash, hash('sha256', $expectedPrompt))

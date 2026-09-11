@@ -143,7 +143,7 @@ final readonly class DispatchOrbitPullRequestReview
             || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
             || $project->state !== ProjectOrchestrationState::Enabled
-            || $phase?->attempt !== 1
+            || ! in_array($phase?->attempt, [1, 2], true)
             || ($expectedPhaseId !== null && $phase->id !== $expectedPhaseId)
             || ! in_array($delivery->status, [
                 DeliveryStatus::Queued,
@@ -188,7 +188,7 @@ final readonly class DispatchOrbitPullRequestReview
                 ->sortByDesc('attempt')
                 ->first();
 
-            if ($phase === null || $phase->attempt !== 1
+            if ($phase === null || ! in_array($phase->attempt, [1, 2], true)
                 || ($expectedPhaseId !== null && $phase->id !== $expectedPhaseId)) {
                 throw new OrbitPullRequestReviewDispatchFailed(
                     'The retained Orbit pull request review phase is inconsistent.',
@@ -227,7 +227,7 @@ final readonly class DispatchOrbitPullRequestReview
                 || $project->config !== $config->toArray()
                 || $phase->agentDispatches()->count() !== 1
                 || $dispatch->idempotency_key !== $expectedKey
-                || $dispatch->herdr_agent_name !== strtolower((string) $locked->external_issue_key).'-loop-pr-review-1'
+                || $dispatch->herdr_agent_name !== strtolower((string) $locked->external_issue_key).'-loop-pr-review-'.$phase->attempt
                 || $dispatch->prompt_name !== 'orbit_pr_review'
                 || $dispatch->prompt_version !== 1) {
                 throw new OrbitPullRequestReviewDispatchFailed(
@@ -705,7 +705,7 @@ final readonly class DispatchOrbitPullRequestReview
             $phase = PhaseRun::query()
                 ->where('delivery_id', $delivery->id)
                 ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
-                ->where('attempt', 1)
+                ->latest('attempt')
                 ->lockForUpdate()
                 ->firstOrFail();
             $dispatch = AgentDispatch::query()->whereKey($dispatchId)->lockForUpdate()->firstOrFail();

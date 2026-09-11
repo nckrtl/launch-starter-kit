@@ -396,13 +396,14 @@ final readonly class AdvanceOrbitImplementation
             $phase->save();
 
             if ($pullRequest->mergeable) {
+                $reviewAttempt = $this->pullRequestReviewAttempt($phase);
                 $this->createNextIntent(
                     $delivery,
                     $receipt,
                     OrbitFeatureWorkflow::PR_REVIEW_PHASE,
-                    1,
+                    $reviewAttempt,
                     OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
-                    strtolower((string) $delivery->external_issue_key).'-loop-pr-review-1',
+                    strtolower((string) $delivery->external_issue_key).'-loop-pr-review-'.$reviewAttempt,
                     'orbit_pr_review',
                     $pullRequest,
                 );
@@ -499,10 +500,9 @@ final readonly class AdvanceOrbitImplementation
             return false;
         }
 
-        $nextAttempt = $delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE ? 2 : 1;
         $next = $delivery->phaseRuns()
             ->where('phase_name', $delivery->current_phase)
-            ->where('attempt', $nextAttempt)
+            ->latest('attempt')
             ->first();
 
         if ($next === null || ! is_array($next->input)
@@ -521,6 +521,10 @@ final readonly class AdvanceOrbitImplementation
             || $phase->delivery_id !== $delivery->id
             || $phase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             || ! in_array($phase->attempt, [1, 2], true)
+            || ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE && $next->attempt !== 2)
+            || ($delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+                && $next->attempt !== $this->pullRequestReviewAttempt($phase))
+            || ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE && $next->attempt !== 1)
             || $phase->status !== PhaseRunStatus::Completed || $phase->finished_at === null) {
             throw new OrbitImplementationAdvancementFailed('The retained implementation transition is inconsistent.');
         }
@@ -574,7 +578,7 @@ final readonly class AdvanceOrbitImplementation
         };
         $expectedAgent = match ($delivery->current_phase) {
             OrbitFeatureWorkflow::IMPLEMENTATION_PHASE => strtolower((string) $delivery->external_issue_key).'-loop-builder',
-            OrbitFeatureWorkflow::PR_REVIEW_PHASE => strtolower((string) $delivery->external_issue_key).'-loop-pr-review-1',
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE => strtolower((string) $delivery->external_issue_key).'-loop-pr-review-'.$next->attempt,
             default => strtolower((string) $delivery->external_issue_key).'-loop-resolution-1',
         };
         $expectedPrompt = match ($delivery->current_phase) {
@@ -662,6 +666,15 @@ final readonly class AdvanceOrbitImplementation
         $source = is_array($input) ? ($input['implementation_receipt'] ?? null) : null;
 
         return is_array($source) ? ($source['candidate_sha'] ?? null) : null;
+    }
+
+    private function pullRequestReviewAttempt(PhaseRun $implementation): int
+    {
+        return $implementation->attempt === 2
+            && is_array($implementation->input)
+            && array_key_exists('pr_review_receipt_id', $implementation->input)
+                ? 2
+                : 1;
     }
 
     /** @param array<string, mixed> $payload */

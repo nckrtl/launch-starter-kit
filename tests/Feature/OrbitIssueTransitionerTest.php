@@ -256,6 +256,33 @@ it('transitions Todo to the exact In Progress state through Hermes and verifies 
     });
 });
 
+it('returns an issue from In Review to In Progress before a correction', function () {
+    $current = transitionSnapshot('In Review');
+    $readBack = transitionSnapshot('In Progress');
+    $provider = bindTransitionReadBack($readBack);
+    Process::fake(['*' => Process::result(output: '{"data":{"issueUpdate":{"success":true}}}')])
+        ->preventStrayProcesses();
+
+    $result = app(OrbitIssueTransitioner::class)->transitionToInProgress(
+        $current,
+        $this->contractHash,
+    );
+
+    expect($result)->toBe($readBack)
+        ->and($provider->requests)->toHaveCount(1);
+
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input)
+            && ($input['variables']['input'] ?? null) === [
+                'stateId' => '44444444-5555-4666-8777-888888888888',
+            ];
+    });
+});
+
 it('reconciles a lost mutation response when the exact Linear read-back succeeded', function () {
     $provider = bindTransitionReadBack(transitionSnapshot('In Progress'));
     $attempts = 0;

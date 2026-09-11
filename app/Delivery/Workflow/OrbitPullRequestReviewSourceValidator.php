@@ -43,17 +43,22 @@ final readonly class OrbitPullRequestReviewSourceValidator
             ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
             ->latest('attempt')
             ->first();
-        $expectedPrompt = $implementation?->attempt === 2
-            ? 'orbit_implementation_correction'
-            : 'orbit_implementation';
+        $expectedPrompt = match (true) {
+            $implementation?->attempt === 1 => 'orbit_implementation',
+            $implementation !== null
+                && is_array($implementation->input)
+                && array_key_exists('pr_review_receipt_id', $implementation->input) => 'orbit_pr_review_correction',
+            default => 'orbit_implementation_correction',
+        };
 
         if ($receipt === null || $implementation === null || $dispatch === null
             || $review->delivery_id !== $delivery->id
             || $review->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || $review->attempt !== 1
+            || ! in_array($review->attempt, [1, 2], true)
             || $implementation->delivery_id !== $delivery->id
             || $implementation->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             || ! in_array($implementation->attempt, [1, 2], true)
+            || $review->attempt !== $this->reviewAttempt($implementation)
             || ! ($latest?->id === $implementation->id
                 || ($retainedTransition && $this->matchesRetainedSuccessor(
                     $delivery,
@@ -165,5 +170,14 @@ final readonly class OrbitPullRequestReviewSourceValidator
         $sourceDelivery->candidate_sha = $sourceCandidate;
 
         return $this->receipts->matches($sourceDelivery, $implementation, $dispatch, $receipt);
+    }
+
+    private function reviewAttempt(PhaseRun $implementation): int
+    {
+        return $implementation->attempt === 2
+            && is_array($implementation->input)
+            && array_key_exists('pr_review_receipt_id', $implementation->input)
+                ? 2
+                : 1;
     }
 }
