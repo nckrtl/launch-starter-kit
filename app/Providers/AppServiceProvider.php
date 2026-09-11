@@ -4,6 +4,7 @@ namespace App\Providers;
 
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\HerdrWorkspaceRuntime;
+use App\Delivery\Contracts\OrbitAbandonedWorktreeCleaner;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
@@ -44,6 +45,7 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->bind(OrbitRepository::class, ProcessOrbitRepository::class);
+        $this->app->bind(OrbitAbandonedWorktreeCleaner::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitImplementationRepository::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitMainCacheRefreshRequester::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitIssueProvider::class, SshOrbitIssueProvider::class);

@@ -20,6 +20,8 @@ final readonly class OrbitFeatureWorkflow
 
     public const string LANDING_PHASE = 'landing';
 
+    public const string CLEANUP_PHASE = 'cleanup';
+
     public const string RESOLUTION_PHASE = 'resolution';
 
     public const string PLANNING_AGENT_ROLE = 'planner';

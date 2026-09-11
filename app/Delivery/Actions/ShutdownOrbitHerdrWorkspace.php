@@ -37,7 +37,7 @@ final readonly class ShutdownOrbitHerdrWorkspace
 
     public function __construct(private HerdrWorkspaceRuntime $herdr) {}
 
-    /** Return false when owned agents are still exiting and the landing job should retry. */
+    /** Return false when owned agents are still exiting and the owning job should retry. */
     public function handle(
         OrbitProjectConfig $config,
         int $deliveryId,
@@ -51,9 +51,17 @@ final readonly class ShutdownOrbitHerdrWorkspace
 
         if ($state === null) {
             if ($workspace === null) {
-                throw new OrbitLandingAdvancementFailed(
-                    'The recorded Orbit Herdr workspace disappeared before Commander requested its shutdown.',
-                );
+                if (! $this->isCleanupLedger($delivery, $phase)) {
+                    throw new OrbitLandingAdvancementFailed(
+                        'The recorded Orbit Herdr workspace disappeared before Commander requested its shutdown.',
+                    );
+                }
+
+                $this->assertRetainedWorkspaceAbsent($snapshot, $identity);
+                $state = $this->initialAbsentState($snapshot, $identity, $delivery);
+                $this->persistState($deliveryId, $phaseId, null, $state);
+
+                return true;
             }
 
             $this->assertWorkspace($workspace, $config, $delivery);
@@ -66,6 +74,18 @@ final readonly class ShutdownOrbitHerdrWorkspace
         }
 
         if ($workspace === null) {
+            if ($this->isAlreadyAbsentState($state)) {
+                if (! $this->isCleanupLedger($delivery, $phase)) {
+                    throw new OrbitLandingAdvancementFailed(
+                        'A reconciled absent workspace is not valid for Orbit landing cleanup.',
+                    );
+                }
+
+                $this->assertRetainedWorkspaceAbsent($snapshot, $identity);
+
+                return true;
+            }
+
             if (($state['workspace_close_attempted_at'] ?? null) === null) {
                 throw new OrbitLandingAdvancementFailed(
                     'The recorded Orbit Herdr workspace disappeared without a retained close intent.',
@@ -152,7 +172,7 @@ final readonly class ShutdownOrbitHerdrWorkspace
     }
 
     /**
-     * @return array{Delivery, PhaseRun, array{session: string, workspace_id: string, agent_names: list<string>}}
+     * @return array{Delivery, PhaseRun, array{session: string, workspace_id: string, agent_names: list<string>, pane_ids: list<string>, terminal_ids: list<string>}}
      */
     private function ledger(
         OrbitProjectConfig $config,
@@ -168,6 +188,8 @@ final readonly class ShutdownOrbitHerdrWorkspace
         $sessions = [];
         $workspaces = [];
         $names = [];
+        $paneIds = [];
+        $terminalIds = [];
 
         foreach ($dispatches as $dispatch) {
             if ($dispatch->status !== AgentDispatchStatus::Settled
@@ -184,19 +206,28 @@ final readonly class ShutdownOrbitHerdrWorkspace
             $sessions[] = $dispatch->herdr_session;
             $workspaces[] = $dispatch->herdr_workspace_id;
             $names[] = $dispatch->herdr_agent_name;
+            $paneIds[] = $dispatch->herdr_pane_id;
+            $terminalIds[] = $dispatch->herdr_terminal_id;
         }
 
         $sessions = array_values(array_unique($sessions));
         $workspaces = array_values(array_unique($workspaces));
         $names = array_values(array_unique($names));
         sort($names, SORT_STRING);
+        $paneIds = $this->sortedStrings($paneIds);
+        $terminalIds = $this->sortedStrings($terminalIds);
+
+        $landingLedger = $delivery->status === DeliveryStatus::Landed
+            && $delivery->current_phase === OrbitFeatureWorkflow::LANDING_PHASE
+            && $phase->phase_name === OrbitFeatureWorkflow::LANDING_PHASE;
+        $cleanupLedger = $delivery->status === DeliveryStatus::Cleaning
+            && $delivery->current_phase === OrbitFeatureWorkflow::CLEANUP_PHASE
+            && $phase->phase_name === OrbitFeatureWorkflow::CLEANUP_PHASE;
 
         if ($delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
             || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
-            || $delivery->status !== DeliveryStatus::Landed
-            || $delivery->current_phase !== OrbitFeatureWorkflow::LANDING_PHASE
+            || (! $landingLedger && ! $cleanupLedger)
             || $phase->delivery_id !== $delivery->id
-            || $phase->phase_name !== OrbitFeatureWorkflow::LANDING_PHASE
             || $phase->attempt !== 1 || $phase->status !== PhaseRunStatus::Running
             || $phase->current_block !== 'workspace_shutdown'
             || ! is_array($phase->output)
@@ -214,11 +245,48 @@ final readonly class ShutdownOrbitHerdrWorkspace
             'session' => $sessions[0],
             'workspace_id' => $workspaces[0],
             'agent_names' => $names,
+            'pane_ids' => $paneIds,
+            'terminal_ids' => $terminalIds,
         ]];
     }
 
     /**
-     * @param  array{session: string, workspace_id: string, agent_names: list<string>}  $identity
+     * @param  array{session: string, workspace_id: string, agent_names: list<string>, pane_ids: list<string>, terminal_ids: list<string>}  $identity
+     * @return array<string, mixed>
+     */
+    private function initialAbsentState(
+        HerdrSessionSnapshot $snapshot,
+        array $identity,
+        Delivery $delivery,
+    ): array {
+        return [
+            'schema' => self::STATE_SCHEMA,
+            'protocol' => $snapshot->protocol,
+            'session' => $identity['session'],
+            'workspace_id' => $identity['workspace_id'],
+            'worktree_path' => $delivery->worktree_path,
+            'owned_agent_names' => $identity['agent_names'],
+            'protected_workspace_ids' => $this->workspaceIds($snapshot, $identity['workspace_id']),
+            'protected_agent_terminal_ids' => $this->agentTerminalIds($snapshot, $identity['workspace_id']),
+            'protected_pane_ids' => $this->snapshotPaneIds($snapshot, $identity['workspace_id']),
+            'target_agent_terminal_ids' => $identity['terminal_ids'],
+            'target_pane_ids' => $identity['pane_ids'],
+            'exit_attempted' => [],
+            'exit_submitted' => [],
+            'workspace_close_attempted_at' => null,
+            'closed' => [
+                'session' => $identity['session'],
+                'workspace_id' => $identity['workspace_id'],
+                'worktree_path' => $delivery->worktree_path,
+                'owned_agent_names' => $identity['agent_names'],
+                'disposition' => 'already_absent',
+                'verified_at' => now()->toISOString(),
+            ],
+        ];
+    }
+
+    /**
+     * @param  array{session: string, workspace_id: string, agent_names: list<string>, pane_ids: list<string>, terminal_ids: list<string>}  $identity
      * @return array<string, mixed>
      */
     private function initialState(
@@ -249,7 +317,7 @@ final readonly class ShutdownOrbitHerdrWorkspace
     }
 
     /**
-     * @param  array{session: string, workspace_id: string, agent_names: list<string>}  $identity
+     * @param  array{session: string, workspace_id: string, agent_names: list<string>, pane_ids: list<string>, terminal_ids: list<string>}  $identity
      * @param  array<string, mixed>  $state
      */
     private function assertStateIdentity(array $state, array $identity, Delivery $delivery): void
@@ -280,7 +348,7 @@ final readonly class ShutdownOrbitHerdrWorkspace
     }
 
     /**
-     * @param  array{session: string, workspace_id: string, agent_names: list<string>}  $identity
+     * @param  array{session: string, workspace_id: string, agent_names: list<string>, pane_ids: list<string>, terminal_ids: list<string>}  $identity
      * @param  array<string, mixed>  $state
      * @return array{HerdrSessionSnapshot, array<string, mixed>}
      */
@@ -506,11 +574,14 @@ final readonly class ShutdownOrbitHerdrWorkspace
     /** @param array<string, mixed> $state */
     private function matchesClosedState(array $state, mixed $closed): bool
     {
+        $disposition = is_array($closed) ? ($closed['disposition'] ?? null) : null;
+
         return is_array($closed) && ! array_is_list($closed)
             && ($closed['session'] ?? null) === ($state['session'] ?? null)
             && ($closed['workspace_id'] ?? null) === ($state['workspace_id'] ?? null)
             && ($closed['worktree_path'] ?? null) === ($state['worktree_path'] ?? null)
             && ($closed['owned_agent_names'] ?? null) === ($state['owned_agent_names'] ?? null)
+            && ($disposition === null || $disposition === 'already_absent')
             && is_string($closed['verified_at'] ?? null)
             && $closed['verified_at'] !== '';
     }
@@ -528,14 +599,20 @@ final readonly class ShutdownOrbitHerdrWorkspace
             $output = $phase->output;
             $current = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
 
-            if ($delivery->status !== DeliveryStatus::Landed
-                || $delivery->current_phase !== OrbitFeatureWorkflow::LANDING_PHASE
+            $landingLedger = $delivery->status === DeliveryStatus::Landed
+                && $delivery->current_phase === OrbitFeatureWorkflow::LANDING_PHASE
+                && $phase->phase_name === OrbitFeatureWorkflow::LANDING_PHASE;
+            $cleanupLedger = $delivery->status === DeliveryStatus::Cleaning
+                && $delivery->current_phase === OrbitFeatureWorkflow::CLEANUP_PHASE
+                && $phase->phase_name === OrbitFeatureWorkflow::CLEANUP_PHASE;
+
+            if ((! $landingLedger && ! $cleanupLedger)
                 || $phase->delivery_id !== $delivery->id
                 || $phase->status !== PhaseRunStatus::Running
                 || $phase->current_block !== 'workspace_shutdown'
                 || ! is_array($output) || $current !== $expected) {
                 throw new OrbitLandingAdvancementFailed(
-                    'The Orbit landing ledger changed while recording Herdr workspace shutdown.',
+                    'The Orbit delivery ledger changed while recording Herdr workspace shutdown.',
                 );
             }
 
@@ -577,7 +654,59 @@ final readonly class ShutdownOrbitHerdrWorkspace
         }
     }
 
-    /** @param array{session: string, workspace_id: string, agent_names: list<string>} $identity */
+    /**
+     * @param  array{session: string, workspace_id: string, agent_names: list<string>, pane_ids: list<string>, terminal_ids: list<string>}  $identity
+     */
+    private function assertRetainedWorkspaceAbsent(
+        HerdrSessionSnapshot $snapshot,
+        array $identity,
+    ): void {
+        foreach ($snapshot->workspaces as $workspace) {
+            if ($workspace->workspaceId === $identity['workspace_id']) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The retained Orbit Herdr workspace is still present.',
+                );
+            }
+        }
+
+        foreach ($snapshot->agents as $agent) {
+            if ($agent->workspaceId === $identity['workspace_id']
+                || in_array($agent->paneId, $identity['pane_ids'], true)
+                || in_array($agent->terminalId, $identity['terminal_ids'], true)
+                || is_string($agent->name) && in_array($agent->name, $identity['agent_names'], true)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'A retained Orbit Herdr agent identity is still present.',
+                );
+            }
+        }
+
+        foreach ($snapshot->panes as $pane) {
+            if ($pane->workspaceId === $identity['workspace_id']
+                || in_array($pane->paneId, $identity['pane_ids'], true)
+                || in_array($pane->terminalId, $identity['terminal_ids'], true)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'A retained Orbit Herdr pane identity is still present.',
+                );
+            }
+        }
+    }
+
+    private function isCleanupLedger(Delivery $delivery, PhaseRun $phase): bool
+    {
+        return $delivery->status === DeliveryStatus::Cleaning
+            && $delivery->current_phase === OrbitFeatureWorkflow::CLEANUP_PHASE
+            && $phase->phase_name === OrbitFeatureWorkflow::CLEANUP_PHASE;
+    }
+
+    /** @param array<string, mixed> $state */
+    private function isAlreadyAbsentState(array $state): bool
+    {
+        $closed = $state['closed'] ?? null;
+
+        return is_array($closed) && ($closed['disposition'] ?? null) === 'already_absent';
+    }
+
+    /** @param array{session: string, workspace_id: string, agent_names: list<string>, pane_ids: list<string>, terminal_ids: list<string>} $identity */
     private function assertOwnedAgents(
         HerdrSessionSnapshot $snapshot,
         array $identity,

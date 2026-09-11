@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Delivery\Repositories;
 
+use App\Delivery\Contracts\OrbitAbandonedWorktreeCleaner;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
@@ -13,12 +14,14 @@ use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Contracts\OrbitWorktreeCleaner;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\CleanedOrbitAbandonedWorktree;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\OrbitProofCloseout;
 use App\Delivery\Data\PreparedIssueSnapshot;
+use App\Delivery\Data\PreparedOrbitAbandonedWorktreeCleanup;
 use App\Delivery\Data\PreparedOrbitWorktreeRemoval;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
@@ -35,7 +38,7 @@ use Illuminate\Support\Str;
 use JsonException;
 use RuntimeException;
 
-final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository, OrbitWorktreeCleaner
+final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCleaner, OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository, OrbitWorktreeCleaner
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -573,6 +576,376 @@ final readonly class ProcessOrbitRepository implements OrbitImplementationReposi
             evidenceArchives: $archives,
             removedAt: gmdate('Y-m-d\TH:i:s\Z'),
         );
+    }
+
+    public function prepareAbandonedWorktreeCleanup(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $cleanupAttemptId,
+    ): PreparedOrbitAbandonedWorktreeCleanup {
+        $context = $this->abandonedWorktreeCleanupContext(
+            $config,
+            $issueKey,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $cleanupAttemptId,
+        );
+        $this->refreshWorktreeCleanupState($context['repository']);
+        $state = $this->inspectAbandonedWorktreeState(
+            $context['repository'],
+            $worktree,
+            $branch,
+            $candidateSha,
+            'prepare',
+        );
+
+        return new PreparedOrbitAbandonedWorktreeCleanup(
+            repository: $context['repository'],
+            worktree: $worktree,
+            issueKey: $issueKey,
+            branch: $branch,
+            candidateSha: $candidateSha,
+            cleanupAttemptId: $cleanupAttemptId,
+            disposition: $state['target_present'] ? 'remove' : 'already_absent',
+            protectedWorktrees: $this->unrelatedWorktrees($state['worktrees'], $worktree, $branch),
+            protectedBranches: $this->unrelatedBranches($state['branches'], $branch),
+            authorizedAt: gmdate('Y-m-d\TH:i:s\Z'),
+        );
+    }
+
+    public function cleanupAbandonedWorktree(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $cleanupAttemptId,
+        PreparedOrbitAbandonedWorktreeCleanup $authorization,
+        bool $resume,
+    ): CleanedOrbitAbandonedWorktree {
+        $context = $this->abandonedWorktreeCleanupContext(
+            $config,
+            $issueKey,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $cleanupAttemptId,
+        );
+        $repository = $context['repository'];
+
+        if ($authorization->repository !== $repository
+            || $authorization->worktree !== $worktree
+            || $authorization->issueKey !== $issueKey
+            || $authorization->branch !== $branch
+            || $authorization->candidateSha !== $candidateSha
+            || $authorization->cleanupAttemptId !== $cleanupAttemptId) {
+            throw new OrbitRepositoryFailed(
+                'The retained abandoned Orbit worktree cleanup authorization is inconsistent.',
+            );
+        }
+
+        $this->refreshWorktreeCleanupState($repository);
+        $expectedState = $authorization->disposition === 'already_absent'
+            ? 'absent'
+            : ($resume ? 'resume' : 'initial');
+        $before = $this->inspectAbandonedWorktreeState(
+            $repository,
+            $worktree,
+            $branch,
+            $candidateSha,
+            $expectedState,
+        );
+
+        if ($before['target_prunable']) {
+            $this->removeAuthorizedAbandonedWorktreeRegistration($repository, $worktree);
+            $before = $this->inspectAbandonedWorktreeState(
+                $repository,
+                $worktree,
+                $branch,
+                $candidateSha,
+                'resume',
+            );
+
+            if ($before['target_prunable']) {
+                throw new OrbitRepositoryFailed(
+                    'The authorized abandoned Orbit worktree registration remains prunable.',
+                );
+            }
+        }
+
+        if ($this->unrelatedWorktrees($before['worktrees'], $worktree, $branch)
+                !== $authorization->protectedWorktrees
+            || $this->unrelatedBranches($before['branches'], $branch)
+                !== $authorization->protectedBranches) {
+            throw new OrbitRepositoryFailed(
+                'The abandoned Orbit worktree cleanup state changed after authorization.',
+            );
+        }
+
+        if (! $before['target_present'] && ! $before['branch_present']) {
+            return new CleanedOrbitAbandonedWorktree(
+                repository: $repository,
+                worktree: $worktree,
+                issueKey: $issueKey,
+                branch: $branch,
+                candidateSha: $candidateSha,
+                cleanupAttemptId: $cleanupAttemptId,
+                disposition: 'already_absent',
+                recordedAt: gmdate('Y-m-d\TH:i:s\Z'),
+            );
+        }
+
+        try {
+            $result = Process::path($repository)->timeout(300)->run([
+                $context['script'],
+                $issueKey,
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The abandoned Orbit worktree cleanup adapter could not run.',
+                previous: $exception,
+            );
+        }
+
+        if ($result->failed()
+            || preg_match('/(?:^|\R)Removed '.preg_quote($branch, '/').'\s*$/', $result->output()) !== 1) {
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Abandoned Orbit worktree cleanup failed: '.$details);
+        }
+
+        if (file_exists($worktree) || is_link($worktree)) {
+            throw new OrbitRepositoryFailed('The abandoned Orbit worktree path remains after cleanup.');
+        }
+
+        $after = $this->inspectAbandonedWorktreeState(
+            $repository,
+            $worktree,
+            $branch,
+            $candidateSha,
+            'complete',
+        );
+
+        if ($this->unrelatedWorktrees($after['worktrees'], $worktree, $branch)
+                !== $authorization->protectedWorktrees
+            || $this->unrelatedBranches($after['branches'], $branch)
+                !== $authorization->protectedBranches) {
+            throw new OrbitRepositoryFailed(
+                'An unrelated Orbit worktree or branch changed during abandoned cleanup.',
+            );
+        }
+
+        return new CleanedOrbitAbandonedWorktree(
+            repository: $repository,
+            worktree: $worktree,
+            issueKey: $issueKey,
+            branch: $branch,
+            candidateSha: $candidateSha,
+            cleanupAttemptId: $cleanupAttemptId,
+            disposition: 'removed',
+            recordedAt: gmdate('Y-m-d\TH:i:s\Z'),
+        );
+    }
+
+    /** @return array{repository: string, script: string} */
+    private function abandonedWorktreeCleanupContext(
+        OrbitProjectConfig $config,
+        string $issueKey,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $cleanupAttemptId,
+    ): array {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree);
+        $commonPath = $repository === false ? '' : $repository.'/.git';
+        $common = $repository === false ? false : realpath($commonPath);
+        $scriptPath = $repository === false ? '' : $repository.'/bin/worktree-remove';
+        $script = $repository === false ? false : realpath($scriptPath);
+        $expectedBranch = Str::lower($issueKey);
+
+        if ($repository === false || $repository !== $config->repository
+            || $root === false || $root !== $config->worktreeRoot
+            || $worktree !== $root.'/'.$expectedBranch
+            || ($path !== false && $path !== $worktree)
+            || ($path === false && (file_exists($worktree) || is_link($worktree)))
+            || $common === false || $common !== $commonPath
+            || ! is_dir($common) || is_link($commonPath)
+            || ($path !== false
+                && (! is_file($path.'/.git') || is_link($path.'/.git')))
+            || $branch !== $expectedBranch
+            || $script === false || $script !== $scriptPath
+            || is_link($scriptPath) || ! is_executable($script)
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
+            || preg_match('/^[a-f0-9]{32}$/', $cleanupAttemptId) !== 1) {
+            throw new OrbitRepositoryFailed(
+                'The configured abandoned Orbit worktree cleanup adapter is unavailable.',
+            );
+        }
+
+        if ($path !== false) {
+            try {
+                $worktreeCommon = Process::path($path)->timeout(10)->run([
+                    'git', 'rev-parse', '--path-format=absolute', '--git-common-dir',
+                ]);
+            } catch (RuntimeException $exception) {
+                throw new OrbitRepositoryFailed(
+                    'The abandoned Orbit worktree common directory could not be inspected.',
+                    previous: $exception,
+                );
+            }
+
+            $resolvedWorktreeCommon = $worktreeCommon->failed()
+                ? false
+                : realpath(trim($worktreeCommon->output()));
+
+            if ($resolvedWorktreeCommon === false || $resolvedWorktreeCommon !== $common) {
+                throw new OrbitRepositoryFailed(
+                    'The abandoned Orbit worktree no longer belongs to the configured repository.',
+                );
+            }
+        }
+
+        return ['repository' => $repository, 'script' => $script];
+    }
+
+    /**
+     * @param  'prepare'|'initial'|'resume'|'absent'|'complete'  $expectedState
+     * @return array{
+     *     worktrees: list<array{worktree: string, head: string, branch: ?string, prunable: bool}>,
+     *     branches: array<string, string>,
+     *     target_present: bool,
+     *     target_prunable: bool,
+     *     branch_present: bool
+     * }
+     */
+    private function inspectAbandonedWorktreeState(
+        string $repository,
+        string $worktree,
+        string $branch,
+        string $candidateSha,
+        string $expectedState,
+    ): array {
+        try {
+            $inventory = Process::path($repository)->timeout(10)->run([
+                'git', 'worktree', 'list', '--porcelain', '-z',
+            ]);
+            $branchInventory = Process::path($repository)->timeout(10)->run([
+                'git', 'for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads/',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The abandoned Orbit worktree cleanup state could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        if ($inventory->failed() || $branchInventory->failed()) {
+            throw new OrbitRepositoryFailed(
+                'The abandoned Orbit worktree cleanup state could not be inspected.',
+            );
+        }
+
+        $worktrees = $this->parseWorktreeInventory($inventory->output());
+        $branches = $this->parseBranchInventory($branchInventory->output());
+        $branchRef = 'refs/heads/'.$branch;
+        $matchingPaths = array_values(array_filter(
+            $worktrees,
+            static fn (array $item): bool => $item['worktree'] === $worktree,
+        ));
+        $matchingBranches = array_values(array_filter(
+            $worktrees,
+            static fn (array $item): bool => $item['branch'] === $branchRef,
+        ));
+        $exactWorktrees = array_values(array_filter(
+            $matchingPaths,
+            static fn (array $item): bool => $item['branch'] === $branchRef,
+        ));
+        $matchingIssueBranches = array_values(array_filter(
+            array_keys($branches),
+            static fn (string $ref): bool => $ref === $branchRef
+                || str_starts_with($ref, $branchRef.'-'),
+        ));
+        $targetRegistered = count($exactWorktrees) === 1;
+        $targetPrunable = $targetRegistered && $exactWorktrees[0]['prunable'];
+        $targetPresent = $targetRegistered && ! $targetPrunable;
+        $branchPresent = array_key_exists($branchRef, $branches);
+        $targetAbsent = ! $targetRegistered && ! $branchPresent;
+        $validTargetState = match ($expectedState) {
+            'prepare' => ($targetPresent && $branchPresent) || $targetAbsent,
+            'initial' => $targetPresent && $branchPresent,
+            'resume' => ($targetPresent && $branchPresent)
+                || ($targetPrunable && $branchPresent
+                    && ! file_exists($worktree) && ! is_link($worktree))
+                || (! $targetRegistered && ($branchPresent || $targetAbsent)),
+            'absent', 'complete' => $targetAbsent,
+        };
+        $primary = $worktrees[0]['worktree'] ?? null;
+
+        if ($primary !== $repository
+            || count($matchingPaths) !== ($targetRegistered ? 1 : 0)
+            || count($matchingBranches) !== ($targetRegistered ? 1 : 0)
+            || count($exactWorktrees) > 1
+            || ($targetPrunable && $exactWorktrees[0]['head'] !== $candidateSha)
+            || ! $validTargetState
+            || count($matchingIssueBranches) !== ($branchPresent ? 1 : 0)
+            || (! $targetRegistered && (file_exists($worktree) || is_link($worktree)))) {
+            throw new OrbitRepositoryFailed('The abandoned Orbit worktree cleanup state is inconsistent.');
+        }
+
+        if ($branchPresent) {
+            $this->assertCleanupBranchSafety(
+                $repository,
+                $targetPresent ? $worktree : null,
+                $branch,
+                $candidateSha,
+            );
+        }
+
+        foreach ($this->unrelatedWorktrees($worktrees, $worktree, $branch) as $unrelated) {
+            if ($unrelated['prunable']) {
+                throw new OrbitRepositoryFailed(
+                    'An unrelated prunable Orbit worktree makes abandoned cleanup unsafe.',
+                );
+            }
+        }
+
+        return [
+            'worktrees' => $worktrees,
+            'branches' => $branches,
+            'target_present' => $targetPresent,
+            'target_prunable' => $targetPrunable,
+            'branch_present' => $branchPresent,
+        ];
+    }
+
+    private function removeAuthorizedAbandonedWorktreeRegistration(
+        string $repository,
+        string $worktree,
+    ): void {
+        try {
+            $result = Process::path($repository)->timeout(30)->run([
+                'git', 'worktree', 'remove', $worktree,
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The authorized abandoned Orbit worktree registration could not be removed.',
+                previous: $exception,
+            );
+        }
+
+        if ($result->failed()) {
+            throw new OrbitRepositoryFailed(
+                'The authorized abandoned Orbit worktree registration could not be removed.',
+            );
+        }
     }
 
     /** @return array{repository: string, script: string, artifact_ref: string} */

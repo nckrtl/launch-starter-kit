@@ -17,6 +17,7 @@ use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
+use App\Jobs\AdvanceOrbitCleanup as AdvanceOrbitCleanupJob;
 use App\Jobs\AdvanceOrbitImplementation as AdvanceOrbitImplementationJob;
 use App\Jobs\AdvanceOrbitLanding as AdvanceOrbitLandingJob;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
@@ -48,6 +49,21 @@ final readonly class AdvanceDeliveryAction
 
         if ($delivery->workflow_type === OrbitFeatureWorkflow::TYPE
             && $delivery->workflow_version === OrbitFeatureWorkflow::VERSION) {
+            if ($delivery->current_phase === OrbitFeatureWorkflow::CLEANUP_PHASE
+                && $delivery->status === DeliveryStatus::Cleaning) {
+                $cleanup = $delivery->phaseRuns()
+                    ->where('phase_name', OrbitFeatureWorkflow::CLEANUP_PHASE)
+                    ->where('attempt', 1)
+                    ->first();
+
+                if ($cleanup !== null
+                    && in_array($cleanup->status, [PhaseRunStatus::Pending, PhaseRunStatus::Running], true)) {
+                    AdvanceOrbitCleanupJob::dispatch($deliveryId, $cleanup->id)->afterCommit();
+                }
+
+                return false;
+            }
+
             if ($delivery->current_phase === OrbitFeatureWorkflow::INITIAL_PHASE) {
                 $planning = $delivery->phaseRuns()
                     ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)

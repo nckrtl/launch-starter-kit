@@ -66,6 +66,21 @@ protected baselines. Commander verifies the local and remote immutable artifact
 ref and, for proof deliveries, binds the four primary proof archives to the
 retained successful closeout record before and after removal.
 
+Blocked pre-merge deliveries now have a separate, explicit cleanup path through
+`delivery:abort-orbit`. It creates one durable cleanup phase and advances it in a
+bounded queued job. Cleanup accepts only the exact retained blocked ledger,
+proves the recorded Herdr workspace, pane, terminal, and agent identities are
+closed or already absent, and removes only a clean candidate already contained
+in refreshed `origin/main`. It retains authorization before invoking Orbit's
+non-force `bin/worktree-remove` adapter, protects unrelated worktrees and
+branches across retries, and reconciles an interrupted removal without replaying
+it. If an interrupted Git removal leaves only the exact authorized target as a
+prunable registration, Commander removes that missing-path registration before
+the adapter resumes branch cleanup; unrelated prunable worktrees remain a hard
+failure. Successful cleanup preserves the original failed phase, dispatch, and
+receipt, clears the active issue key, and terminalizes the delivery as `Failed`
+with `delivery_aborted` provenance. It does not mutate Linear.
+
 Linear closeout is a persistent landing stage after verified worktree cleanup
 and before reservation release. It resolves exactly one `Done` state, atomically
 clears the assignee and delegate, reconciles uncertain mutation responses
