@@ -131,6 +131,7 @@ final readonly class RunOrbitMainCacheRefresh
             || ($phase->status === PhaseRunStatus::Running
                 && ! in_array($phase->current_block, [
                     'repository_reconciliation',
+                    'workspace_shutdown',
                     'reservation_release',
                 ], true))
             || ($phase->status === PhaseRunStatus::Completed

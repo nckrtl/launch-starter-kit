@@ -5,6 +5,7 @@ use App\Delivery\Actions\AdvanceOrbitLanding;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\RunOrbitMainCacheRefresh;
 use App\Delivery\Actions\StartOrbitDelivery;
+use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
@@ -15,6 +16,13 @@ use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\ApprovedOrbitPullRequest;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\HerdrAgentOutput;
+use App\Delivery\Data\HerdrForegroundProcess;
+use App\Delivery\Data\HerdrPaneProcessInfo;
+use App\Delivery\Data\HerdrSessionSnapshot;
+use App\Delivery\Data\HerdrSnapshotAgent;
+use App\Delivery\Data\HerdrSnapshotPane;
+use App\Delivery\Data\HerdrSnapshotWorkspace;
 use App\Delivery\Data\MergedOrbitPullRequest;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
@@ -431,6 +439,111 @@ final class LandingGateway implements OrbitPullRequestLandingGateway
     }
 }
 
+final class LandingHerdrWorkspace implements HerdrWorkspaceRuntime
+{
+    public int $snapshotCalls = 0;
+
+    public int $closeCalls = 0;
+
+    public bool $closed = false;
+
+    public bool $agentsRemain = false;
+
+    /** @var list<array{name: string, keys: list<string>}> */
+    public array $sentKeys = [];
+
+    public function __construct(
+        private readonly string $repository,
+        private readonly string $worktree,
+    ) {}
+
+    public function snapshot(): HerdrSessionSnapshot
+    {
+        $this->snapshotCalls++;
+        $canonical = new HerdrSnapshotWorkspace('canonical-workspace', null, null, null);
+        $canonicalPane = new HerdrSnapshotPane(
+            'canonical-workspace',
+            'canonical-tab',
+            'canonical-pane',
+            'canonical-terminal',
+            $this->repository,
+        );
+
+        if ($this->closed) {
+            return new HerdrSessionSnapshot('0.9.0', 22, [$canonical], [$canonicalPane], []);
+        }
+
+        return new HerdrSessionSnapshot(
+            '0.9.0',
+            22,
+            [
+                $canonical,
+                new HerdrSnapshotWorkspace(
+                    'issue-workspace',
+                    $this->repository,
+                    $this->worktree,
+                    true,
+                ),
+            ],
+            [
+                $canonicalPane,
+                new HerdrSnapshotPane(
+                    'issue-workspace',
+                    'issue-tab',
+                    'issue-shell',
+                    'issue-shell-terminal',
+                    $this->worktree,
+                ),
+            ],
+            $this->agentsRemain ? [new HerdrSnapshotAgent(
+                'issue-workspace',
+                'issue-tab',
+                'issue-shell',
+                'issue-agent-terminal',
+                'codex',
+                'orb-234-loop-builder',
+                'idle',
+                $this->worktree,
+            )] : [],
+        );
+    }
+
+    public function readAgent(string $name): HerdrAgentOutput
+    {
+        return new HerdrAgentOutput(
+            'issue-workspace',
+            'issue-tab',
+            'issue-shell',
+            'The agent remains idle.',
+        );
+    }
+
+    public function sendAgentKeys(string $name, array $keys): void
+    {
+        $this->sentKeys[] = ['name' => $name, 'keys' => $keys];
+    }
+
+    public function inspectPaneProcess(string $paneId): HerdrPaneProcessInfo
+    {
+        expect($paneId)->toBe('issue-shell');
+
+        return new HerdrPaneProcessInfo(
+            $paneId,
+            100,
+            100,
+            [new HerdrForegroundProcess(100, 'zsh')],
+        );
+    }
+
+    public function closeWorkspace(string $workspaceId, int $protocol): void
+    {
+        expect($workspaceId)->toBe('issue-workspace');
+        expect($protocol)->toBe(22);
+        $this->closeCalls++;
+        $this->closed = true;
+    }
+}
+
 beforeEach(function () {
     $this->base = storage_path('framework/testing/orbit-landing-'.bin2hex(random_bytes(4)));
     $this->projectsPath = $this->base.'/projects';
@@ -452,6 +565,7 @@ beforeEach(function () {
 
     File::makeDirectory($this->projectsPath, 0755, true);
     config()->set('commander.projects_path', $this->projectsPath);
+    config()->set('herdr.session', 'orbit');
     app(SharedKnowledgeProjectRepository::class)->create('orbit', [
         'name' => 'Orbit',
         'status' => 'active',
@@ -605,10 +719,10 @@ beforeEach(function () {
         'herdr_agent_name' => 'orb-234-loop-pr-review-1',
         'prompt_name' => 'orbit_pr_review',
         'herdr_session' => 'orbit',
-        'herdr_workspace_id' => 'review-workspace',
-        'herdr_tab_id' => 'review-tab',
-        'herdr_pane_id' => 'review-pane',
-        'herdr_terminal_id' => 'review-terminal',
+        'herdr_workspace_id' => 'issue-workspace',
+        'herdr_tab_id' => 'issue-tab',
+        'herdr_pane_id' => 'issue-pr-reviewer-pane',
+        'herdr_terminal_id' => 'issue-pr-reviewer-terminal',
         'herdr_agent_id' => 'review-agent',
         'dispatched_at' => now(),
     ])->save();
@@ -685,6 +799,7 @@ beforeEach(function () {
     $this->gateway = new LandingGateway;
     $this->merges = new LandingMergeLineageVerifier;
     $this->primaryCheckout = new LandingPrimaryCheckoutReconciler;
+    $this->herdrWorkspace = new LandingHerdrWorkspace($this->repositoryPath, $this->worktreePath);
     $transactionLevel = DB::transactionLevel();
     $this->repository->transactionLevel = $transactionLevel;
     $this->implementations->transactionLevel = $transactionLevel;
@@ -700,6 +815,7 @@ beforeEach(function () {
     app()->instance(OrbitPullRequestLandingGateway::class, $this->gateway);
     app()->instance(OrbitMergeLineageVerifier::class, $this->merges);
     app()->instance(OrbitPrimaryCheckoutReconciler::class, $this->primaryCheckout);
+    app()->instance(HerdrWorkspaceRuntime::class, $this->herdrWorkspace);
     Queue::fake();
 });
 
@@ -711,6 +827,12 @@ function landingDispatch(PhaseRun $phase, string $role, string $name): AgentDisp
         'phase_run_id' => $phase->id,
         'agent_role' => $role,
         'idempotency_key' => "landing-{$name}",
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'issue-workspace',
+        'herdr_tab_id' => 'issue-tab',
+        'herdr_pane_id' => "issue-{$name}-pane",
+        'herdr_terminal_id' => "issue-{$name}-terminal",
+        'herdr_agent_id' => 'codex',
         'herdr_agent_name' => "orb-234-loop-{$name}",
         'prompt_name' => "orbit_{$name}",
         'prompt_version' => 1,
@@ -846,10 +968,10 @@ function promoteLandingToSecondPullRequestReview(object $test): void
         'herdr_agent_name' => 'orb-234-loop-pr-review-2',
         'prompt_name' => 'orbit_pr_review',
         'herdr_session' => 'orbit',
-        'herdr_workspace_id' => 'review-workspace',
-        'herdr_tab_id' => 'review-tab',
-        'herdr_pane_id' => 'review-pane-2',
-        'herdr_terminal_id' => 'review-terminal-2',
+        'herdr_workspace_id' => 'issue-workspace',
+        'herdr_tab_id' => 'issue-tab',
+        'herdr_pane_id' => 'issue-pr-reviewer-2-pane',
+        'herdr_terminal_id' => 'issue-pr-reviewer-2-terminal',
         'herdr_agent_id' => 'review-agent-2',
         'dispatched_at' => now(),
     ])->save();
@@ -935,6 +1057,11 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
             'main_sha' => str_repeat('8', 40),
             'origin_main_sha' => str_repeat('8', 40),
         ])
+        ->and($landing->output['workspace_shutdown']['closed'])->toMatchArray([
+            'session' => 'orbit',
+            'workspace_id' => 'issue-workspace',
+            'worktree_path' => $this->worktreePath,
+        ])
         ->and($this->repository->reservationIsHeld())->toBeFalse()
         ->and($this->implementations->calls)->toBe(1)
         ->and($this->issues->calls)->toBe(1)
@@ -944,7 +1071,8 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->gateway->mergeCalls)->toBe(1)
         ->and($this->gateway->releaseCalls)->toBe(1)
         ->and($this->merges->calls)->toBe(1)
-        ->and($this->primaryCheckout->calls)->toBe(1);
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(1);
 
     $maintenance = MaintenanceRun::sole();
     expect($maintenance->status)->toBe(MaintenanceRunStatus::Pending)
@@ -969,6 +1097,32 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->primaryCheckout->calls)->toBe(1)
         ->and(MaintenanceRun::count())->toBe(1);
     Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
+});
+
+it('retains the merge reservation while Commander waits for owned Herdr agents to exit', function () {
+    $this->herdrWorkspace->agentsRemain = true;
+
+    expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))
+        ->toBe(AdvanceOrbitLanding::RETRY_SECONDS)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('landing_workspace_shutdown_wait')
+        ->and($this->landing->fresh()->current_block)->toBe('workspace_shutdown')
+        ->and($this->landing->fresh()->output)->toHaveKeys([
+            'merge_verification',
+            'repository_reconciliation',
+            'workspace_shutdown',
+        ])
+        ->and($this->gateway->releaseCalls)->toBe(0)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->closeCalls)->toBe(0)
+        ->and($this->herdrWorkspace->sentKeys)->toHaveCount(1)
+        ->and(MaintenanceRun::count())->toBe(1);
+
+    expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))
+        ->toBe(AdvanceOrbitLanding::RETRY_SECONDS)
+        ->and($this->gateway->releaseCalls)->toBe(0)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->herdrWorkspace->sentKeys)->toHaveCount(1);
 });
 
 it('lands the exact candidate approved by the second pull request review', function () {
@@ -1229,6 +1383,7 @@ it('queues incomplete landing recovery states', function (DeliveryStatus $status
     'merge read-back' => [DeliveryStatus::Merging, 'merge'],
     'merge verification' => [DeliveryStatus::Landed, 'merge_verification'],
     'repository reconciliation' => [DeliveryStatus::Landed, 'repository_reconciliation'],
+    'workspace shutdown' => [DeliveryStatus::Landed, 'workspace_shutdown'],
     'reservation release' => [DeliveryStatus::Landed, 'reservation_release'],
 ]);
 
@@ -1307,6 +1462,12 @@ it('guards exhausted landing jobs and preserves recoverable external states', fu
         PhaseRunStatus::Running,
         'repository_reconciliation',
         'landing_repository_reconciliation_required',
+    ],
+    'post-merge workspace shutdown' => [
+        DeliveryStatus::Landed,
+        PhaseRunStatus::Running,
+        'workspace_shutdown',
+        'landing_workspace_shutdown_required',
     ],
 ]);
 

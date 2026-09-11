@@ -57,6 +57,7 @@ final readonly class AdvanceOrbitLanding
         private OrbitPullRequestReviewReceiptValidator $reviewReceipts,
         private OrbitPullRequestReviewSourceValidator $sources,
         private QueueOrbitMainCacheRefresh $cacheRefresh,
+        private ShutdownOrbitHerdrWorkspace $workspaceShutdown,
     ) {}
 
     /** Return a delay when the same queued job should retry a non-failing wait. */
@@ -82,9 +83,7 @@ final readonly class AdvanceOrbitLanding
         }
 
         if (in_array($delivery->status, [DeliveryStatus::Merging, DeliveryStatus::Landed], true)) {
-            $this->resumePostMerge($delivery, $intent[0]);
-
-            return null;
+            return $this->resumePostMerge($delivery, $intent[0]);
         }
 
         $config = $this->configs->hydrate($delivery->projectOrchestration->config);
@@ -202,9 +201,8 @@ final readonly class AdvanceOrbitLanding
             $retainMergeReservation = true;
             $merged = $this->pullRequests->merge($approved->number, $approved->candidateSha);
             $this->commitMerged($delivery->id, $phase->id, $preMerge, $merged);
-            $this->reconcileAndFinalize($config, $delivery->id, $phase->id, false);
 
-            return null;
+            return $this->reconcileAndFinalize($config, $delivery->id, $phase->id, false);
         } finally {
             if ($mergeReservationOwned && ! $retainMergeReservation) {
                 $this->pullRequests->release(
@@ -332,6 +330,7 @@ final readonly class AdvanceOrbitLanding
             && in_array($phase->current_block, [
                 'merge_verification',
                 'repository_reconciliation',
+                'workspace_shutdown',
                 'reservation_release',
             ], true)
             && $phase->started_at !== null && $phase->finished_at === null;
@@ -420,22 +419,30 @@ final readonly class AdvanceOrbitLanding
         $merge = is_array($output) ? ($output['merge'] ?? null) : null;
         $verification = is_array($output) ? ($output['merge_verification'] ?? null) : null;
         $reconciliation = is_array($output) ? ($output['repository_reconciliation'] ?? null) : null;
+        $workspaceShutdown = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
         $preMerge = is_array($output) ? $output : null;
 
         if (! is_array($merge) || array_is_list($merge) || ! is_array($preMerge)
             || ! in_array($stage, [
                 'merge_verification',
                 'repository_reconciliation',
+                'workspace_shutdown',
                 'reservation_release',
                 'completed',
             ], true)) {
             return false;
         }
 
-        unset($preMerge['merge'], $preMerge['merge_verification'], $preMerge['repository_reconciliation']);
+        unset(
+            $preMerge['merge'],
+            $preMerge['merge_verification'],
+            $preMerge['repository_reconciliation'],
+            $preMerge['workspace_shutdown'],
+        );
 
         $requiresVerification = $stage !== 'merge_verification';
-        $requiresReconciliation = in_array($stage, ['reservation_release', 'completed'], true);
+        $requiresReconciliation = in_array($stage, ['workspace_shutdown', 'reservation_release', 'completed'], true);
+        $requiresClosedWorkspace = in_array($stage, ['reservation_release', 'completed'], true);
 
         return $this->matchesPreMergeOutput($delivery, $preMerge, $published)
             && $merge === [
@@ -451,7 +458,12 @@ final readonly class AdvanceOrbitLanding
                 : $verification === null)
             && ($requiresReconciliation
                 ? $this->matchesRepositoryReconciliation($preMerge, $merge, $reconciliation)
-                : $reconciliation === null);
+                : $reconciliation === null)
+            && ($requiresClosedWorkspace
+                ? $this->matchesClosedWorkspace($delivery, $workspaceShutdown)
+                : ($stage === 'workspace_shutdown'
+                    ? $workspaceShutdown === null || is_array($workspaceShutdown)
+                    : $workspaceShutdown === null));
     }
 
     /** @param array<string, mixed> $merge */
@@ -485,6 +497,31 @@ final readonly class AdvanceOrbitLanding
             && is_string($reconciliation['main_sha'] ?? null)
             && $reconciliation['main_sha'] === ($reconciliation['origin_main_sha'] ?? null)
             && preg_match('/^[a-f0-9]{40}$/', $reconciliation['main_sha']) === 1;
+    }
+
+    private function matchesClosedWorkspace(Delivery $delivery, mixed $shutdown): bool
+    {
+        $closed = is_array($shutdown) ? ($shutdown['closed'] ?? null) : null;
+
+        return is_array($shutdown) && ! array_is_list($shutdown)
+            && ($shutdown['schema'] ?? null) === 1
+            && ($shutdown['worktree_path'] ?? null) === $delivery->worktree_path
+            && is_string($shutdown['workspace_id'] ?? null)
+            && is_string($shutdown['session'] ?? null)
+            && is_string($shutdown['workspace_close_attempted_at'] ?? null)
+            && is_array($shutdown['owned_agent_names'] ?? null)
+            && array_is_list($shutdown['owned_agent_names'])
+            && is_array($shutdown['protected_workspace_ids'] ?? null)
+            && is_array($shutdown['protected_agent_terminal_ids'] ?? null)
+            && is_array($shutdown['protected_pane_ids'] ?? null)
+            && is_array($shutdown['target_agent_terminal_ids'] ?? null)
+            && is_array($shutdown['target_pane_ids'] ?? null)
+            && is_array($closed) && ! array_is_list($closed)
+            && ($closed['session'] ?? null) === $shutdown['session']
+            && ($closed['workspace_id'] ?? null) === $shutdown['workspace_id']
+            && ($closed['worktree_path'] ?? null) === $delivery->worktree_path
+            && ($closed['owned_agent_names'] ?? null) === $shutdown['owned_agent_names']
+            && is_string($closed['verified_at'] ?? null);
     }
 
     private function verifyImplementation(
@@ -689,7 +726,7 @@ final readonly class AdvanceOrbitLanding
         });
     }
 
-    private function resumePostMerge(Delivery $delivery, PhaseRun $phase): void
+    private function resumePostMerge(Delivery $delivery, PhaseRun $phase): ?int
     {
         $config = $this->configs->hydrate($delivery->projectOrchestration->config);
         $repository = is_array($phase->output) ? ($phase->output['repository'] ?? null) : null;
@@ -716,9 +753,7 @@ final readonly class AdvanceOrbitLanding
             }
 
             if ($delivery->status === DeliveryStatus::Merging) {
-                $this->resumeMerge($delivery, $intent[0], $config);
-
-                return;
+                return $this->resumeMerge($delivery, $intent[0], $config);
             }
 
             if ($delivery->status !== DeliveryStatus::Landed) {
@@ -727,7 +762,7 @@ final readonly class AdvanceOrbitLanding
                 );
             }
 
-            $this->reconcileAndFinalize($config, $delivery->id, $intent[0]->id, true);
+            return $this->reconcileAndFinalize($config, $delivery->id, $intent[0]->id, true);
         } finally {
             $issueReservation->release();
         }
@@ -738,7 +773,7 @@ final readonly class AdvanceOrbitLanding
         int $deliveryId,
         int $phaseId,
         bool $ensureMergeReservation,
-    ): void {
+    ): ?int {
         $delivery = $this->delivery($deliveryId);
 
         if ($ensureMergeReservation) {
@@ -757,10 +792,24 @@ final readonly class AdvanceOrbitLanding
         $this->verifyMerge($config, $deliveryId, $phaseId);
         $this->cacheRefresh->handle($deliveryId, $phaseId);
         $this->reconcilePrimaryCheckout($config, $deliveryId, $phaseId);
+        $phase = PhaseRun::query()->findOrFail($phaseId);
+
+        if ($phase->current_block === 'workspace_shutdown') {
+            if (! $this->workspaceShutdown->handle($config, $deliveryId, $phaseId)) {
+                $this->markWorkspaceShutdownWait($deliveryId, $phaseId);
+
+                return self::RETRY_SECONDS;
+            }
+
+            $this->recordWorkspaceShutdown($deliveryId, $phaseId);
+        }
+
         $this->releaseAndFinalize(
             $this->delivery($deliveryId),
             PhaseRun::query()->findOrFail($phaseId),
         );
+
+        return null;
     }
 
     private function verifyMerge(OrbitProjectConfig $config, int $deliveryId, int $phaseId): void
@@ -770,6 +819,7 @@ final readonly class AdvanceOrbitLanding
 
         if (in_array($phase->current_block, [
             'repository_reconciliation',
+            'workspace_shutdown',
             'reservation_release',
         ], true)) {
             return;
@@ -846,7 +896,7 @@ final readonly class AdvanceOrbitLanding
     ): void {
         $phase = PhaseRun::query()->findOrFail($phaseId);
 
-        if ($phase->current_block === 'reservation_release') {
+        if (in_array($phase->current_block, ['workspace_shutdown', 'reservation_release'], true)) {
             return;
         }
 
@@ -884,7 +934,7 @@ final readonly class AdvanceOrbitLanding
                 'origin_main_sha' => $reconciled->originMainSha,
             ];
 
-            if ($phase !== null && $phase->current_block === 'reservation_release'
+            if ($phase !== null && in_array($phase->current_block, ['workspace_shutdown', 'reservation_release'], true)
                 && is_array($output) && ($output['repository_reconciliation'] ?? null) === $evidence) {
                 return;
             }
@@ -900,10 +950,60 @@ final readonly class AdvanceOrbitLanding
                 );
             }
 
-            $phase->current_block = 'reservation_release';
+            $phase->current_block = 'workspace_shutdown';
             $phase->output = [...$output, 'repository_reconciliation' => $evidence];
             $phase->save();
             $delivery->failure_details = null;
+            $delivery->save();
+        });
+    }
+
+    private function recordWorkspaceShutdown(int $deliveryId, int $phaseId): void
+    {
+        DB::transaction(function () use ($deliveryId, $phaseId): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $intent = $this->landingIntent($delivery, $phaseId);
+            $phase = $intent[0] ?? null;
+            $output = $phase?->output;
+            $shutdown = is_array($output) ? ($output['workspace_shutdown'] ?? null) : null;
+
+            if ($phase !== null && $phase->current_block === 'reservation_release'
+                && $this->matchesClosedWorkspace($delivery, $shutdown)) {
+                return;
+            }
+
+            if ($phase === null || $phase->current_block !== 'workspace_shutdown'
+                || ! is_array($output) || ! $this->matchesClosedWorkspace($delivery, $shutdown)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The verified Orbit Herdr workspace shutdown no longer matches its landing ledger.',
+                );
+            }
+
+            $phase->current_block = 'reservation_release';
+            $phase->save();
+            $delivery->failure_details = null;
+            $delivery->save();
+        });
+    }
+
+    private function markWorkspaceShutdownWait(int $deliveryId, int $phaseId): void
+    {
+        DB::transaction(function () use ($deliveryId, $phaseId): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $intent = $this->landingIntent($delivery, $phaseId);
+            $phase = $intent[0] ?? null;
+
+            if ($phase === null || $phase->current_block !== 'workspace_shutdown') {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit landing ledger changed while recording its workspace shutdown wait.',
+                );
+            }
+
+            $delivery->failure_details = [
+                'code' => 'landing_workspace_shutdown_wait',
+                'phase_run_id' => $phase->id,
+                'message' => 'Commander is waiting for the owned Herdr agents to exit.',
+            ];
             $delivery->save();
         });
     }
@@ -912,7 +1012,7 @@ final readonly class AdvanceOrbitLanding
         Delivery $delivery,
         PhaseRun $phase,
         OrbitProjectConfig $config,
-    ): void {
+    ): ?int {
         $output = $phase->output;
         $approval = $this->associativeArray(
             is_array($output) ? ($output['approved_pull_request'] ?? null) : null,
@@ -933,7 +1033,8 @@ final readonly class AdvanceOrbitLanding
             $this->sha($approval, 'candidate_sha'),
         );
         $this->commitMerged($delivery->id, $phase->id, $output, $merged);
-        $this->reconcileAndFinalize($config, $delivery->id, $phase->id, false);
+
+        return $this->reconcileAndFinalize($config, $delivery->id, $phase->id, false);
     }
 
     private function releaseAndFinalize(Delivery $delivery, PhaseRun $phase): void

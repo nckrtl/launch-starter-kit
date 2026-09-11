@@ -3,6 +3,7 @@
 namespace App\Providers;
 
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
@@ -53,6 +54,15 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitPullRequestReviewPublisher::class, SshOrbitPullRequestReviewPublisher::class);
 
         $this->app->bind(HerdrRuntime::class, function (): SocketHerdrRuntime {
+            $path = config('herdr.socket');
+
+            if (! is_string($path) || $path === '') {
+                throw new \RuntimeException('The Herdr socket is not configured.');
+            }
+
+            return new SocketHerdrRuntime(new SocketClient($path));
+        });
+        $this->app->bind(HerdrWorkspaceRuntime::class, function (): SocketHerdrRuntime {
             $path = config('herdr.socket');
 
             if (! is_string($path) || $path === '') {

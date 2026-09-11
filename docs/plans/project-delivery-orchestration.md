@@ -1,6 +1,6 @@
 # Project delivery orchestration
 
-Status: discovery complete; first implementation slice ready
+Status: implementation in progress; live cutover remains disabled
 
 Continuation thread: `codex://threads/01a08cc2-0105-74b1-aeb0-be013aa73267`
 
@@ -34,6 +34,27 @@ For an Orbit issue, Commander can:
 
 The normal path advances without a Tom wake-up. Commander informs Tom when a
 decision, repair, or policy exception is required.
+
+## Implementation status
+
+Commander now owns the durable Orbit path from verified preparation through
+planning, independent plan review and correction, implementation and correction,
+pull request publication and review, deterministic merge, merge-lineage
+verification, primary checkout reconciliation, cache refresh enqueueing, and
+Herdr worktree-workspace shutdown.
+
+Workspace shutdown is a persistent landing stage. It targets only the workspace
+ID recorded by the delivery, accepts only ledger-owned idle or done agents,
+records exit and close intent before sending input, verifies idle shells, and
+checks that no unrelated Herdr workspace, agent, or pane disappeared. It supports
+the installed protocol 20 close request and sends the explicit `close_group:
+false` guard on protocol 22 and newer.
+
+The remaining landing slices are proof-topology closeout where required,
+repository-owned worktree removal and branch absence verification, Linear `Done`
+transition with ownership clearing, and the final Commander `Completed`
+transition. The normal `bin/loop ISSUE` entry point still invokes the legacy
+controller; route it through Commander only after those closeout stages pass.
 
 ## Ownership boundaries
 

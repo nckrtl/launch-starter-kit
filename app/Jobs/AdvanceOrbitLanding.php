@@ -111,6 +111,7 @@ final class AdvanceOrbitLanding implements ShouldQueue, ShouldQueueAfterCommit
                 $code = match ($phase->current_block) {
                     'merge_verification' => 'landing_merge_verification_required',
                     'repository_reconciliation' => 'landing_repository_reconciliation_required',
+                    'workspace_shutdown' => 'landing_workspace_shutdown_required',
                     default => 'landing_reservation_release_required',
                 };
                 $delivery->failure_details = [
@@ -151,6 +152,7 @@ final class AdvanceOrbitLanding implements ShouldQueue, ShouldQueueAfterCommit
             && in_array($phase->current_block, [
                 'merge_verification',
                 'repository_reconciliation',
+                'workspace_shutdown',
                 'reservation_release',
             ], true)
             && $phase->finished_at === null;

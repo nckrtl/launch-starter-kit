@@ -134,3 +134,114 @@ it('does not retry prompt errors other than agent not ready', function () {
         ->and(array_column($this->server->requests(), 'method'))->toBe(['agent.prompt']);
     Sleep::assertNeverSlept();
 });
+
+it('maps protocol 22 workspace cleanup responses and sends exact safe requests', function () {
+    $this->server->stop();
+    $this->server = FakeHerdrServer::start([
+        'agents' => [], 'workspaces' => [], 'events' => [],
+        'rpc' => [
+            'session.snapshot' => [
+                'type' => 'session_snapshot',
+                'snapshot' => [
+                    'version' => '0.9.0',
+                    'protocol' => 22,
+                    'workspaces' => [[
+                        'workspace_id' => 'w1',
+                        'worktree' => [
+                            'repo_root' => '/tmp/repository',
+                            'checkout_path' => '/tmp/worktree',
+                            'is_linked_worktree' => true,
+                        ],
+                    ]],
+                    'tabs' => [],
+                    'panes' => [[
+                        'workspace_id' => 'w1', 'tab_id' => 't1',
+                        'pane_id' => 'p1', 'terminal_id' => 'term1',
+                        'cwd' => '/tmp/worktree',
+                    ]],
+                    'layouts' => [],
+                    'agents' => [[
+                        'workspace_id' => 'w1', 'tab_id' => 't1',
+                        'pane_id' => 'p1', 'terminal_id' => 'term1',
+                        'agent' => 'codex', 'name' => 'orb-234-loop-builder',
+                        'agent_status' => 'idle', 'cwd' => '/tmp/worktree',
+                    ]],
+                ],
+            ],
+            'agent.read' => [
+                'type' => 'pane_read',
+                'read' => [
+                    'workspace_id' => 'w1', 'tab_id' => 't1', 'pane_id' => 'p1',
+                    'source' => 'recent_unwrapped', 'format' => 'text',
+                    'text' => '> /quit',
+                ],
+            ],
+            'agent.send_keys' => ['type' => 'ok'],
+            'pane.process_info' => [
+                'type' => 'pane_process_info',
+                'process_info' => [
+                    'pane_id' => 'p1', 'shell_pid' => 100,
+                    'foreground_process_group_id' => 100,
+                    'foreground_processes' => [['pid' => 100, 'name' => 'zsh']],
+                ],
+            ],
+            'workspace.close' => ['type' => 'ok'],
+        ],
+    ]);
+    $runtime = new SocketHerdrRuntime(new SocketClient($this->server->socketPath));
+
+    $snapshot = $runtime->snapshot();
+    $output = $runtime->readAgent('orb-234-loop-builder');
+    $runtime->sendAgentKeys('orb-234-loop-builder', ['/', 'q', 'u', 'i', 't', 'enter']);
+    $process = $runtime->inspectPaneProcess('p1');
+    $runtime->closeWorkspace('w1', 22);
+    $runtime->closeWorkspace('w1', 20);
+
+    expect($snapshot->protocol)->toBe(22)
+        ->and($snapshot->workspaces[0]->checkoutPath)->toBe('/tmp/worktree')
+        ->and($snapshot->agents[0]->status)->toBe('idle')
+        ->and($output->text)->toBe('> /quit')
+        ->and($process->foregroundProcesses[0]->name)->toBe('zsh');
+
+    $requests = $this->server->requests();
+    expect(array_column($requests, 'method'))->toBe([
+        'session.snapshot', 'agent.read', 'agent.send_keys',
+        'pane.process_info', 'workspace.close', 'workspace.close',
+    ])->and(array_column($requests, 'params'))->toBe([
+        [],
+        [
+            'target' => 'orb-234-loop-builder',
+            'source' => 'recent_unwrapped',
+            'format' => 'text',
+            'lines' => 160,
+            'strip_ansi' => true,
+        ],
+        [
+            'target' => 'orb-234-loop-builder',
+            'keys' => ['/', 'q', 'u', 'i', 't', 'enter'],
+        ],
+        ['pane_id' => 'p1'],
+        ['workspace_id' => 'w1', 'close_group' => false],
+        ['workspace_id' => 'w1'],
+    ]);
+});
+
+it('rejects malformed workspace cleanup snapshots', function () {
+    $this->server->stop();
+    $this->server = FakeHerdrServer::start([
+        'agents' => [], 'workspaces' => [], 'events' => [],
+        'rpc' => [
+            'session.snapshot' => [
+                'type' => 'session_snapshot',
+                'snapshot' => [
+                    'version' => '0.9.0', 'protocol' => 22,
+                    'workspaces' => [], 'tabs' => [], 'layouts' => [],
+                    'panes' => 'not-a-list', 'agents' => [],
+                ],
+            ],
+        ],
+    ]);
+
+    expect(fn () => (new SocketHerdrRuntime(new SocketClient($this->server->socketPath)))->snapshot())
+        ->toThrow(InvalidArgumentException::class, 'missing [panes]');
+});
