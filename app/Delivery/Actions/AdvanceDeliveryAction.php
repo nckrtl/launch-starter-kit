@@ -18,6 +18,7 @@ use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
 use App\Jobs\AdvanceOrbitImplementation as AdvanceOrbitImplementationJob;
+use App\Jobs\AdvanceOrbitLanding as AdvanceOrbitLandingJob;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
 use App\Jobs\AdvanceOrbitPullRequestReview as AdvanceOrbitPullRequestReviewJob;
 use App\Jobs\DispatchOrbitImplementation;
@@ -116,6 +117,23 @@ final readonly class AdvanceDeliveryAction
             if ($pullRequestReview?->attempt === 1
                 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 AdvanceOrbitPullRequestReviewJob::dispatch($deliveryId, $pullRequestReview->id)->afterCommit();
+            }
+
+            $landing = $delivery->current_phase === OrbitFeatureWorkflow::LANDING_PHASE
+                ? $delivery->phaseRuns()
+                    ->where('phase_name', OrbitFeatureWorkflow::LANDING_PHASE)
+                    ->where('attempt', 1)
+                    ->first()
+                : null;
+            $landingIsActive = $landing !== null && (
+                ($delivery->status === DeliveryStatus::ReadyToMerge
+                    && $landing->status === PhaseRunStatus::Pending)
+                || (in_array($delivery->status, [DeliveryStatus::Merging, DeliveryStatus::Landed], true)
+                    && $landing->status === PhaseRunStatus::Running)
+            );
+
+            if ($landingIsActive) {
+                AdvanceOrbitLandingJob::dispatch($deliveryId, $landing->id)->afterCommit();
             }
 
             return false;

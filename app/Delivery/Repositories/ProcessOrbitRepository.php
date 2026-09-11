@@ -5,10 +5,12 @@ declare(strict_types=1);
 namespace App\Delivery\Repositories;
 
 use App\Delivery\Contracts\OrbitImplementationRepository;
+use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
+use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
@@ -22,7 +24,7 @@ use Illuminate\Support\Str;
 use JsonException;
 use RuntimeException;
 
-final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitRepository
+final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCorrectnessInspector, OrbitRepository
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -31,6 +33,69 @@ final readonly class ProcessOrbitRepository implements OrbitImplementationReposi
         ['composer', 'check'],
         ['composer', 'test:affected'],
     ];
+
+    public function inspectMainCorrectness(OrbitProjectConfig $config): OrbitMainCorrectness
+    {
+        $repository = realpath($config->repository);
+        $script = $repository === false ? false : realpath($repository.'/bin/tia-cache');
+
+        if ($repository === false || ! is_dir($repository)
+            || $script === false || ! is_executable($script)) {
+            throw new OrbitRepositoryFailed('The configured Orbit main correctness adapter is unavailable.');
+        }
+
+        try {
+            $result = Process::path($repository)
+                ->timeout(120)
+                ->run([$script, 'status', '--json', '--remote']);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit main correctness adapter could not run.',
+                previous: $exception,
+            );
+        }
+
+        if ($result->failed()) {
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit main correctness inspection failed: '.$details);
+        }
+
+        try {
+            $status = json_decode($result->output(), true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit main correctness adapter returned invalid JSON.',
+                previous: $exception,
+            );
+        }
+
+        $mainSha = is_array($status) ? ($status['main'] ?? null) : null;
+        $failures = is_array($status) ? ($status['correctness_failures'] ?? null) : null;
+
+        if (! is_array($status) || array_is_list($status) || ($status['schema'] ?? null) !== 1
+            || ! is_string($mainSha) || preg_match('/^[a-f0-9]{40}$/', $mainSha) !== 1
+            || ! is_array($failures)) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit main correctness adapter returned incomplete status.',
+            );
+        }
+
+        $normalizedFailures = [];
+
+        foreach ($failures as $project => $failure) {
+            if (! is_string($project) || trim($project) === '') {
+                throw new OrbitRepositoryFailed(
+                    'The Orbit main correctness adapter returned incomplete status.',
+                );
+            }
+
+            $normalizedFailures[$project] = $failure;
+        }
+
+        return new OrbitMainCorrectness($mainSha, $normalizedFailures);
+    }
 
     public function reserveDelivery(OrbitProjectConfig $config, string $issueKey): OrbitDeliveryReservation
     {
