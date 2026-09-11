@@ -8,6 +8,8 @@ use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
+use App\Delivery\Contracts\OrbitMergeLineageVerifier;
+use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\ApprovedOrbitPullRequest;
@@ -17,7 +19,9 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitLandingReservation;
 use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
+use App\Delivery\Data\VerifiedOrbitMergeLineage;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
@@ -48,6 +52,8 @@ final readonly class AdvanceOrbitLanding
         private OrbitActiveIssueProvider $issues,
         private OrbitMainCorrectnessInspector $main,
         private OrbitPullRequestLandingGateway $pullRequests,
+        private OrbitMergeLineageVerifier $merges,
+        private OrbitPrimaryCheckoutReconciler $primaryCheckout,
         private OrbitPullRequestReviewReceiptValidator $reviewReceipts,
         private OrbitPullRequestReviewSourceValidator $sources,
         private QueueOrbitMainCacheRefresh $cacheRefresh,
@@ -75,15 +81,8 @@ final readonly class AdvanceOrbitLanding
             return null;
         }
 
-        if ($delivery->status === DeliveryStatus::Landed) {
-            $this->cacheRefresh->handle($delivery->id, $intent[0]->id);
-            $this->releaseAndFinalize($delivery, $intent[0]);
-
-            return null;
-        }
-
-        if ($delivery->status === DeliveryStatus::Merging) {
-            $this->resumeMerge($delivery, $intent[0]);
+        if (in_array($delivery->status, [DeliveryStatus::Merging, DeliveryStatus::Landed], true)) {
+            $this->resumePostMerge($delivery, $intent[0]);
 
             return null;
         }
@@ -203,10 +202,7 @@ final readonly class AdvanceOrbitLanding
             $retainMergeReservation = true;
             $merged = $this->pullRequests->merge($approved->number, $approved->candidateSha);
             $this->commitMerged($delivery->id, $phase->id, $preMerge, $merged);
-            $this->releaseAndFinalize(
-                $this->delivery($delivery->id),
-                PhaseRun::query()->findOrFail($phase->id),
-            );
+            $this->reconcileAndFinalize($config, $delivery->id, $phase->id, false);
 
             return null;
         } finally {
@@ -294,7 +290,12 @@ final readonly class AdvanceOrbitLanding
                 'pull_request' => $pullRequest,
                 'published_review' => $published,
             ]
-            || ! $this->matchesLandingState($delivery, $phase, $published)) {
+            || ! $this->matchesLandingState(
+                $delivery,
+                $phase,
+                $published,
+                $implementation->payload['flow'] ?? null,
+            )) {
             throw new OrbitLandingAdvancementFailed(
                 'The retained Orbit landing intent is inconsistent.',
             );
@@ -304,8 +305,12 @@ final readonly class AdvanceOrbitLanding
     }
 
     /** @param array<string, mixed> $published */
-    private function matchesLandingState(Delivery $delivery, PhaseRun $phase, array $published): bool
-    {
+    private function matchesLandingState(
+        Delivery $delivery,
+        PhaseRun $phase,
+        array $published,
+        mixed $implementationFlow,
+    ): bool {
         if ($delivery->status === DeliveryStatus::ReadyToMerge) {
             return $phase->status === PhaseRunStatus::Pending
                 && $phase->current_block === null && $phase->output === null
@@ -323,15 +328,28 @@ final readonly class AdvanceOrbitLanding
             return false;
         }
 
-        $activeRelease = $phase->status === PhaseRunStatus::Running
-            && $phase->current_block === 'reservation_release'
+        $activeBlock = $phase->status === PhaseRunStatus::Running
+            && in_array($phase->current_block, [
+                'merge_verification',
+                'repository_reconciliation',
+                'reservation_release',
+            ], true)
             && $phase->started_at !== null && $phase->finished_at === null;
         $completed = $phase->status === PhaseRunStatus::Completed
             && $phase->current_block === null
             && $phase->started_at !== null && $phase->finished_at !== null;
+        $stage = $completed ? 'completed' : $phase->current_block;
 
-        return ($activeRelease || $completed)
-            && $this->matchesMergedOutput($delivery, $phase->output, $published);
+        return ($activeBlock || $completed)
+            && is_string($stage)
+            && is_string($implementationFlow)
+            && $this->matchesMergedOutput(
+                $delivery,
+                $phase->output,
+                $published,
+                $stage,
+                $implementationFlow,
+            );
     }
 
     /** @param array<string, mixed> $published */
@@ -392,16 +410,32 @@ final readonly class AdvanceOrbitLanding
      * @param  array<string, mixed>|null  $output
      * @param  array<string, mixed>  $published
      */
-    private function matchesMergedOutput(Delivery $delivery, ?array $output, array $published): bool
-    {
+    private function matchesMergedOutput(
+        Delivery $delivery,
+        ?array $output,
+        array $published,
+        string $stage,
+        string $implementationFlow,
+    ): bool {
         $merge = is_array($output) ? ($output['merge'] ?? null) : null;
+        $verification = is_array($output) ? ($output['merge_verification'] ?? null) : null;
+        $reconciliation = is_array($output) ? ($output['repository_reconciliation'] ?? null) : null;
         $preMerge = is_array($output) ? $output : null;
 
-        if (! is_array($merge) || array_is_list($merge) || ! is_array($preMerge)) {
+        if (! is_array($merge) || array_is_list($merge) || ! is_array($preMerge)
+            || ! in_array($stage, [
+                'merge_verification',
+                'repository_reconciliation',
+                'reservation_release',
+                'completed',
+            ], true)) {
             return false;
         }
 
-        unset($preMerge['merge']);
+        unset($preMerge['merge'], $preMerge['merge_verification'], $preMerge['repository_reconciliation']);
+
+        $requiresVerification = $stage !== 'merge_verification';
+        $requiresReconciliation = in_array($stage, ['reservation_release', 'completed'], true);
 
         return $this->matchesPreMergeOutput($delivery, $preMerge, $published)
             && $merge === [
@@ -411,7 +445,46 @@ final readonly class AdvanceOrbitLanding
                 'merge_commit_sha' => $merge['merge_commit_sha'] ?? null,
             ]
             && is_string($merge['merge_commit_sha'] ?? null)
-            && preg_match('/^[a-f0-9]{40}$/', $merge['merge_commit_sha']) === 1;
+            && preg_match('/^[a-f0-9]{40}$/', $merge['merge_commit_sha']) === 1
+            && ($requiresVerification
+                ? $this->matchesMergeVerification($merge, $verification, $implementationFlow)
+                : $verification === null)
+            && ($requiresReconciliation
+                ? $this->matchesRepositoryReconciliation($preMerge, $merge, $reconciliation)
+                : $reconciliation === null);
+    }
+
+    /** @param array<string, mixed> $merge */
+    private function matchesMergeVerification(
+        array $merge,
+        mixed $verification,
+        string $implementationFlow,
+    ): bool {
+        return is_array($verification) && ! array_is_list($verification)
+            && count($verification) === 4
+            && ($verification['flow'] ?? null) === $implementationFlow
+            && ($verification['candidate_sha'] ?? null) === ($merge['candidate_sha'] ?? null)
+            && ($verification['merge_commit_sha'] ?? null) === ($merge['merge_commit_sha'] ?? null)
+            && is_string($verification['tree_sha'] ?? null)
+            && preg_match('/^[a-f0-9]{40}$/', $verification['tree_sha']) === 1;
+    }
+
+    /**
+     * @param  array<string, mixed>  $preMerge
+     * @param  array<string, mixed>  $merge
+     */
+    private function matchesRepositoryReconciliation(
+        array $preMerge,
+        array $merge,
+        mixed $reconciliation,
+    ): bool {
+        return is_array($reconciliation) && ! array_is_list($reconciliation)
+            && count($reconciliation) === 4
+            && ($reconciliation['repository'] ?? null) === ($preMerge['repository'] ?? null)
+            && ($reconciliation['merge_commit_sha'] ?? null) === ($merge['merge_commit_sha'] ?? null)
+            && is_string($reconciliation['main_sha'] ?? null)
+            && $reconciliation['main_sha'] === ($reconciliation['origin_main_sha'] ?? null)
+            && preg_match('/^[a-f0-9]{40}$/', $reconciliation['main_sha']) === 1;
     }
 
     private function verifyImplementation(
@@ -510,6 +583,7 @@ final readonly class AdvanceOrbitLanding
             $delivery = $this->lockLedger($deliveryId);
             $intent = $this->landingIntent($delivery, $phaseId);
             $phase = $intent[0] ?? null;
+            $implementation = $intent[2] ?? null;
 
             if ($phase === null
                 || $delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
@@ -587,10 +661,8 @@ final readonly class AdvanceOrbitLanding
             $output = [...$preMerge, 'merge' => $merge];
 
             if ($delivery->status === DeliveryStatus::Landed
-                && $phase->current_block === 'reservation_release'
+                && $phase->current_block === 'merge_verification'
                 && $phase->output === $output) {
-                $this->cacheRefresh->handle($delivery->id, $phase->id);
-
                 return;
             }
 
@@ -608,18 +680,239 @@ final readonly class AdvanceOrbitLanding
                 );
             }
 
-            $phase->current_block = 'reservation_release';
+            $phase->current_block = 'merge_verification';
             $phase->output = $output;
             $phase->save();
             $delivery->status = DeliveryStatus::Landed;
             $delivery->failure_details = null;
             $delivery->save();
-            $this->cacheRefresh->handle($delivery->id, $phase->id);
         });
     }
 
-    private function resumeMerge(Delivery $delivery, PhaseRun $phase): void
+    private function resumePostMerge(Delivery $delivery, PhaseRun $phase): void
     {
+        $config = $this->configs->hydrate($delivery->projectOrchestration->config);
+        $repository = is_array($phase->output) ? ($phase->output['repository'] ?? null) : null;
+        $issueKey = $delivery->external_issue_key;
+
+        if (! $config instanceof OrbitProjectConfig
+            || ! is_string($repository) || $config->repository !== $repository
+            || ! is_string($issueKey) || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit post-merge repository configuration is inconsistent.',
+            );
+        }
+
+        $issueReservation = $this->repository->reserveDelivery($config, $issueKey);
+
+        try {
+            $delivery = $this->delivery($delivery->id);
+            $intent = $this->landingIntent($delivery, $phase->id);
+
+            if ($intent === null) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit post-merge ledger changed before recovery.',
+                );
+            }
+
+            if ($delivery->status === DeliveryStatus::Merging) {
+                $this->resumeMerge($delivery, $intent[0], $config);
+
+                return;
+            }
+
+            if ($delivery->status !== DeliveryStatus::Landed) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The Orbit post-merge delivery is not recoverable.',
+                );
+            }
+
+            $this->reconcileAndFinalize($config, $delivery->id, $intent[0]->id, true);
+        } finally {
+            $issueReservation->release();
+        }
+    }
+
+    private function reconcileAndFinalize(
+        OrbitProjectConfig $config,
+        int $deliveryId,
+        int $phaseId,
+        bool $ensureMergeReservation,
+    ): void {
+        $delivery = $this->delivery($deliveryId);
+
+        if ($ensureMergeReservation) {
+            $reservation = $this->pullRequests->reserve(
+                (string) $delivery->external_issue_id,
+                $this->pullRequestUrl($delivery),
+            );
+
+            if (! $reservation->owned) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The landed Orbit delivery no longer owns its merge reservation.',
+                );
+            }
+        }
+
+        $this->verifyMerge($config, $deliveryId, $phaseId);
+        $this->cacheRefresh->handle($deliveryId, $phaseId);
+        $this->reconcilePrimaryCheckout($config, $deliveryId, $phaseId);
+        $this->releaseAndFinalize(
+            $this->delivery($deliveryId),
+            PhaseRun::query()->findOrFail($phaseId),
+        );
+    }
+
+    private function verifyMerge(OrbitProjectConfig $config, int $deliveryId, int $phaseId): void
+    {
+        $delivery = $this->delivery($deliveryId);
+        $phase = PhaseRun::query()->findOrFail($phaseId);
+
+        if (in_array($phase->current_block, [
+            'repository_reconciliation',
+            'reservation_release',
+        ], true)) {
+            return;
+        }
+
+        $output = $phase->output;
+        $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+        $worktree = $delivery->worktree_path;
+
+        if ($phase->current_block !== 'merge_verification'
+            || $merge === null || ! is_string($worktree)) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit merge cannot be verified from its retained ledger.',
+            );
+        }
+
+        $verified = $this->merges->verifyMergeLineage(
+            $config,
+            $worktree,
+            $this->sha($merge, 'candidate_sha'),
+            $this->sha($merge, 'merge_commit_sha'),
+        );
+        $this->recordMergeVerification($deliveryId, $phaseId, $verified);
+    }
+
+    private function recordMergeVerification(
+        int $deliveryId,
+        int $phaseId,
+        VerifiedOrbitMergeLineage $verified,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $phaseId, $verified): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $intent = $this->landingIntent($delivery, $phaseId);
+            $phase = $intent[0] ?? null;
+            $implementation = $intent[2] ?? null;
+            $output = $phase?->output;
+            $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+            $evidence = [
+                'flow' => $verified->flow,
+                'candidate_sha' => $verified->candidateSha,
+                'merge_commit_sha' => $verified->mergeCommitSha,
+                'tree_sha' => $verified->treeSha,
+            ];
+
+            if ($phase !== null && $phase->current_block === 'repository_reconciliation'
+                && is_array($output) && ($output['merge_verification'] ?? null) === $evidence) {
+                return;
+            }
+
+            if ($phase === null || $phase->current_block !== 'merge_verification'
+                || $implementation === null
+                || ! is_array($output) || $merge === null
+                || ($implementation->payload['flow'] ?? null) !== $verified->flow
+                || ($merge['candidate_sha'] ?? null) !== $verified->candidateSha
+                || ($merge['merge_commit_sha'] ?? null) !== $verified->mergeCommitSha
+                || array_key_exists('merge_verification', $output)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The verified Orbit merge no longer matches its landing ledger.',
+                );
+            }
+
+            $phase->current_block = 'repository_reconciliation';
+            $phase->output = [...$output, 'merge_verification' => $evidence];
+            $phase->save();
+            $delivery->failure_details = null;
+            $delivery->save();
+        });
+    }
+
+    private function reconcilePrimaryCheckout(
+        OrbitProjectConfig $config,
+        int $deliveryId,
+        int $phaseId,
+    ): void {
+        $phase = PhaseRun::query()->findOrFail($phaseId);
+
+        if ($phase->current_block === 'reservation_release') {
+            return;
+        }
+
+        $output = $phase->output;
+        $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+
+        if ($phase->current_block !== 'repository_reconciliation' || $merge === null) {
+            throw new OrbitLandingAdvancementFailed(
+                'The Orbit primary checkout cannot reconcile from its retained ledger.',
+            );
+        }
+
+        $reconciled = $this->primaryCheckout->reconcilePrimaryCheckout(
+            $config,
+            $this->sha($merge, 'merge_commit_sha'),
+        );
+        $this->recordRepositoryReconciliation($deliveryId, $phaseId, $reconciled);
+    }
+
+    private function recordRepositoryReconciliation(
+        int $deliveryId,
+        int $phaseId,
+        ReconciledOrbitPrimaryCheckout $reconciled,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $phaseId, $reconciled): void {
+            $delivery = $this->lockLedger($deliveryId);
+            $intent = $this->landingIntent($delivery, $phaseId);
+            $phase = $intent[0] ?? null;
+            $output = $phase?->output;
+            $merge = $this->associativeArray(is_array($output) ? ($output['merge'] ?? null) : null);
+            $evidence = [
+                'repository' => $reconciled->repository,
+                'merge_commit_sha' => $reconciled->mergeCommitSha,
+                'main_sha' => $reconciled->mainSha,
+                'origin_main_sha' => $reconciled->originMainSha,
+            ];
+
+            if ($phase !== null && $phase->current_block === 'reservation_release'
+                && is_array($output) && ($output['repository_reconciliation'] ?? null) === $evidence) {
+                return;
+            }
+
+            if ($phase === null || $phase->current_block !== 'repository_reconciliation'
+                || ! is_array($output) || $merge === null
+                || ($output['repository'] ?? null) !== $reconciled->repository
+                || ($merge['merge_commit_sha'] ?? null) !== $reconciled->mergeCommitSha
+                || $reconciled->mainSha !== $reconciled->originMainSha
+                || array_key_exists('repository_reconciliation', $output)) {
+                throw new OrbitLandingAdvancementFailed(
+                    'The reconciled Orbit primary checkout no longer matches its landing ledger.',
+                );
+            }
+
+            $phase->current_block = 'reservation_release';
+            $phase->output = [...$output, 'repository_reconciliation' => $evidence];
+            $phase->save();
+            $delivery->failure_details = null;
+            $delivery->save();
+        });
+    }
+
+    private function resumeMerge(
+        Delivery $delivery,
+        PhaseRun $phase,
+        OrbitProjectConfig $config,
+    ): void {
         $output = $phase->output;
         $approval = $this->associativeArray(
             is_array($output) ? ($output['approved_pull_request'] ?? null) : null,
@@ -640,10 +933,7 @@ final readonly class AdvanceOrbitLanding
             $this->sha($approval, 'candidate_sha'),
         );
         $this->commitMerged($delivery->id, $phase->id, $output, $merged);
-        $this->releaseAndFinalize(
-            $this->delivery($delivery->id),
-            PhaseRun::query()->findOrFail($phase->id),
-        );
+        $this->reconcileAndFinalize($config, $delivery->id, $phase->id, false);
     }
 
     private function releaseAndFinalize(Delivery $delivery, PhaseRun $phase): void

@@ -87,14 +87,18 @@ final readonly class QueueOrbitMainCacheRefresh
             || ($phase->status !== PhaseRunStatus::Running
                 && $phase->status !== PhaseRunStatus::Completed)
             || ($phase->status === PhaseRunStatus::Running
-                && $phase->current_block !== 'reservation_release')
+                && ! in_array($phase->current_block, [
+                    'repository_reconciliation',
+                    'reservation_release',
+                ], true))
             || ($phase->status === PhaseRunStatus::Completed
                 && ($phase->current_block !== null || $phase->finished_at === null))
             || ! is_string($repository) || ! str_starts_with($repository, '/')
             || ! is_string($mainSha) || preg_match('/^[a-f0-9]{40}$/', $mainSha) !== 1
             || ! is_string($candidateSha) || $candidateSha !== $delivery->candidate_sha
             || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
-            || ! is_string($mergeSha) || preg_match('/^[a-f0-9]{40}$/', $mergeSha) !== 1) {
+            || ! is_string($mergeSha) || preg_match('/^[a-f0-9]{40}$/', $mergeSha) !== 1
+            || ! $this->matchesMergeVerification($output, $candidateSha, $mergeSha)) {
             throw new OrbitLandingAdvancementFailed(
                 'The confirmed Orbit merge cannot queue main cache maintenance.',
             );
@@ -108,5 +112,19 @@ final readonly class QueueOrbitMainCacheRefresh
             'merge_commit_sha' => $mergeSha,
             'pre_merge_main_sha' => $mainSha,
         ];
+    }
+
+    /** @param array<string, mixed>|null $output */
+    private function matchesMergeVerification(?array $output, string $candidateSha, string $mergeSha): bool
+    {
+        $verification = is_array($output) ? ($output['merge_verification'] ?? null) : null;
+
+        return is_array($verification) && ! array_is_list($verification)
+            && count($verification) === 4
+            && in_array($verification['flow'] ?? null, ['discovery', 'proof'], true)
+            && ($verification['candidate_sha'] ?? null) === $candidateSha
+            && ($verification['merge_commit_sha'] ?? null) === $mergeSha
+            && is_string($verification['tree_sha'] ?? null)
+            && preg_match('/^[a-f0-9]{40}$/', $verification['tree_sha']) === 1;
     }
 }

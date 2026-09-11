@@ -83,6 +83,9 @@ final readonly class RunOrbitMainCacheRefresh
     {
         $input = $run->input;
         $repository = is_array($input) ? ($input['repository'] ?? null) : null;
+        $candidateSha = is_array($input) ? ($input['candidate_sha'] ?? null) : null;
+        $mergeSha = is_array($input) ? ($input['merge_commit_sha'] ?? null) : null;
+        $preMergeMainSha = is_array($input) ? ($input['pre_merge_main_sha'] ?? null) : null;
 
         if (! is_array($input) || array_keys($input) !== [
             'schema',
@@ -95,9 +98,9 @@ final readonly class RunOrbitMainCacheRefresh
             || ($input['schema'] ?? null) !== QueueOrbitMainCacheRefresh::SCHEMA
             || ! is_int($input['landing_phase_run_id'] ?? null)
             || ! is_string($repository) || ! str_starts_with($repository, '/')
-            || ! $this->sha($input['candidate_sha'] ?? null)
-            || ! $this->sha($input['merge_commit_sha'] ?? null)
-            || ! $this->sha($input['pre_merge_main_sha'] ?? null)) {
+            || ! is_string($candidateSha) || ! $this->sha($candidateSha)
+            || ! is_string($mergeSha) || ! $this->sha($mergeSha)
+            || ! is_string($preMergeMainSha) || ! $this->sha($preMergeMainSha)) {
             throw new OrbitRepositoryFailed('The Orbit main cache refresh request is malformed.');
         }
 
@@ -126,18 +129,39 @@ final readonly class RunOrbitMainCacheRefresh
             || $phase->attempt !== 1
             || ! in_array($phase->status, [PhaseRunStatus::Running, PhaseRunStatus::Completed], true)
             || ($phase->status === PhaseRunStatus::Running
-                && $phase->current_block !== 'reservation_release')
+                && ! in_array($phase->current_block, [
+                    'repository_reconciliation',
+                    'reservation_release',
+                ], true))
             || ($phase->status === PhaseRunStatus::Completed
                 && ($phase->current_block !== null || $phase->finished_at === null))
             || ! is_array($merge)
             || ($output['repository'] ?? null) !== $repository
-            || ($output['main_sha'] ?? null) !== $input['pre_merge_main_sha']
-            || ($merge['candidate_sha'] ?? null) !== $input['candidate_sha']
-            || ($merge['merge_commit_sha'] ?? null) !== $input['merge_commit_sha']) {
+            || ($output['main_sha'] ?? null) !== $preMergeMainSha
+            || ($merge['candidate_sha'] ?? null) !== $candidateSha
+            || ($merge['merge_commit_sha'] ?? null) !== $mergeSha
+            || ! $this->matchesMergeVerification(
+                $output,
+                $candidateSha,
+                $mergeSha,
+            )) {
             throw new OrbitRepositoryFailed('The Orbit main cache refresh request no longer matches its landing ledger.');
         }
 
         return $repository;
+    }
+
+    /** @param array<string, mixed>|null $output */
+    private function matchesMergeVerification(?array $output, string $candidateSha, string $mergeSha): bool
+    {
+        $verification = is_array($output) ? ($output['merge_verification'] ?? null) : null;
+
+        return is_array($verification) && ! array_is_list($verification)
+            && count($verification) === 4
+            && in_array($verification['flow'] ?? null, ['discovery', 'proof'], true)
+            && ($verification['candidate_sha'] ?? null) === $candidateSha
+            && ($verification['merge_commit_sha'] ?? null) === $mergeSha
+            && $this->sha($verification['tree_sha'] ?? null);
     }
 
     private function lockRunLedger(int $maintenanceRunId): MaintenanceRun

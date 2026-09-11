@@ -7,6 +7,8 @@ namespace App\Delivery\Repositories;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
+use App\Delivery\Contracts\OrbitMergeLineageVerifier;
+use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitDeliveryReservation;
@@ -15,8 +17,10 @@ use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
 use App\Delivery\Data\RequestedOrbitMainCacheRefresh;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
+use App\Delivery\Data\VerifiedOrbitMergeLineage;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
@@ -26,7 +30,7 @@ use Illuminate\Support\Str;
 use JsonException;
 use RuntimeException;
 
-final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitRepository
+final readonly class ProcessOrbitRepository implements OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitRepository
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -35,6 +39,217 @@ final readonly class ProcessOrbitRepository implements OrbitImplementationReposi
         ['composer', 'check'],
         ['composer', 'test:affected'],
     ];
+
+    public function verifyMergeLineage(
+        OrbitProjectConfig $config,
+        string $worktree,
+        string $candidateSha,
+        string $mergeCommitSha,
+    ): VerifiedOrbitMergeLineage {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $path = realpath($worktree);
+        $common = $repository === false ? false : realpath($repository.'/.git');
+        $scriptPath = $repository === false ? '' : $repository.'/bin/loop-flow';
+        $script = $repository === false ? false : realpath($scriptPath);
+
+        if ($repository === false || $repository !== $config->repository
+            || $root === false || $root !== $config->worktreeRoot
+            || $path === false || $path !== $worktree || ! str_starts_with($path, $root.'/')
+            || $common === false || ! is_dir($common) || is_link($repository.'/.git')
+            || $script === false || $script !== $scriptPath
+            || is_link($scriptPath) || ! is_executable($script)
+            || preg_match('/^[a-f0-9]{40}$/', $candidateSha) !== 1
+            || preg_match('/^[a-f0-9]{40}$/', $mergeCommitSha) !== 1) {
+            throw new OrbitRepositoryFailed('The configured Orbit merge lineage adapter is unavailable.');
+        }
+
+        try {
+            $worktreeCommon = Process::path($path)->timeout(10)->run([
+                'git', 'rev-parse', '--path-format=absolute', '--git-common-dir',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit merge worktree could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        $resolvedWorktreeCommon = $worktreeCommon->failed()
+            ? false
+            : realpath(trim($worktreeCommon->output()));
+
+        if ($resolvedWorktreeCommon === false || $resolvedWorktreeCommon !== $common) {
+            throw new OrbitRepositoryFailed('The Orbit merge worktree no longer belongs to the configured repository.');
+        }
+
+        try {
+            $fetch = Process::path($repository)->timeout(120)->run(['git', 'fetch', 'origin', 'main']);
+
+            if ($fetch->failed()) {
+                $details = trim($fetch->errorOutput()) ?: trim($fetch->output());
+                $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+                throw new OrbitRepositoryFailed('Orbit merge lineage verification failed: '.$details);
+            }
+
+            $published = Process::path($repository)->timeout(10)->run([
+                'git', 'merge-base', '--is-ancestor', $mergeCommitSha, 'origin/main',
+            ]);
+
+            if ($published->failed()) {
+                $details = trim($published->errorOutput()) ?: trim($published->output());
+                $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+                throw new OrbitRepositoryFailed('Orbit merge lineage verification failed: '.$details);
+            }
+
+            $verification = Process::path($repository)->timeout(60)->run([
+                $script,
+                'verify-merge',
+                '--worktree='.$path,
+                '--candidate='.$candidateSha,
+                '--merge='.$mergeCommitSha,
+            ]);
+        } catch (OrbitRepositoryFailed $exception) {
+            throw $exception;
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit merge lineage adapter could not run.',
+                previous: $exception,
+            );
+        }
+
+        if ($verification->failed()) {
+            $details = trim($verification->errorOutput()) ?: trim($verification->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Orbit merge lineage verification failed: '.$details);
+        }
+
+        try {
+            $evidence = json_decode($verification->output(), true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit merge lineage adapter returned invalid JSON.',
+                previous: $exception,
+            );
+        }
+
+        $flow = is_array($evidence) ? ($evidence['flow'] ?? null) : null;
+        $candidate = is_array($evidence) ? ($evidence['candidate'] ?? null) : null;
+        $merge = is_array($evidence) ? ($evidence['merge'] ?? null) : null;
+        $tree = is_array($evidence) ? ($evidence['tree'] ?? null) : null;
+
+        if (! is_array($evidence) || array_is_list($evidence) || count($evidence) !== 4
+            || ! in_array($flow, ['discovery', 'proof'], true)
+            || $candidate !== $candidateSha || $merge !== $mergeCommitSha
+            || ! is_string($tree) || preg_match('/^[a-f0-9]{40}$/', $tree) !== 1) {
+            throw new OrbitRepositoryFailed(
+                'The Orbit merge lineage adapter returned incomplete verification evidence.',
+            );
+        }
+
+        return new VerifiedOrbitMergeLineage($flow, $candidate, $merge, $tree);
+    }
+
+    public function reconcilePrimaryCheckout(
+        OrbitProjectConfig $config,
+        string $mergeCommitSha,
+    ): ReconciledOrbitPrimaryCheckout {
+        $repository = realpath($config->repository);
+        $common = $repository === false ? false : realpath($repository.'/.git');
+
+        if ($repository === false || $repository !== $config->repository
+            || $common === false || ! is_dir($common) || is_link($repository.'/.git')
+            || preg_match('/^[a-f0-9]{40}$/', $mergeCommitSha) !== 1) {
+            throw new OrbitRepositoryFailed('The configured Orbit primary checkout is unavailable.');
+        }
+
+        $root = $common.'/orbit-delivery';
+        $base = $root.'/v1';
+        $this->ensureReservationDirectory($root);
+        $this->ensureReservationDirectory($base);
+        $lockPath = $base.'/checkout.lock';
+
+        if (is_link($lockPath) || (file_exists($lockPath) && ! is_file($lockPath))) {
+            throw new OrbitRepositoryFailed('The Orbit primary checkout lock is unsafe.');
+        }
+
+        [$handle, $lockCreated] = $this->openReservationLock($base, $lockPath);
+
+        if (! flock($handle, LOCK_EX | LOCK_NB)) {
+            fclose($handle);
+
+            throw new OrbitRepositoryFailed('Another Orbit controller currently owns the primary checkout.');
+        }
+
+        try {
+            if (! $this->isOpenedReservationLock($handle, $lockPath)
+                || ($lockCreated && ! $this->isPrivateOpenedReservationLock($handle))) {
+                throw new OrbitRepositoryFailed('The Orbit primary checkout lock is unsafe.');
+            }
+
+            try {
+                $status = Process::path($repository)->timeout(10)->run(['git', 'status', '--porcelain']);
+                $branch = Process::path($repository)->timeout(10)->run(['git', 'branch', '--show-current']);
+                $ancestor = Process::path($repository)->timeout(10)->run([
+                    'git', 'merge-base', '--is-ancestor', $mergeCommitSha, 'origin/main',
+                ]);
+            } catch (RuntimeException $exception) {
+                throw new OrbitRepositoryFailed(
+                    'The Orbit primary checkout could not be inspected.',
+                    previous: $exception,
+                );
+            }
+
+            if ($status->failed() || trim($status->output()) !== '') {
+                throw new OrbitRepositoryFailed('The Orbit primary main checkout is dirty.');
+            }
+
+            if ($branch->failed() || trim($branch->output()) !== 'main') {
+                throw new OrbitRepositoryFailed('The Orbit primary checkout is not on main.');
+            }
+
+            if ($ancestor->failed()) {
+                throw new OrbitRepositoryFailed('The confirmed Orbit merge is not present in origin/main.');
+            }
+
+            try {
+                $merge = Process::path($repository)->timeout(120)->run([
+                    'git', 'merge', '--ff-only', 'origin/main',
+                ]);
+                $head = Process::path($repository)->timeout(10)->run(['git', 'rev-parse', 'HEAD']);
+                $main = Process::path($repository)->timeout(10)->run(['git', 'rev-parse', 'main']);
+                $origin = Process::path($repository)->timeout(10)->run(['git', 'rev-parse', 'origin/main']);
+            } catch (RuntimeException $exception) {
+                throw new OrbitRepositoryFailed(
+                    'The Orbit primary checkout could not be reconciled.',
+                    previous: $exception,
+                );
+            }
+
+            $headSha = trim($head->output());
+            $mainSha = trim($main->output());
+            $originMainSha = trim($origin->output());
+
+            if ($merge->failed() || $head->failed() || $main->failed() || $origin->failed()
+                || $headSha !== $mainSha || $mainSha !== $originMainSha
+                || preg_match('/^[a-f0-9]{40}$/', $mainSha) !== 1) {
+                throw new OrbitRepositoryFailed('The Orbit primary checkout did not reconcile to origin/main.');
+            }
+
+            return new ReconciledOrbitPrimaryCheckout(
+                $repository,
+                $mergeCommitSha,
+                $mainSha,
+                $originMainSha,
+            );
+        } finally {
+            flock($handle, LOCK_UN);
+            fclose($handle);
+        }
+    }
 
     public function request(string $repository): RequestedOrbitMainCacheRefresh
     {

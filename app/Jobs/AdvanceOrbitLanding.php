@@ -108,8 +108,13 @@ final class AdvanceOrbitLanding implements ShouldQueue, ShouldQueueAfterCommit
             }
 
             if ($delivery->status === DeliveryStatus::Landed) {
+                $code = match ($phase->current_block) {
+                    'merge_verification' => 'landing_merge_verification_required',
+                    'repository_reconciliation' => 'landing_repository_reconciliation_required',
+                    default => 'landing_reservation_release_required',
+                };
                 $delivery->failure_details = [
-                    'code' => 'landing_reservation_release_required',
+                    'code' => $code,
                     'phase_run_id' => $phase->id,
                     'message' => $exception?->getMessage(),
                 ];
@@ -143,7 +148,11 @@ final class AdvanceOrbitLanding implements ShouldQueue, ShouldQueueAfterCommit
 
         return $delivery->status === DeliveryStatus::Landed
             && $phase->status === PhaseRunStatus::Running
-            && $phase->current_block === 'reservation_release'
+            && in_array($phase->current_block, [
+                'merge_verification',
+                'repository_reconciliation',
+                'reservation_release',
+            ], true)
             && $phase->finished_at === null;
     }
 }

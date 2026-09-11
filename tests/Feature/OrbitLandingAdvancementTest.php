@@ -9,6 +9,8 @@ use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
+use App\Delivery\Contracts\OrbitMergeLineageVerifier;
+use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
 use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\ApprovedOrbitPullRequest;
@@ -21,8 +23,10 @@ use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
 use App\Delivery\Data\RequestedOrbitMainCacheRefresh;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
+use App\Delivery\Data\VerifiedOrbitMergeLineage;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
@@ -209,6 +213,77 @@ final class LandingCacheRefreshRequester implements OrbitMainCacheRefreshRequest
             repository: $repository,
             disposition: $this->disposition,
             message: 'Main cache refresh queued (pid 123); log: /tmp/refresh.log',
+        );
+    }
+}
+
+final class LandingMergeLineageVerifier implements OrbitMergeLineageVerifier
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public int $failures = 0;
+
+    public string $flow = 'discovery';
+
+    public function verifyMergeLineage(
+        OrbitProjectConfig $config,
+        string $worktree,
+        string $candidateSha,
+        string $mergeCommitSha,
+    ): VerifiedOrbitMergeLineage {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($worktree)->toBe(test()->worktreePath)
+            ->and($candidateSha)->toBe(test()->candidateSha)
+            ->and($mergeCommitSha)->toBe(str_repeat('f', 40))
+            ->and(test()->repository->reservationIsHeld())->toBeTrue();
+        $this->calls++;
+
+        if ($this->failures > 0) {
+            $this->failures--;
+
+            throw new OrbitRepositoryFailed('The confirmed merge is not yet published.');
+        }
+
+        return new VerifiedOrbitMergeLineage(
+            flow: $this->flow,
+            candidateSha: $candidateSha,
+            mergeCommitSha: $mergeCommitSha,
+            treeSha: str_repeat('7', 40),
+        );
+    }
+}
+
+final class LandingPrimaryCheckoutReconciler implements OrbitPrimaryCheckoutReconciler
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public int $failures = 0;
+
+    public function reconcilePrimaryCheckout(
+        OrbitProjectConfig $config,
+        string $mergeCommitSha,
+    ): ReconciledOrbitPrimaryCheckout {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($config->repository)->toBe(test()->repositoryPath)
+            ->and($mergeCommitSha)->toBe(str_repeat('f', 40))
+            ->and(test()->repository->reservationIsHeld())->toBeTrue();
+        $this->calls++;
+
+        if ($this->failures > 0) {
+            $this->failures--;
+
+            throw new OrbitRepositoryFailed('The primary checkout is not ready.');
+        }
+
+        return new ReconciledOrbitPrimaryCheckout(
+            repository: $config->repository,
+            mergeCommitSha: $mergeCommitSha,
+            mainSha: str_repeat('8', 40),
+            originMainSha: str_repeat('8', 40),
         );
     }
 }
@@ -608,17 +683,23 @@ beforeEach(function () {
     $this->issues = new LandingIssues;
     $this->main = new LandingMain;
     $this->gateway = new LandingGateway;
+    $this->merges = new LandingMergeLineageVerifier;
+    $this->primaryCheckout = new LandingPrimaryCheckoutReconciler;
     $transactionLevel = DB::transactionLevel();
     $this->repository->transactionLevel = $transactionLevel;
     $this->implementations->transactionLevel = $transactionLevel;
     $this->issues->transactionLevel = $transactionLevel;
     $this->main->transactionLevel = $transactionLevel;
     $this->gateway->transactionLevel = $transactionLevel;
+    $this->merges->transactionLevel = $transactionLevel;
+    $this->primaryCheckout->transactionLevel = $transactionLevel;
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitImplementationRepository::class, $this->implementations);
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
     app()->instance(OrbitMainCorrectnessInspector::class, $this->main);
     app()->instance(OrbitPullRequestLandingGateway::class, $this->gateway);
+    app()->instance(OrbitMergeLineageVerifier::class, $this->merges);
+    app()->instance(OrbitPrimaryCheckoutReconciler::class, $this->primaryCheckout);
     Queue::fake();
 });
 
@@ -842,6 +923,18 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($landing->output['repository'])->toBe($this->repositoryPath)
         ->and($landing->output['merge']['candidate_sha'])->toBe($this->candidateSha)
         ->and($landing->output['merge']['merge_commit_sha'])->toBe(str_repeat('f', 40))
+        ->and($landing->output['merge_verification'])->toBe([
+            'flow' => 'discovery',
+            'candidate_sha' => $this->candidateSha,
+            'merge_commit_sha' => str_repeat('f', 40),
+            'tree_sha' => str_repeat('7', 40),
+        ])
+        ->and($landing->output['repository_reconciliation'])->toBe([
+            'repository' => $this->repositoryPath,
+            'merge_commit_sha' => str_repeat('f', 40),
+            'main_sha' => str_repeat('8', 40),
+            'origin_main_sha' => str_repeat('8', 40),
+        ])
         ->and($this->repository->reservationIsHeld())->toBeFalse()
         ->and($this->implementations->calls)->toBe(1)
         ->and($this->issues->calls)->toBe(1)
@@ -849,7 +942,9 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ->and($this->gateway->reserveCalls)->toBe(1)
         ->and($this->gateway->inspectCalls)->toBe(1)
         ->and($this->gateway->mergeCalls)->toBe(1)
-        ->and($this->gateway->releaseCalls)->toBe(1);
+        ->and($this->gateway->releaseCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1);
 
     $maintenance = MaintenanceRun::sole();
     expect($maintenance->status)->toBe(MaintenanceRunStatus::Pending)
@@ -870,6 +965,8 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
     expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
         ->and($this->gateway->mergeCalls)->toBe(1)
         ->and($this->gateway->releaseCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
         ->and(MaintenanceRun::count())->toBe(1);
     Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 });
@@ -952,7 +1049,80 @@ it('retains and resumes an unresolved merge without repeating pre-merge verifica
         ->and($this->main->calls)->toBe(2)
         ->and($this->gateway->reserveCalls)->toBe(2)
         ->and($this->gateway->mergeCalls)->toBe(2)
-        ->and($this->gateway->releaseCalls)->toBe(1);
+        ->and($this->gateway->releaseCalls)->toBe(1)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1);
+});
+
+it('retries merge verification without releasing or reconciling the confirmed merge', function () {
+    $this->merges->failures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitRepositoryFailed::class, 'not yet published');
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->landing->fresh()->current_block)->toBe('merge_verification')
+        ->and($this->gateway->releaseCalls)->toBe(0)
+        ->and($this->primaryCheckout->calls)->toBe(0)
+        ->and(MaintenanceRun::count())->toBe(0)
+        ->and($this->repository->reservationIsHeld())->toBeFalse();
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->merges->calls)->toBe(2)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->gateway->reserveCalls)->toBe(2)
+        ->and($this->gateway->releaseCalls)->toBe(1)
+        ->and(MaintenanceRun::count())->toBe(1);
+});
+
+it('rejects merge verification under a flow different from the approved implementation', function () {
+    $this->merges->flow = 'proof';
+
+    expect(fn () => app(AdvanceOrbitLanding::class)->handle(
+        $this->delivery->id,
+        $this->landing->id,
+    ))->toThrow(OrbitLandingAdvancementFailed::class, 'no longer matches its landing ledger');
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($this->landing->fresh()->current_block)->toBe('merge_verification')
+        ->and($this->landing->fresh()->output)->not->toHaveKey('merge_verification')
+        ->and($this->primaryCheckout->calls)->toBe(0)
+        ->and($this->gateway->releaseCalls)->toBe(0)
+        ->and(MaintenanceRun::count())->toBe(0);
+});
+
+it('retains verified merge evidence and queued maintenance while primary checkout reconciliation retries', function () {
+    $this->primaryCheckout->failures = 1;
+    $action = app(AdvanceOrbitLanding::class);
+
+    expect(fn () => $action->handle($this->delivery->id, $this->landing->id))
+        ->toThrow(OrbitRepositoryFailed::class, 'not ready');
+    $landing = $this->landing->fresh();
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Landed)
+        ->and($landing->current_block)->toBe('repository_reconciliation')
+        ->and($landing->output['merge_verification']['merge_commit_sha'])->toBe(str_repeat('f', 40))
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(0)
+        ->and(MaintenanceRun::count())->toBe(1);
+    Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
+
+    $run = MaintenanceRun::sole();
+    $requests = new LandingCacheRefreshRequester;
+    $requests->transactionLevel = DB::transactionLevel();
+    app()->instance(OrbitMainCacheRefreshRequester::class, $requests);
+    app(RunOrbitMainCacheRefresh::class)->handle($run->id);
+    expect($run->fresh()->status)->toBe(MaintenanceRunStatus::Completed)
+        ->and($requests->calls)->toBe(1);
+
+    expect($action->handle($this->delivery->id, $this->landing->id))->toBeNull()
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->merges->calls)->toBe(1)
+        ->and($this->primaryCheckout->calls)->toBe(2)
+        ->and($this->gateway->reserveCalls)->toBe(2)
+        ->and($this->gateway->releaseCalls)->toBe(1)
+        ->and(MaintenanceRun::count())->toBe(1);
+    Queue::assertPushedTimes(RunMainCacheRefreshJob::class, 1);
 });
 
 it('preserves a landed merge while reservation release is retried', function () {
@@ -1057,6 +1227,8 @@ it('queues incomplete landing recovery states', function (DeliveryStatus $status
     );
 })->with([
     'merge read-back' => [DeliveryStatus::Merging, 'merge'],
+    'merge verification' => [DeliveryStatus::Landed, 'merge_verification'],
+    'repository reconciliation' => [DeliveryStatus::Landed, 'repository_reconciliation'],
     'reservation release' => [DeliveryStatus::Landed, 'reservation_release'],
 ]);
 
@@ -1123,6 +1295,18 @@ it('guards exhausted landing jobs and preserves recoverable external states', fu
         PhaseRunStatus::Running,
         'reservation_release',
         'landing_reservation_release_required',
+    ],
+    'post-merge verification' => [
+        DeliveryStatus::Landed,
+        PhaseRunStatus::Running,
+        'merge_verification',
+        'landing_merge_verification_required',
+    ],
+    'post-merge repository reconciliation' => [
+        DeliveryStatus::Landed,
+        PhaseRunStatus::Running,
+        'repository_reconciliation',
+        'landing_repository_reconciliation_required',
     ],
 ]);
 
