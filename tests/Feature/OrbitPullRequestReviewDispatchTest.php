@@ -8,6 +8,7 @@ use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
+use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
@@ -34,6 +35,8 @@ use App\Delivery\Exceptions\OrbitPullRequestReviewDispatchFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitImplementationReceiptValidator;
+use App\Jobs\DispatchOrbitImplementation as DispatchImplementationJob;
 use App\Jobs\DispatchOrbitPullRequestReview as DispatchPullRequestReviewJob;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
@@ -191,15 +194,34 @@ final class PullRequestReviewDispatchIssues implements OrbitActiveIssueProvider
     }
 }
 
-final class PullRequestReviewDispatchTransitioner implements OrbitReviewIssueTransitioner
+final class PullRequestReviewDispatchTransitioner implements OrbitIssueTransitioner, OrbitReviewIssueTransitioner
 {
     public int $transactionLevel = 0;
 
     public int $calls = 0;
 
+    public int $progressCalls = 0;
+
     public bool $fail = false;
 
     public ?Closure $afterTransition = null;
+
+    public function transitionToInProgress(
+        OrbitIssueSnapshot $current,
+        string $expectedContractHash,
+    ): OrbitIssueSnapshot {
+        expect($expectedContractHash)->toBe($current->contractHash);
+        $this->progressCalls++;
+        $payload = $current->payload;
+        $payload['state'] = ['id' => 'state-progress', 'name' => 'In Progress', 'type' => 'started'];
+
+        return new OrbitIssueSnapshot(
+            $current->issueId,
+            $current->issueKey,
+            $payload,
+            $current->contractHash,
+        );
+    }
 
     public function transitionToInReview(
         OrbitIssueSnapshot $current,
@@ -566,6 +588,7 @@ beforeEach(function () {
     app()->instance(OrbitImplementationRepository::class, $this->verifier);
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
     app()->instance(OrbitReviewIssueTransitioner::class, $this->transitions);
+    app()->instance(OrbitIssueTransitioner::class, $this->transitions);
     app()->instance(OrbitPullRequestInspector::class, $this->pullRequests);
     app()->instance(HerdrRuntime::class, $this->herdr);
 });
@@ -1172,6 +1195,59 @@ it('queues the retained pull request review after verified recovery', function (
     );
     expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Preparing)
         ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Pending);
+});
+
+it('routes a newly conflicting pull request back to the retained Builder', function () {
+    Queue::fake();
+    $this->pullRequests->mergeable = false;
+    $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Failed,
+        'error_code' => 'pr_review_mergeability_changed',
+        'error_message' => 'The published pull request became unmergeable before independent review.',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'pr_review_mergeability_changed',
+            'dispatch_id' => $this->dispatch->id,
+            'message' => 'The published pull request became unmergeable before independent review.',
+        ],
+    ])->save();
+    addKnownPullRequestAttachment($this);
+    $payload = $this->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+    $payload['assignee'] = null;
+    $this->issues->snapshot = new OrbitIssueSnapshot(
+        $this->issues->snapshot->issueId,
+        $this->issues->snapshot->issueKey,
+        $payload,
+        $this->issues->snapshot->contractHash,
+    );
+
+    $this->artisan('delivery:recover-orbit-pr-review', [
+        'delivery' => (string) $this->delivery->id,
+    ])->assertSuccessful();
+
+    $correction = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->and($this->review->fresh()->status)->toBe(PhaseRunStatus::Failed)
+        ->and($correction->status)->toBe(PhaseRunStatus::Pending)
+        ->and($correction->input['pull_request']['mergeable'])->toBeFalse()
+        ->and($correction->agentDispatches()->sole()->herdr_agent_name)->toBe('orb-234-loop-builder')
+        ->and(app(OrbitImplementationReceiptValidator::class)->matchesInput(
+            $this->delivery->fresh(),
+            $correction,
+        ))->toBeTrue()
+        ->and($this->transitions->progressCalls)->toBe(1);
+    Queue::assertPushed(
+        DispatchImplementationJob::class,
+        fn (DispatchImplementationJob $job): bool => $job->deliveryId === $this->delivery->id,
+    );
 });
 
 it('rejects reviewer identity reuse before agent start', function () {

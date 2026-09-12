@@ -113,8 +113,6 @@ final readonly class OrbitImplementationReceiptValidator
                 'implementation_receipt',
                 'pull_request',
             ];
-        $expectedMergeable = $isPullRequestReviewCorrection;
-
         if (! is_int($receiptId) || ! is_array($payload) || array_is_list($payload)
             || ! is_array($pullRequest) || array_is_list($pullRequest)
             || array_diff(array_keys($input), $allowed) !== []
@@ -129,6 +127,10 @@ final readonly class OrbitImplementationReceiptValidator
         $sourceCandidate = $payload['candidate_sha'] ?? null;
         $sourceDelivery = clone $delivery;
         $sourceDelivery->candidate_sha = is_string($sourceCandidate) ? $sourceCandidate : null;
+        $preReviewMergeabilityCorrection = ! $isPullRequestReviewCorrection
+            && $receipt !== null
+            && $this->matchesPreReviewMergeabilityCorrection($delivery, $correction, $receipt);
+        $expectedSourceMergeable = $isPullRequestReviewCorrection || $preReviewMergeabilityCorrection;
 
         return $receipt !== null && $source !== null && $sourceDispatches !== null && $sourceDispatch !== null
             && $correction->delivery_id === $delivery->id
@@ -144,7 +146,7 @@ final readonly class OrbitImplementationReceiptValidator
                 'result' => 'ready',
                 'pull_request_number' => $delivery->pull_request_number,
                 'pull_request_url' => $delivery->pull_request_url,
-                'mergeable' => $expectedMergeable,
+                'mergeable' => $expectedSourceMergeable,
             ]
             && $sourceDispatches->count() === 1
             && $sourceDispatch->agent_role === OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
@@ -172,7 +174,7 @@ final readonly class OrbitImplementationReceiptValidator
             && $pullRequest === [
                 'number' => $delivery->pull_request_number,
                 'url' => $delivery->pull_request_url,
-                'mergeable' => $expectedMergeable,
+                'mergeable' => $isPullRequestReviewCorrection,
             ]
             && $this->matches($sourceDelivery, $source, $sourceDispatch, $receipt)
             && (! $isPullRequestReviewCorrection || $this->matchesPullRequestReviewCorrection(
@@ -180,6 +182,47 @@ final readonly class OrbitImplementationReceiptValidator
                 $correction,
                 $receipt,
             ));
+    }
+
+    private function matchesPreReviewMergeabilityCorrection(
+        Delivery $delivery,
+        PhaseRun $correction,
+        Receipt $implementationReceipt,
+    ): bool {
+        $review = $delivery->phaseRuns()
+            ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+            ->where('attempt', 1)
+            ->first();
+        $dispatches = $review?->agentDispatches()->get();
+        $dispatch = $dispatches?->first();
+
+        return $review !== null && $dispatches !== null && $dispatch !== null
+            && $correction->attempt === 2
+            && $review->status === PhaseRunStatus::Failed
+            && $review->failure_code === 'pr_review_mergeability_changed'
+            && $review->finished_at !== null
+            && $review->input === [
+                'implementation_receipt_id' => $implementationReceipt->id,
+                'implementation_receipt' => $implementationReceipt->payload,
+                'pull_request' => [
+                    'number' => $delivery->pull_request_number,
+                    'url' => $delivery->pull_request_url,
+                    'mergeable' => true,
+                ],
+            ]
+            && $review->receipts()->doesntExist()
+            && $dispatches->count() === 1
+            && $dispatch->agent_role === OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
+            && $dispatch->status === AgentDispatchStatus::Failed
+            && $dispatch->error_code === 'pr_review_mergeability_changed'
+            && $dispatch->herdr_session === null
+            && $dispatch->herdr_workspace_id === null
+            && $dispatch->herdr_tab_id === null
+            && $dispatch->herdr_pane_id === null
+            && $dispatch->herdr_terminal_id === null
+            && $dispatch->herdr_agent_id === null
+            && $dispatch->dispatched_at === null
+            && $dispatch->settled_at === null;
     }
 
     private function matchesPullRequestReviewCorrection(

@@ -6,7 +6,9 @@ namespace App\Console\Commands;
 
 use App\Delivery\Actions\RecoverOrbitPullRequestReviewTransition;
 use App\Delivery\Exceptions\OrbitPullRequestReviewDispatchFailed;
-use App\Jobs\DispatchOrbitPullRequestReview;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Jobs\DispatchOrbitImplementation as DispatchOrbitImplementationJob;
+use App\Jobs\DispatchOrbitPullRequestReview as DispatchOrbitPullRequestReviewJob;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
 use Illuminate\Console\Command;
@@ -34,7 +36,11 @@ final class RecoverOrbitPullRequestReviewCommand extends Command
             return self::FAILURE;
         }
 
-        DispatchOrbitPullRequestReview::dispatch($deliveryId, $phase->id);
+        if ($phase->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE) {
+            DispatchOrbitImplementationJob::dispatch($deliveryId);
+        } else {
+            DispatchOrbitPullRequestReviewJob::dispatch($deliveryId, $phase->id);
+        }
         $this->info("Orbit pull request review delivery {$deliveryId} recovered on phase {$phase->id}.");
 
         return self::SUCCESS;

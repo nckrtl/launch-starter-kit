@@ -22,6 +22,7 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitImplementationDispatchFailed;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitImplementationReceiptValidator;
@@ -46,6 +47,7 @@ final readonly class DispatchOrbitImplementation
         private OrbitFeatureWorkflow $workflow,
         private OrbitImplementationReceiptValidator $implementationReceipts,
         private OrbitPlanReviewReceiptValidator $reviewReceipts,
+        private OrbitIssueSnapshotFactory $snapshots,
     ) {}
 
     public function handle(int $deliveryId): AgentDispatch
@@ -94,11 +96,15 @@ final readonly class DispatchOrbitImplementation
                 true,
             );
 
-            if ($this->isPullRequestReviewCorrection($phase)) {
+            $currentState = $currentIssue->payload['state'] ?? null;
+
+            if ($phase->attempt === 2
+                && is_array($currentState)
+                && ($currentState['name'] ?? null) === 'In Review') {
                 try {
                     $currentIssue = $this->transitions->transitionToInProgress(
                         $currentIssue,
-                        $preparation->snapshot->contractHash,
+                        $currentIssue->contractHash,
                     );
                 } catch (OrbitIssueTransitionFailed $exception) {
                     $code = $exception->ambiguous
@@ -118,7 +124,7 @@ final readonly class DispatchOrbitImplementation
                     );
                 }
 
-                $this->assertCurrentIssue($preparation, $currentIssue);
+                $this->assertCurrentIssue($delivery, $preparation, $currentIssue);
             }
 
             try {
@@ -316,9 +322,10 @@ final readonly class DispatchOrbitImplementation
     ): OrbitIssueSnapshot {
         $issue = $this->issues->fetch($preparation->snapshot->issueId, $preparation->snapshot->issueKey);
         $this->assertCurrentIssue(
+            $delivery,
             $preparation,
             $issue,
-            $allowPullRequestReviewState && $this->isPullRequestReviewCorrection($phase),
+            $allowPullRequestReviewState && $phase->attempt === 2,
         );
 
         if ($sourceReceipt->kind === 'orbit_implementation') {
@@ -387,6 +394,7 @@ final readonly class DispatchOrbitImplementation
     }
 
     private function assertCurrentIssue(
+        Delivery $delivery,
         OrbitDeliveryPreparation $preparation,
         OrbitIssueSnapshot $issue,
         bool $allowPullRequestReviewState = false,
@@ -400,7 +408,11 @@ final readonly class DispatchOrbitImplementation
 
         if ($issue->issueId !== $preparation->snapshot->issueId
             || $issue->issueKey !== $preparation->snapshot->issueKey
-            || ! hash_equals($preparation->snapshot->contractHash, $issue->contractHash)
+            || ! $this->snapshots->matchesExpectedContract(
+                $issue,
+                $preparation->snapshot->contractHash,
+                $delivery->pull_request_url,
+            )
             || ! $validState) {
             throw new OrbitIssueContractChanged('The Orbit issue changed before implementation dispatch.');
         }
