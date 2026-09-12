@@ -21,9 +21,9 @@ final class AdvanceOrbitResolution implements ShouldQueue, ShouldQueueAfterCommi
 {
     use Queueable;
 
-    public const int TIMEOUT_SECONDS = 90;
+    public const int TIMEOUT_SECONDS = 240;
 
-    public const int LOCK_SECONDS = 120;
+    public const int LOCK_SECONDS = 270;
 
     public int $timeout = self::TIMEOUT_SECONDS;
 

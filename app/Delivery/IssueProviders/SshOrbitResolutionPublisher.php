@@ -53,6 +53,7 @@ GRAPHQL;
             $this->request($target, $profile, self::QUERY, ['id' => $issue->issueId]),
             $issue,
             $viewerId,
+            $marker,
             $body,
         );
 
@@ -78,6 +79,7 @@ GRAPHQL;
                     $this->request($target, $profile, self::QUERY, ['id' => $issue->issueId]),
                     $issue,
                     $viewerId,
+                    $marker,
                     $body,
                 );
             } catch (OrbitResolutionPublicationFailed $exception) {
@@ -133,8 +135,13 @@ GRAPHQL;
      * @param  array<string, mixed>  $response
      * @return list<string>
      */
-    private function matchingComments(array $response, OrbitIssueSnapshot $expected, string $viewerId, string $body): array
-    {
+    private function matchingComments(
+        array $response,
+        OrbitIssueSnapshot $expected,
+        string $viewerId,
+        string $marker,
+        string $body,
+    ): array {
         $data = $response['data'] ?? null;
         $viewer = is_array($data) ? ($data['viewer'] ?? null) : null;
         $issue = is_array($data) ? ($data['issue'] ?? null) : null;
@@ -158,7 +165,14 @@ GRAPHQL;
         $matches = [];
 
         foreach ($nodes as $comment) {
-            if (! is_array($comment) || ($comment['body'] ?? null) !== $body) {
+            if (! is_array($comment)) {
+                continue;
+            }
+
+            $commentBody = $comment['body'] ?? null;
+
+            if (! is_string($commentBody)
+                || ($commentBody !== $marker && ! str_starts_with($commentBody, $marker."\n"))) {
                 continue;
             }
 
@@ -166,7 +180,13 @@ GRAPHQL;
             $id = $comment['id'] ?? null;
 
             if (! is_array($user) || ($user['id'] ?? null) !== $viewerId || ! is_string($id) || ! $this->isUuid($id)) {
-                throw new OrbitResolutionPublicationFailed('A matching resolution publication has invalid authorship or identity.');
+                throw new OrbitResolutionPublicationFailed('A marked resolution publication has invalid authorship or identity.');
+            }
+
+            if ($commentBody !== $body) {
+                throw new OrbitResolutionPublicationFailed(
+                    'A resolution publication already exists for this dispatch with different content.',
+                );
             }
 
             $matches[] = $id;

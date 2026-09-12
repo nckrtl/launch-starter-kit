@@ -1,7 +1,9 @@
 <?php
 
 use App\Delivery\Data\OrbitIssueSnapshot;
+use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
 use App\Delivery\IssueProviders\SshOrbitResolutionPublisher;
+use App\Jobs\AdvanceOrbitResolution;
 use Illuminate\Support\Facades\Process;
 
 beforeEach(function () {
@@ -121,4 +123,50 @@ it('does not create a second copy of an existing exact resolution publication', 
     );
 
     Process::assertRanTimes(fn ($process) => true, 1);
+});
+
+it('rejects a same-dispatch marker with different publication content', function () {
+    $existingBody = "ORBIT-LOOP-RESOLUTION:25\n\nComplete proposal.\n\nCommander routing: Needs an explicit decision or recovery action.";
+
+    Process::fake(['*' => Process::result(output: json_encode([
+        'data' => [
+            'viewer' => ['id' => $this->viewerId],
+            'issue' => [
+                'id' => $this->issueId,
+                'identifier' => 'ORB-234',
+                'state' => ['name' => 'In Review', 'type' => 'started'],
+                'assignee' => null,
+                'delegate' => ['id' => $this->viewerId],
+                'comments' => [
+                    'nodes' => [[
+                        'id' => $this->commentId,
+                        'body' => $existingBody,
+                        'user' => ['id' => $this->viewerId],
+                    ]],
+                    'pageInfo' => ['hasNextPage' => false],
+                ],
+            ],
+        ],
+    ], JSON_THROW_ON_ERROR))])->preventStrayProcesses();
+
+    expect(fn () => app(SshOrbitResolutionPublisher::class)->publish(
+        $this->issue,
+        25,
+        'Complete proposal.',
+        true,
+        'implementing',
+    ))->toThrow(
+        OrbitResolutionPublicationFailed::class,
+        'A resolution publication already exists for this dispatch with different content.',
+    );
+
+    Process::assertRanTimes(fn ($process) => true, 1);
+});
+
+it('bounds resolution publication below the queue retry window', function () {
+    $job = new AdvanceOrbitResolution(7, 28);
+
+    expect($job->timeout)->toBe(AdvanceOrbitResolution::TIMEOUT_SECONDS)
+        ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
+        ->and(AdvanceOrbitResolution::LOCK_SECONDS)->toBeGreaterThan($job->timeout);
 });
