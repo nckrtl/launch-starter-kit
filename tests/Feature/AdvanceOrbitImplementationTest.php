@@ -512,6 +512,50 @@ function promoteImplementationAdvancementToCorrection(object $test, string $resu
     $test->pullRequests->calls = 0;
 }
 
+function promoteImplementationAdvancementFromLateReviewConflict(object $test): void
+{
+    promoteImplementationAdvancementToCorrection($test);
+    $output = $test->phase->refresh()->output;
+    $output['mergeable'] = true;
+    $test->phase->forceFill(['output' => $output])->save();
+    $review = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Failed,
+        'input' => [
+            'implementation_receipt_id' => $test->receipt->id,
+            'implementation_receipt' => $test->implementationPayload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => true,
+            ],
+        ],
+        'failure_code' => 'pr_review_mergeability_changed',
+        'failure_message' => 'The published pull request became unmergeable before independent review.',
+        'started_at' => now(),
+        'finished_at' => now(),
+    ]);
+    AgentDispatch::query()->create([
+        'phase_run_id' => $review->id,
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $test->delivery->id,
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+            1,
+            OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-pr-review-1',
+        'prompt_name' => 'orbit_pr_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Failed,
+        'error_code' => 'pr_review_mergeability_changed',
+        'error_message' => 'The published pull request became unmergeable before independent review.',
+    ]);
+}
+
 function promoteImplementationAdvancementToReviewCorrection(object $test): void
 {
     app(AdvanceOrbitImplementation::class)->handle($test->delivery->id);
@@ -907,6 +951,22 @@ it('allows the known pull request attachment while advancing a corrected candida
         ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
         ->and($this->verifier->calls)->toBe(1)
         ->and($this->pullRequests->calls)->toBe(1);
+});
+
+it('creates review attempt two after a late merge-conflict correction', function () {
+    promoteImplementationAdvancementFromLateReviewConflict($this);
+    addImplementationPullRequestAttachment($this);
+
+    expect(app(AdvanceOrbitImplementation::class)->handle($this->delivery->id))->toBeFalse();
+
+    $review = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->and($review->status)->toBe(PhaseRunStatus::Pending)
+        ->and($review->agentDispatches()->sole()->herdr_agent_name)->toBe('orb-234-loop-pr-review-2');
 });
 
 it('publishes a review correction and creates the second independent review intent', function () {
