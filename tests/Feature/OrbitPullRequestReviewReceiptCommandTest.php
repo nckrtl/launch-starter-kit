@@ -821,6 +821,24 @@ it('captures and validates the second independent pull request review receipt', 
         ->and($this->pullRequests->calls)->toBe(1);
 });
 
+it('captures the second review without protocol agent ids', function () {
+    promotePullRequestReviewReceiptToSecondRound($this);
+    AgentDispatch::query()
+        ->whereHas('phaseRun', fn ($query) => $query
+            ->where('delivery_id', $this->delivery->id)
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE))
+        ->update(['herdr_agent_id' => null]);
+    $this->dispatch->forceFill(['herdr_agent_id' => null])->save();
+
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $this->arguments)->assertSuccessful();
+
+    expect(Receipt::query()
+        ->where('phase_run_id', $this->phaseRun->id)
+        ->where('kind', 'orbit_pr_review')
+        ->sole()
+        ->payload['result'])->toBe('approved');
+});
+
 it('routes second-round approval to landing', function () {
     promotePullRequestReviewReceiptToSecondRound($this);
     $this->artisan('delivery:submit-orbit-pr-review-receipt', $this->arguments)->assertSuccessful();

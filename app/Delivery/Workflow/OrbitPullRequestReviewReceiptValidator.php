@@ -165,7 +165,6 @@ final readonly class OrbitPullRequestReviewReceiptValidator
             && is_string($dispatch->herdr_tab_id) && trim($dispatch->herdr_tab_id) !== ''
             && is_string($dispatch->herdr_pane_id) && trim($dispatch->herdr_pane_id) !== ''
             && is_string($dispatch->herdr_terminal_id) && trim($dispatch->herdr_terminal_id) !== ''
-            && is_string($dispatch->herdr_agent_id) && trim($dispatch->herdr_agent_id) !== ''
             && $dispatch->dispatched_at !== null
             && (! $retainedTransition || (
                 $phase->status === PhaseRunStatus::Completed
@@ -225,7 +224,9 @@ final readonly class OrbitPullRequestReviewReceiptValidator
             ->get()
             ->contains(fn (AgentDispatch $builder): bool => $builder->herdr_agent_name === $reviewer->herdr_agent_name
                 || $builder->herdr_pane_id === $reviewer->herdr_pane_id
-                || $builder->herdr_agent_id === $reviewer->herdr_agent_id);
+                || ($builder->herdr_agent_id !== null
+                    && $reviewer->herdr_agent_id !== null
+                    && $builder->herdr_agent_id === $reviewer->herdr_agent_id));
     }
 
     /** @return array<string, mixed>|null */
