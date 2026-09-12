@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Delivery\Actions;
 
+use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -39,12 +40,68 @@ final readonly class CaptureHerdrEvent
         return $event->refresh();
     }
 
+    public function reconcile(
+        AgentDispatch $dispatch,
+        HerdrAgentIdentifiers $agent,
+    ): ?ExternalEvent {
+        if (! config('herdr.orchestration.enabled', false)
+            || ! in_array($agent->agentStatus, ['idle', 'done'], true)
+            || $agent->stateChangeSeq === null) {
+            return null;
+        }
+
+        $providerEventId = implode(':', [
+            'reconciliation',
+            $dispatch->id,
+            $agent->stateChangeSeq,
+            $agent->agentStatus,
+        ]);
+        $envelope = [
+            'event' => 'pane.agent_status_changed',
+            'data' => [
+                'workspace_id' => $agent->workspaceId,
+                'tab_id' => $agent->tabId,
+                'pane_id' => $agent->paneId,
+                'terminal_id' => $agent->terminalId,
+                'agent_id' => $agent->agentId,
+                'agent_name' => $agent->agentName,
+                'agent_status' => $agent->agentStatus,
+                'state_change_seq' => $agent->stateChangeSeq,
+            ],
+            'observed_by' => 'scheduled_reconciliation',
+        ];
+        $payloadHash = hash('sha256', json_encode($envelope, JSON_THROW_ON_ERROR));
+        $event = ExternalEvent::query()->firstOrCreate(
+            ['provider' => 'herdr', 'provider_event_id' => $providerEventId],
+            [
+                'ingestion_id' => (string) Str::uuid(),
+                'event_kind' => 'pane.agent_status_changed',
+                'payload' => $envelope,
+                'payload_hash' => $payloadHash,
+                'received_at' => now(),
+            ],
+        );
+
+        if (! hash_equals($event->payload_hash, $payloadHash)) {
+            throw new \RuntimeException('The retained Herdr reconciliation event changed.');
+        }
+
+        if ($event->processed_at === null) {
+            $this->process($event);
+        }
+
+        return $event->refresh();
+    }
+
     private function process(ExternalEvent $event): void
     {
         $payload = $event->payload;
         $data = is_array($payload['data'] ?? null) ? $payload['data'] : [];
         $kind = str_replace('.', '_', $event->event_kind);
         $status = is_string($data['agent_status'] ?? null) ? $data['agent_status'] : null;
+        $stateChangeSeq = is_int($data['state_change_seq'] ?? null)
+            ? $data['state_change_seq']
+            : null;
 
         if ($kind !== 'pane_agent_status_changed' || ! in_array($status, ['idle', 'done'], true)) {
             $event->processed_at = now();
@@ -99,7 +156,7 @@ final readonly class CaptureHerdrEvent
             return;
         }
 
-        $shouldAdvance = DB::transaction(function () use ($event, $dispatch, $deliveryId): bool {
+        $shouldAdvance = DB::transaction(function () use ($event, $dispatch, $deliveryId, $stateChangeSeq): bool {
             $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
             $phaseRun = PhaseRun::query()
                 ->whereKey($dispatch->phase_run_id)
@@ -133,8 +190,14 @@ final readonly class CaptureHerdrEvent
             if ($locked->status !== AgentDispatchStatus::Settled) {
                 $locked->status = AgentDispatchStatus::Settled;
                 $locked->settled_at = now();
-                $locked->save();
             }
+
+            if ($stateChangeSeq !== null
+                && ($locked->state_change_seq === null || $stateChangeSeq > $locked->state_change_seq)) {
+                $locked->state_change_seq = $stateChangeSeq;
+            }
+
+            $locked->save();
 
             $event->delivery_id = $phaseRun->delivery_id;
             $event->agent_dispatch_id = $locked->id;

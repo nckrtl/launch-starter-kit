@@ -58,7 +58,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
             ->orderBy('deliveries.id')
             ->chunkById(self::CHUNK_SIZE, function ($deliveries): void {
                 foreach ($deliveries as $delivery) {
-                    AdvanceDelivery::dispatch($delivery->id);
+                    ReconcileDelivery::dispatch($delivery->id);
                 }
             }, 'deliveries.id', 'id');
     }

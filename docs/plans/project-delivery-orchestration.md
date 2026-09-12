@@ -113,6 +113,16 @@ matched, none were missing, and none had a pending Tom notification. This
 proves live listener-capture parity only. End-to-end issue delivery parity is
 still required before the normal entry point can move.
 
+Scheduled reconciliation now queues one bounded, unique job per recoverable
+delivery instead of only replaying advancement. For a delivery waiting on an
+agent, that job reads only the exact retained Herdr agent identity. An `idle` or
+`done` observation settles the dispatch only when its state-change sequence is
+newer than the sequence recorded after prompting. Commander records that
+read-back as one idempotent correlated event and then uses the normal
+advancement path. A working agent, stale observation, disabled capture, or
+transient Herdr read failure remains unchanged. This recovers a missed terminal
+webhook without re-prompting, replacing, or killing an agent.
+
 Live canaries use the `controller:commander` Linear label as an explicit
 ownership handoff. Commander requires a complete, valid label page before
 preparation, rejects a concurrent `maintenance:monorepo` label, and checks the
