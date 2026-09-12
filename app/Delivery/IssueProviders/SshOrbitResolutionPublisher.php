@@ -8,6 +8,7 @@ use App\Delivery\Contracts\OrbitResolutionPublisher;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\PublishedOrbitResolution;
 use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
@@ -43,7 +44,13 @@ GRAPHQL;
         bool $adopted,
         string $resumePhase,
     ): PublishedOrbitResolution {
-        [$target, $profile, $viewerId] = $this->configuration($issue, $dispatchId, $handoff);
+        $expectedState = $this->expectedState($resumePhase);
+        [$target, $profile, $viewerId] = $this->configuration(
+            $issue,
+            $dispatchId,
+            $handoff,
+            $expectedState,
+        );
         $marker = "ORBIT-LOOP-RESOLUTION:{$dispatchId}";
         $routing = $adopted
             ? "Adopted for {$resumePhase}; verification remains required."
@@ -55,6 +62,7 @@ GRAPHQL;
             $viewerId,
             $marker,
             $body,
+            $expectedState,
         );
 
         if ($matches === []) {
@@ -81,6 +89,7 @@ GRAPHQL;
                     $viewerId,
                     $marker,
                     $body,
+                    $expectedState,
                 );
             } catch (OrbitResolutionPublicationFailed $exception) {
                 throw new OrbitResolutionPublicationFailed(
@@ -105,8 +114,12 @@ GRAPHQL;
     }
 
     /** @return array{string, string, string} */
-    private function configuration(OrbitIssueSnapshot $issue, int $dispatchId, string $handoff): array
-    {
+    private function configuration(
+        OrbitIssueSnapshot $issue,
+        int $dispatchId,
+        string $handoff,
+        string $expectedState,
+    ): array {
         $target = config('commander.hermes.ssh_target');
         $profile = config('commander.hermes.profiles.tom');
         $viewerId = config('commander.hermes.tom_linear_viewer_id');
@@ -122,7 +135,7 @@ GRAPHQL;
             || $dispatchId < 1 || trim($handoff) === ''
             || ($payload['id'] ?? null) !== $issue->issueId
             || ($payload['identifier'] ?? null) !== $issue->issueKey
-            || ! is_array($state) || ($state['name'] ?? null) !== 'In Review' || ($state['type'] ?? null) !== 'started'
+            || ! is_array($state) || ($state['name'] ?? null) !== $expectedState || ($state['type'] ?? null) !== 'started'
             || ! is_array($delegate) || ($delegate['id'] ?? null) !== $viewerId
             || ($payload['assignee'] ?? null) !== null) {
             throw new OrbitResolutionPublicationFailed('The resolution publication input or Hermes configuration is invalid.');
@@ -141,6 +154,7 @@ GRAPHQL;
         string $viewerId,
         string $marker,
         string $body,
+        string $expectedState,
     ): array {
         $data = $response['data'] ?? null;
         $viewer = is_array($data) ? ($data['viewer'] ?? null) : null;
@@ -154,7 +168,7 @@ GRAPHQL;
         if (! empty($response['errors']) || ! is_array($viewer) || ($viewer['id'] ?? null) !== $viewerId
             || ! is_array($issue) || ($issue['id'] ?? null) !== $expected->issueId
             || ($issue['identifier'] ?? null) !== $expected->issueKey
-            || ! is_array($state) || ($state['name'] ?? null) !== 'In Review' || ($state['type'] ?? null) !== 'started'
+            || ! is_array($state) || ($state['name'] ?? null) !== $expectedState || ($state['type'] ?? null) !== 'started'
             || ! is_array($delegate) || ($delegate['id'] ?? null) !== $viewerId
             || ($issue['assignee'] ?? null) !== null
             || ! is_array($nodes) || ! array_is_list($nodes)
@@ -193,6 +207,17 @@ GRAPHQL;
         }
 
         return $matches;
+    }
+
+    private function expectedState(string $resumePhase): string
+    {
+        return match ($resumePhase) {
+            OrbitFeatureWorkflow::INITIAL_PHASE => 'In Progress',
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE => 'In Review',
+            default => throw new OrbitResolutionPublicationFailed(
+                'The resolution resume phase is invalid.',
+            ),
+        };
     }
 
     /**

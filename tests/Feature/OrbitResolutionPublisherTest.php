@@ -126,6 +126,106 @@ it('does not create a second copy of an existing exact resolution publication', 
     Process::assertRanTimes(fn ($process) => true, 1);
 });
 
+it('publishes a planning resolution while Linear remains in progress', function () {
+    $expectedBody = "ORBIT-LOOP-RESOLUTION:25\n\nComplete proposal.\n\nCommander routing: Needs an explicit decision or recovery action.";
+    $this->issue = new OrbitIssueSnapshot(
+        $this->issueId,
+        'ORB-234',
+        [
+            'id' => $this->issueId,
+            'identifier' => 'ORB-234',
+            'state' => ['name' => 'In Progress', 'type' => 'started'],
+            'assignee' => null,
+            'delegate' => ['id' => $this->viewerId],
+        ],
+        str_repeat('a', 64),
+    );
+
+    Process::fake(['*' => Process::result(output: json_encode([
+        'data' => [
+            'viewer' => ['id' => $this->viewerId],
+            'issue' => [
+                'id' => $this->issueId,
+                'identifier' => 'ORB-234',
+                'state' => ['name' => 'In Progress', 'type' => 'started'],
+                'assignee' => null,
+                'delegate' => ['id' => $this->viewerId],
+                'comments' => [
+                    'nodes' => [[
+                        'id' => $this->commentId,
+                        'body' => $expectedBody,
+                        'user' => ['id' => $this->viewerId],
+                    ]],
+                    'pageInfo' => ['hasNextPage' => false],
+                ],
+            ],
+        ],
+    ], JSON_THROW_ON_ERROR))])->preventStrayProcesses();
+
+    $published = app(SshOrbitResolutionPublisher::class)->publish(
+        $this->issue,
+        25,
+        'Complete proposal.',
+        false,
+        'planning',
+    );
+
+    expect($published->commentId)->toBe($this->commentId);
+    Process::assertRanTimes(fn ($process) => true, 1);
+});
+
+it('rejects a resolution whose Linear state does not match its origin', function (
+    string $issueState,
+    string $resumePhase,
+) {
+    $this->issue = new OrbitIssueSnapshot(
+        $this->issueId,
+        'ORB-234',
+        [
+            'id' => $this->issueId,
+            'identifier' => 'ORB-234',
+            'state' => ['name' => $issueState, 'type' => 'started'],
+            'assignee' => null,
+            'delegate' => ['id' => $this->viewerId],
+        ],
+        str_repeat('a', 64),
+    );
+    Process::fake()->preventStrayProcesses();
+
+    expect(fn () => app(SshOrbitResolutionPublisher::class)->publish(
+        $this->issue,
+        25,
+        'Complete proposal.',
+        false,
+        $resumePhase,
+    ))->toThrow(
+        OrbitResolutionPublicationFailed::class,
+        'The resolution publication input or Hermes configuration is invalid.',
+    );
+
+    Process::assertDidntRun(fn ($process) => true);
+})->with([
+    'planning resolution after an In Review transition' => ['In Review', 'planning'],
+    'pull request resolution before an In Review transition' => ['In Progress', 'implementing'],
+]);
+
+it('rejects an unsupported resolution resume phase before publication', function () {
+    Process::fake()->preventStrayProcesses();
+
+    expect(fn () => app(SshOrbitResolutionPublisher::class)->publish(
+        $this->issue,
+        25,
+        'Complete proposal.',
+        false,
+        'landing',
+    ))->toThrow(
+        OrbitResolutionPublicationFailed::class,
+        'The resolution resume phase is invalid.',
+    );
+
+    Process::assertDidntRun(fn ($process) => true);
+});
+
 it('rejects a same-dispatch marker with different publication content', function () {
     $existingBody = "ORBIT-LOOP-RESOLUTION:25\n\nComplete proposal.\n\nCommander routing: Needs an explicit decision or recovery action.";
 
