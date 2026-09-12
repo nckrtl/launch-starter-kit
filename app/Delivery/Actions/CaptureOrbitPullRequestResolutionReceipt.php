@@ -12,7 +12,7 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitResolutionReceiptFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
-use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
+use App\Delivery\Workflow\OrbitResolutionReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -22,7 +22,7 @@ use Illuminate\Support\Facades\DB;
 
 final readonly class CaptureOrbitPullRequestResolutionReceipt
 {
-    public function __construct(private OrbitPullRequestResolutionReceiptValidator $receipts) {}
+    public function __construct(private OrbitResolutionReceiptValidator $receipts) {}
 
     /** @param array<string, mixed> $payload */
     public function handle(

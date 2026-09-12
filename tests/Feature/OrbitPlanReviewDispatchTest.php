@@ -2,14 +2,22 @@
 
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitPlanReview;
+use App\Delivery\Actions\AdvanceOrbitResolution;
+use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\CaptureOrbitPlanReviewReceipt;
+use App\Delivery\Actions\CaptureOrbitPullRequestResolutionReceipt;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPlanReview;
+use App\Delivery\Actions\DispatchOrbitPullRequestResolution;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitResolutionPublisher;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
@@ -19,6 +27,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\PublishedOrbitResolution;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
@@ -31,10 +40,13 @@ use App\Delivery\Exceptions\OrbitPlanReviewAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
 use App\Jobs\DispatchOrbitPlanReview as DispatchOrbitPlanReviewJob;
+use App\Jobs\ReconcileDeliveries;
 use App\Models\AgentDispatch;
+use App\Models\Delivery;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
@@ -161,11 +173,16 @@ final class PlanReviewDispatchRepository implements OrbitRepository
     }
 }
 
-final class PlanReviewIssueProvider implements OrbitIssueProvider
+final class PlanReviewIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
 {
     public function __construct(public OrbitIssueSnapshot $snapshot) {}
 
     public function fetch(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        return $this->snapshot;
+    }
+
+    public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         return $this->snapshot;
     }
@@ -186,6 +203,12 @@ final class PlanReviewHerdrRuntime implements HerdrRuntime
     public ?Closure $beforePromptReturn = null;
 
     public ?HerdrAgentLaunch $launch = null;
+
+    public string $paneId = 'worker-pane';
+
+    public string $terminalId = 'worker-terminal';
+
+    public string $agentId = 'codex-reviewer-1';
 
     public function __construct(private readonly PlanReviewDispatchRepository $repository) {}
 
@@ -258,11 +281,41 @@ final class PlanReviewHerdrRuntime implements HerdrRuntime
         return new HerdrAgentIdentifiers(
             'workspace-1',
             'tab-1',
-            'worker-pane',
-            'worker-terminal',
-            'codex-reviewer-1',
+            $this->paneId,
+            $this->terminalId,
+            $this->agentId,
             $name,
             $sequence,
+        );
+    }
+}
+
+final class PlanReviewResolutionPublisher implements OrbitResolutionPublisher
+{
+    public int $calls = 0;
+
+    public function publish(
+        OrbitIssueSnapshot $issue,
+        int $dispatchId,
+        string $handoff,
+        bool $adopted,
+        string $resumePhase,
+    ): PublishedOrbitResolution {
+        expect($issue->issueKey)->toBe('ORB-234')
+            ->and($adopted)->toBeFalse()
+            ->and($resumePhase)->toBe(OrbitFeatureWorkflow::INITIAL_PHASE);
+        $this->calls++;
+        $marker = "ORBIT-LOOP-RESOLUTION:{$dispatchId}";
+        $body = implode("\n\n", [
+            $marker,
+            $handoff,
+            'Commander routing: Needs an explicit decision or recovery action.',
+        ]);
+
+        return new PublishedOrbitResolution(
+            '22222222-3333-4444-8555-666666666666',
+            $marker,
+            hash('sha256', $body),
         );
     }
 }
@@ -375,6 +428,8 @@ beforeEach(function () {
         'id' => '11111111-2222-4333-8444-555555555555',
         'identifier' => 'ORB-234',
         'state' => ['id' => 'state-1', 'name' => 'In Progress', 'type' => 'started'],
+        'delegate' => ['id' => config('commander.hermes.tom_linear_viewer_id')],
+        'assignee' => ['id' => config('commander.hermes.nick_linear_user_id')],
     ];
     $this->repository = new PlanReviewDispatchRepository;
     $this->issues = new PlanReviewIssueProvider(new OrbitIssueSnapshot(
@@ -384,8 +439,11 @@ beforeEach(function () {
         str_repeat('d', 64),
     ));
     $this->herdr = new PlanReviewHerdrRuntime($this->repository);
+    $this->resolutionPublisher = new PlanReviewResolutionPublisher;
     app()->instance(OrbitRepository::class, $this->repository);
+    app()->instance(OrbitActiveIssueProvider::class, $this->issues);
     app()->instance(OrbitIssueProvider::class, $this->issues);
+    app()->instance(OrbitResolutionPublisher::class, $this->resolutionPublisher);
     app()->instance(HerdrRuntime::class, $this->herdr);
     Queue::fake();
 });
@@ -556,6 +614,242 @@ it('waits for both the review receipt and Herdr settlement in either order', fun
     expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE);
 })->with(['receipt', 'settlement']);
 
+it('dispatches, captures, and publishes a blocked plan review through the planning resolver', function () {
+    $reviewReceipt = capturedPlanReviewResult($this, 'blocked');
+    app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+    $this->herdr->paneId = 'resolver-pane';
+    $this->herdr->terminalId = 'resolver-terminal';
+    $this->herdr->agentId = 'codex-resolver-1';
+
+    $resolver = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+    $prompt = $this->herdr->prompts[array_key_last($this->herdr->prompts)];
+
+    expect($resolution->fresh()->input)->toBe([
+        'plan_review_receipt_id' => $reviewReceipt->id,
+        'plan_review_receipt' => $reviewReceipt->payload,
+    ])->and($resolver->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($resolver->herdr_pane_id)->toBe('resolver-pane')
+        ->and($resolver->prompt_hash)->toBe(hash('sha256', $prompt))
+        ->and($prompt)->toContain('planning or plan-review stop')
+        ->and($prompt)->toContain('"resume_phase":"planning"')
+        ->and($prompt)->not->toContain('repeated pull request review stop');
+
+    $handoff = 'Resolve the planning constraint before implementation starts.';
+    $proposal = [
+        'schema' => 1,
+        'resume_phase' => 'planning',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => [],
+        'plan_changes' => [],
+    ];
+    $payload = [
+        'kind' => 'orbit_resolution',
+        'schema_version' => 1,
+        'delivery_id' => $this->delivery->id,
+        'dispatch_id' => $resolver->id,
+        'issue_key' => 'ORB-234',
+        'phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'attempt' => 1,
+        'result' => 'proposal',
+        'worktree' => $this->worktree,
+        'candidate_sha' => str_repeat('b', 40),
+        'handoff_path' => '.loop/runtime/resolution-handoff.md',
+        'handoff' => $handoff,
+        'handoff_sha256' => hash('sha256', $handoff),
+        'resolution_path' => '.loop/runtime/resolution.json',
+        'resolution' => $proposal,
+        'resolution_sha256' => hash('sha256', json_encode($proposal, JSON_THROW_ON_ERROR)),
+    ];
+    $implementingProposal = [...$proposal, 'resume_phase' => 'implementing'];
+    $implementingPayload = [
+        ...$payload,
+        'resolution' => $implementingProposal,
+        'resolution_sha256' => hash(
+            'sha256',
+            json_encode($implementingProposal, JSON_THROW_ON_ERROR),
+        ),
+    ];
+    expect(app(OrbitPlanResolutionReceiptValidator::class)->matchesPayload(
+        $this->delivery->fresh('projectOrchestration'),
+        $resolution->fresh(),
+        $resolver->fresh(),
+        $implementingPayload,
+    ))->toBeFalse();
+    $config = new OrbitProjectConfig(
+        type: 'orbit',
+        repository: '/home/nckrtl/orbit',
+        worktreeRoot: '/fast/worktrees/orbit',
+        herdrSession: 'orbit',
+        concurrency: 1,
+        defaultFlow: 'discovery',
+    );
+    $receipt = app(CaptureOrbitPullRequestResolutionReceipt::class)->handle(
+        $resolution->fresh(),
+        $resolver->fresh(),
+        $config,
+        $payload,
+    );
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+
+    app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
+    app(AdvanceOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
+
+    expect($receipt->validation_status)->toBe(ReceiptValidationStatus::Valid)
+        ->and($resolution->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($resolution->fresh()->output['receipt_id'])->toBe($receipt->id)
+        ->and($resolution->fresh()->output['expected_resume_phase'])
+        ->toBe(OrbitFeatureWorkflow::INITIAL_PHASE)
+        ->and($resolution->fresh()->output['automatic_adoption_eligible'])->toBeFalse()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details['code'])
+        ->toBe('resolution_decision_required')
+        ->and($this->resolutionPublisher->calls)->toBe(1);
+});
+
+it('recovers an untouched exhausted plan resolver only after project capacity is free', function () {
+    capturedPlanReviewResult($this, 'blocked');
+    app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $this->delivery->refresh()->forceFill([
+        'status' => DeliveryStatus::Failed,
+        'failure_details' => [
+            'code' => 'resolution_dispatch_exhausted',
+            'phase_run_id' => $resolution->id,
+            'message' => 'The resolver dispatcher exhausted its retry window.',
+        ],
+        'failed_at' => now(),
+    ])->save();
+    $occupying = Delivery::query()->create([
+        'project_orchestration_id' => $this->delivery->project_orchestration_id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => '66666666-7777-4888-8999-000000000000',
+        'external_issue_key' => 'ORB-235',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::WaitingForAgent,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+    ]);
+    $job = new ReconcileDeliveries;
+    Queue::fake();
+
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Failed);
+    Queue::assertNotPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $queued): bool => $queued->deliveryId === $this->delivery->id,
+    );
+
+    $occupying->forceFill([
+        'status' => DeliveryStatus::Completed,
+        'completed_at' => now(),
+    ])->save();
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->delivery->fresh()->failed_at)->toBeNull();
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $queued): bool => $queued->deliveryId === $this->delivery->id,
+    );
+});
+
+it('rejects corrupted plan-resolution provenance', function (string $corruption) {
+    $reviewReceipt = capturedPlanReviewResult($this, 'blocked');
+    app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+    $prompt = app(OrbitFeatureWorkflow::class)->planResolutionPrompt(
+        'ORB-234',
+        '/home/nckrtl/orbit',
+        $this->worktree,
+        $this->delivery->id,
+        $resolution->id,
+        $resolver->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-resolution-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $resolution->id,
+            $resolver->id,
+        ),
+        $resolution->input,
+    );
+    $resolver->forceFill(['prompt_hash' => hash('sha256', $prompt)])->save();
+    $delivery = $this->delivery->fresh('projectOrchestration');
+    $validator = app(OrbitPlanResolutionReceiptValidator::class);
+
+    expect($validator->matchesInput($delivery, $resolution, $resolver))->toBeTrue();
+
+    match ($corruption) {
+        'changed receipt id' => $resolution->forceFill(['input' => [
+            'plan_review_receipt_id' => $reviewReceipt->id + 1000,
+            'plan_review_receipt' => $reviewReceipt->payload,
+        ]])->save(),
+        'changed receipt payload' => DB::table('receipts')
+            ->where('id', $reviewReceipt->id)
+            ->update(['payload' => json_encode([
+                ...$reviewReceipt->payload,
+                'handoff' => 'Changed handoff.',
+            ], JSON_THROW_ON_ERROR)]),
+        'changed receipt hash' => DB::table('receipts')
+            ->where('id', $reviewReceipt->id)
+            ->update(['payload_hash' => str_repeat('9', 64)]),
+        'changed review output' => $this->review->forceFill([
+            'output' => ['receipt_id' => $reviewReceipt->id, 'result' => 'pass'],
+        ])->save(),
+        'changed review attempt' => $this->review->forceFill(['attempt' => 2])->save(),
+        'changed resolution attempt' => $resolution->forceFill(['attempt' => 2])->save(),
+        'changed candidate' => $delivery->forceFill(['candidate_sha' => str_repeat('9', 40)])->save(),
+        'extra input key' => $resolution->forceFill([
+            'input' => [...$resolution->input, 'extra' => true],
+        ])->save(),
+        'missing input key' => $resolution->forceFill([
+            'input' => ['plan_review_receipt_id' => $reviewReceipt->id],
+        ])->save(),
+    };
+
+    expect($validator->matchesSource(
+        $delivery->fresh('projectOrchestration'),
+        $resolution->fresh(),
+        $resolver->fresh(),
+    ))->toBeFalse();
+})->with([
+    'changed receipt id',
+    'changed receipt payload',
+    'changed receipt hash',
+    'changed review output',
+    'changed review attempt',
+    'changed resolution attempt',
+    'changed candidate',
+    'extra input key',
+    'missing input key',
+]);
+
 it('routes a repeated fixing review to resolution with complete correction provenance', function () {
     $firstReviewReceipt = capturedPlanReviewResult($this, 'fix');
     app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
@@ -663,6 +957,7 @@ it('routes a repeated fixing review to resolution with complete correction prove
     $resolution = PhaseRun::query()
         ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
         ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
     expect($review->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($reviewer->herdr_agent_name)->toBe('orb-234-loop-plan-review-2')
         ->and($this->herdr->calls)->toBe([
@@ -670,6 +965,11 @@ it('routes a repeated fixing review to resolution with complete correction prove
             'open', 'split', 'start', 'prompt',
         ])
         ->and($resolution->input['plan_review_receipt']['result'])->toBe('fix')
+        ->and(app(OrbitPlanResolutionReceiptValidator::class)->matchesSource(
+            $this->delivery->fresh('projectOrchestration'),
+            $resolution,
+            $resolver,
+        ))->toBeTrue()
         ->and($planning->input)->toBe([
             'plan_review_receipt_id' => $firstReviewReceipt->id,
             'plan_review_receipt' => $firstReviewReceipt->payload,

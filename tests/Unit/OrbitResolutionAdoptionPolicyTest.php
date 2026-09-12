@@ -87,3 +87,30 @@ it('preserves the two-adoption budget', function () {
     expect($adoption->adopt)->toBeFalse()
         ->and($adoption->reason)->toBe('The automatic resolution adoption budget is exhausted.');
 });
+
+it('reports planning as the expected resume phase without automatically adopting it', function () {
+    $phase = (new PhaseRun)->forceFill([
+        'input' => [
+            'plan_review_receipt' => ['phase' => 'plan_review'],
+        ],
+    ]);
+    $proposal = [
+        'schema' => 1,
+        'resume_phase' => 'planning',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => [],
+        'plan_changes' => [],
+    ];
+
+    $adoption = app(OrbitResolutionAdoptionPolicy::class)->assess(
+        $phase,
+        resolutionPolicyReceipt($proposal),
+        0,
+    );
+
+    expect($adoption->adopt)->toBeFalse()
+        ->and($adoption->expectedResumePhase)->toBe('planning')
+        ->and($adoption->requirements)->toBe([])
+        ->and($adoption->reason)->toBe('Planning resolutions require an explicit decision before adoption.');
+});

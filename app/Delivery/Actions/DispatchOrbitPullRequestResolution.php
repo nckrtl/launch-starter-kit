@@ -14,6 +14,7 @@ use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
 use App\Delivery\Data\OrbitDeliveryPreparation;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -21,7 +22,8 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitResolutionDispatchFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
-use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
+use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
+use App\Delivery\Workflow\OrbitResolutionReceiptValidator;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -40,7 +42,8 @@ final readonly class DispatchOrbitPullRequestResolution
         private OrbitPullRequestInspector $pullRequests,
         private HerdrRuntime $herdr,
         private OrbitFeatureWorkflow $workflow,
-        private OrbitPullRequestResolutionReceiptValidator $receipts,
+        private OrbitResolutionReceiptValidator $receipts,
+        private OrbitPlanResolutionReceiptValidator $planReceipts,
         private OrbitIssueSnapshotFactory $snapshots,
     ) {}
 
@@ -243,16 +246,28 @@ final readonly class DispatchOrbitPullRequestResolution
                 $delivery->save();
             }
 
-            $prompt = $this->workflow->pullRequestResolutionPrompt(
-                (string) $delivery->external_issue_key,
-                $config->repository,
-                (string) $delivery->worktree_path,
-                $delivery->id,
-                $phase->id,
-                $dispatch->id,
-                $this->receiptCommand($phase, $dispatch),
-                is_array($phase->input) ? $phase->input : [],
-            );
+            $resolutionInput = is_array($phase->input) ? $phase->input : [];
+            $prompt = $this->planReceipts->matchesSource($delivery, $phase, $dispatch)
+                ? $this->workflow->planResolutionPrompt(
+                    (string) $delivery->external_issue_key,
+                    $config->repository,
+                    (string) $delivery->worktree_path,
+                    $delivery->id,
+                    $phase->id,
+                    $dispatch->id,
+                    $this->receiptCommand($phase, $dispatch),
+                    $resolutionInput,
+                )
+                : $this->workflow->pullRequestResolutionPrompt(
+                    (string) $delivery->external_issue_key,
+                    $config->repository,
+                    (string) $delivery->worktree_path,
+                    $delivery->id,
+                    $phase->id,
+                    $dispatch->id,
+                    $this->receiptCommand($phase, $dispatch),
+                    $resolutionInput,
+                );
 
             if ($dispatch->status === AgentDispatchStatus::Pending) {
                 $dispatch->prompt_hash = hash('sha256', $prompt);
@@ -336,12 +351,27 @@ final readonly class DispatchOrbitPullRequestResolution
         PhaseRun $phase,
     ): void {
         $input = $phase->input;
+        $planReview = is_array($input) ? $this->map($input['plan_review_receipt'] ?? null) : null;
+        $planning = is_array($input) ? $this->map($input['planning_receipt'] ?? null) : null;
         $implementation = is_array($input)
             ? $this->map($input['implementation_receipt'] ?? null)
             : null;
         $review = is_array($input) ? $this->map($input['pr_review_receipt'] ?? null) : null;
         $publishedReview = is_array($input) ? $this->map($input['published_review'] ?? null) : null;
         $pullRequestEvidence = is_array($input) ? ($input['pull_request'] ?? null) : null;
+
+        if ($implementation === null && $planReview !== null) {
+            $this->verifyPlanResolution(
+                $delivery,
+                $config,
+                $preparation,
+                $planning,
+                $planReview,
+            );
+            $this->assertCurrentIssue($delivery, $preparation, false);
+
+            return;
+        }
 
         if (! is_array($implementation)) {
             throw new OrbitResolutionDispatchFailed('The resolution evidence is malformed.');
@@ -387,6 +417,58 @@ final readonly class DispatchOrbitPullRequestResolution
         }
 
         $this->assertCurrentIssue($delivery, $preparation, true);
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $planning
+     * @param  array<string, mixed>  $planReview
+     */
+    private function verifyPlanResolution(
+        Delivery $delivery,
+        OrbitProjectConfig $config,
+        OrbitDeliveryPreparation $preparation,
+        ?array $planning,
+        array $planReview,
+    ): void {
+        $source = $planning ?? $planReview;
+        $candidate = $this->sha($source, 'candidate_sha');
+        $verified = $this->repository->verifyPlanningOutcome(
+            $config,
+            $preparation->worktree,
+            $preparation->snapshot,
+            $candidate,
+            null,
+        );
+
+        if ($candidate !== $delivery->candidate_sha
+            || ($planReview['candidate_sha'] ?? null) !== $candidate
+            || $verified->candidateSha !== $candidate
+            || $verified->artifactSha !== null
+            || $verified->planContentsHash !== null) {
+            throw new OrbitResolutionDispatchFailed(
+                'The verified planning state no longer matches the resolution evidence.',
+            );
+        }
+
+        if (($planReview['result'] ?? null) !== 'fix') {
+            return;
+        }
+
+        $artifactSha = $this->sha($planReview, 'artifact_sha');
+        $artifact = $this->repository->verifyPlanningArtifact(
+            $config,
+            new PreparedWorktree($preparation->worktree->path, $candidate),
+            $preparation->snapshot->issueKey,
+            $artifactSha,
+            'FIX',
+        );
+
+        if ($artifact->artifactSha !== $artifactSha
+            || $artifact->planContentsHash !== ($planReview['plan_sha256'] ?? null)) {
+            throw new OrbitResolutionDispatchFailed(
+                'The verified plan-review artifact no longer matches the resolution evidence.',
+            );
+        }
     }
 
     /**

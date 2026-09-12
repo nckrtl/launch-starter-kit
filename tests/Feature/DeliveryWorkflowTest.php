@@ -6,6 +6,7 @@ use App\Delivery\Actions\CaptureHarmlessReceipt;
 use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\CandidateCheck;
@@ -433,6 +434,7 @@ it('completes a transition recovered from a lost receipt continuation enqueue', 
 
     (new ReconcileDeliveries)->handle(
         app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
     Queue::assertPushed(

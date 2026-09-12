@@ -6,6 +6,7 @@ use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
@@ -270,6 +271,7 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
     $job = new ReconcileDeliveries;
     $job->handle(
         app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 
@@ -387,6 +389,7 @@ it('recovers an exhausted untouched planning correction only when project capaci
 
     (new ReconcileDeliveries)->handle(
         $recover,
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 
@@ -401,6 +404,7 @@ it('recovers an exhausted untouched planning correction only when project capaci
     ])->save();
     (new ReconcileDeliveries)->handle(
         $recover,
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 
@@ -479,6 +483,7 @@ it('requeues advancement when a current valid receipt outlives its settled-event
 
     (new ReconcileDeliveries)->handle(
         app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 
@@ -528,6 +533,7 @@ it('keeps settlement reconciliation until both settlement and a valid receipt ex
     Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
     (new ReconcileDeliveries)->handle(
         app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 
@@ -574,6 +580,7 @@ it('ignores a valid receipt retained by an older phase', function (): void {
 
     (new ReconcileDeliveries)->handle(
         app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 

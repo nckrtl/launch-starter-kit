@@ -27,6 +27,7 @@ use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitPlanningDispatchFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\DispatchOrbitPlanningCorrection as DispatchCorrectionJob;
 use App\Models\AgentDispatch;
@@ -420,6 +421,83 @@ it('prompts the exact retained Builder with immutable review findings', function
     app(DispatchOrbitPlanningCorrection::class)->handle($this->delivery->id);
     expect($this->herdr->calls)->toBe(['get', 'prompt'])
         ->and(AgentDispatch::where('herdr_pane_id', 'builder-pane')->count())->toBe(2);
+});
+
+it('accepts exact blocked planning-correction evidence as a plan-resolution source', function () {
+    $planner = app(DispatchOrbitPlanningCorrection::class)->handle($this->delivery->id);
+    $planner->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    $payload = [
+        'kind' => 'orbit_planning',
+        'schema_version' => 1,
+        'delivery_id' => $this->delivery->id,
+        'dispatch_id' => $planner->id,
+        'issue_key' => 'ORB-234',
+        'phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'attempt' => 2,
+        'result' => 'blocked',
+        'worktree' => $this->worktree,
+        'candidate_sha' => str_repeat('b', 40),
+        'handoff_path' => '.loop/runtime/planning-correction-handoff.md',
+        'handoff' => 'The correction needs an independent resolution.',
+        'artifact_sha' => null,
+        'plan_sha256' => null,
+    ];
+    $receipt = Receipt::query()->create([
+        'phase_run_id' => $this->correction->id,
+        'kind' => 'orbit_planning',
+        'schema_version' => 1,
+        'payload' => $payload,
+        'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+        'candidate_sha' => str_repeat('b', 40),
+        'validation_status' => ReceiptValidationStatus::Valid,
+        'captured_at' => now(),
+        'validated_at' => now(),
+    ]);
+    $this->correction->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'output' => ['receipt_id' => $receipt->id, 'result' => 'blocked'],
+        'finished_at' => now(),
+    ])->save();
+    $resolution = PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Pending,
+        'input' => [
+            'planning_receipt_id' => $receipt->id,
+            'planning_receipt' => $payload,
+            'plan_review_receipt_id' => $this->reviewReceipt->id,
+            'plan_review_receipt' => $this->reviewReceipt->payload,
+        ],
+    ]);
+    $resolver = AgentDispatch::query()->create([
+        'phase_run_id' => $resolution->id,
+        'agent_role' => OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $this->delivery->id,
+            OrbitFeatureWorkflow::RESOLUTION_PHASE,
+            1,
+            OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-resolution-1',
+        'prompt_name' => 'orbit_resolution',
+        'prompt_version' => OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Pending,
+    ]);
+    $this->delivery->refresh()->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'status' => DeliveryStatus::Queued,
+    ])->save();
+
+    expect(app(OrbitPlanResolutionReceiptValidator::class)->matchesSource(
+        $this->delivery->fresh('projectOrchestration'),
+        $resolution,
+        $resolver,
+    ))->toBeTrue();
 });
 
 it('prompts the retained Builder without protocol agent ids', function () {

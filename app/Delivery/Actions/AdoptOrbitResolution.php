@@ -17,8 +17,8 @@ use App\Delivery\Exceptions\OrbitResolutionAdoptionFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
-use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
 use App\Delivery\Workflow\OrbitResolutionAdoptionPolicy;
+use App\Delivery\Workflow\OrbitResolutionReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -35,7 +35,7 @@ final readonly class AdoptOrbitResolution
         private OrbitActiveIssueProvider $issues,
         private OrbitIssueTransitioner $transitions,
         private OrbitIssueSnapshotFactory $snapshots,
-        private OrbitPullRequestResolutionReceiptValidator $receipts,
+        private OrbitResolutionReceiptValidator $receipts,
         private OrbitResolutionAdoptionPolicy $adoptions,
     ) {}
 

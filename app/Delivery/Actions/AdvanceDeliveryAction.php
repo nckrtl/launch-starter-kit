@@ -15,7 +15,7 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
-use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
+use App\Delivery\Workflow\OrbitResolutionReceiptValidator;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
 use App\Jobs\AdvanceOrbitCleanup as AdvanceOrbitCleanupJob;
@@ -43,7 +43,7 @@ final readonly class AdvanceDeliveryAction
         private HerdrRuntime $herdr,
         private ProjectConfigRegistry $configs,
         private AdvanceOrbitPlanning $advanceOrbitPlanning,
-        private OrbitPullRequestResolutionReceiptValidator $resolutionReceipts,
+        private OrbitResolutionReceiptValidator $resolutionReceipts,
     ) {}
 
     /** Return true when a continuation should be queued after the caller releases its lock. */

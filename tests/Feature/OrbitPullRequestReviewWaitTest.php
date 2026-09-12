@@ -8,6 +8,7 @@ use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
@@ -561,6 +562,7 @@ it('queues exact review reconciliation identity and uses a bounded unique job', 
 
     (new ReconcileDeliveries)->handle(
         app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 

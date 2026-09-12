@@ -16,8 +16,8 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
-use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
 use App\Delivery\Workflow\OrbitResolutionAdoptionPolicy;
+use App\Delivery\Workflow\OrbitResolutionReceiptValidator;
 use App\Jobs\AdoptOrbitResolution as AdoptOrbitResolutionJob;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -31,7 +31,7 @@ final readonly class AdvanceOrbitResolution
         private ResolveOrbitDeliveryPreparation $preparations,
         private OrbitActiveIssueProvider $issues,
         private OrbitResolutionPublisher $publisher,
-        private OrbitPullRequestResolutionReceiptValidator $receipts,
+        private OrbitResolutionReceiptValidator $receipts,
         private OrbitResolutionAdoptionPolicy $adoptions,
         private OrbitIssueSnapshotFactory $snapshots,
     ) {}

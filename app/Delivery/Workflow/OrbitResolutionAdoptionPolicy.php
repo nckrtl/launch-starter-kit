@@ -19,9 +19,13 @@ final readonly class OrbitResolutionAdoptionPolicy
         $origin = is_array($input) && is_array($input['pr_review_receipt'] ?? null)
             ? ($input['pr_review_receipt']['phase'] ?? null)
             : null;
-        $expected = $origin === OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            ? OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            : '';
+        $planOrigin = is_array($input) && is_array($input['plan_review_receipt'] ?? null);
+        $expected = match (true) {
+            $origin === OrbitFeatureWorkflow::PR_REVIEW_PHASE => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+            $planOrigin => OrbitFeatureWorkflow::INITIAL_PHASE,
+            default => '',
+        };
+        $canAdoptOrigin = $origin === OrbitFeatureWorkflow::PR_REVIEW_PHASE;
         $requirements = [];
 
         if (is_array($proposal)) {
@@ -45,12 +49,13 @@ final readonly class OrbitResolutionAdoptionPolicy
             && ($phase->output['receipt_id'] ?? null) === $receipt->id
             && ($phase->output['adopted'] ?? null) === true;
         $adopt = $requirements === []
-            && $expected !== ''
+            && $canAdoptOrigin
             && $resume === $expected
             && ($alreadyAdopted || $priorAdoptions < self::AUTOMATIC_ADOPTION_LIMIT);
         $reason = match (true) {
             $requirements !== [] => 'Resolution requirements need an explicit decision or contract change.',
             $expected === '' => 'The resolution origin cannot be resumed automatically.',
+            ! $canAdoptOrigin => 'Planning resolutions require an explicit decision before adoption.',
             $resume !== $expected => 'The proposed resume phase does not match the stopped phase.',
             ! $alreadyAdopted && $priorAdoptions >= self::AUTOMATIC_ADOPTION_LIMIT => 'The automatic resolution adoption budget is exhausted.',
             default => "Eligible for automatic adoption into {$expected}; adoption is pending.",

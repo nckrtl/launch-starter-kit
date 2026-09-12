@@ -6,6 +6,7 @@ namespace App\Jobs;
 
 use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -57,6 +58,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
 
     public function handle(
         RecoverExhaustedOrbitPlanningCorrection $planningCorrections,
+        RecoverExhaustedOrbitPlanResolution $planResolutions,
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
     ): void {
         Delivery::query()
@@ -75,6 +77,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $query->where('status', DeliveryStatus::Failed)
                             ->where('current_phase', OrbitFeatureWorkflow::INITIAL_PHASE)
                             ->where('failure_details->code', 'planning_correction_dispatch_exhausted');
+                    })
+                    ->orWhere(function (Builder $query): void {
+                        $query->where('status', DeliveryStatus::Failed)
+                            ->where('current_phase', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+                            ->where('failure_details->code', 'resolution_dispatch_exhausted');
                     })
                     ->orWhere(function (Builder $query): void {
                         $query->where('status', DeliveryStatus::Blocked)
@@ -97,10 +104,16 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
             ->orderBy('deliveries.id')
             ->chunkById(self::CHUNK_SIZE, function ($deliveries) use (
                 $planningCorrections,
+                $planResolutions,
                 $reviewPublications,
             ): void {
                 foreach ($deliveries as $delivery) {
-                    $this->dispatchRecovery($delivery, $planningCorrections, $reviewPublications);
+                    $this->dispatchRecovery(
+                        $delivery,
+                        $planningCorrections,
+                        $planResolutions,
+                        $reviewPublications,
+                    );
                 }
             }, 'deliveries.id', 'id');
     }
@@ -108,10 +121,12 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
     private function dispatchRecovery(
         Delivery $delivery,
         RecoverExhaustedOrbitPlanningCorrection $planningCorrections,
+        RecoverExhaustedOrbitPlanResolution $planResolutions,
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
     ): void {
         if ($delivery->status === DeliveryStatus::Failed) {
-            if ($planningCorrections->handle($delivery->id)) {
+            if ($planningCorrections->handle($delivery->id)
+                || $planResolutions->handle($delivery->id)) {
                 AdvanceDelivery::dispatch($delivery->id);
             }
 

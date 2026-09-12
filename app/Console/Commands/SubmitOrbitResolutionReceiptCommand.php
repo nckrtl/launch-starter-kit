@@ -13,7 +13,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitResolutionReceiptFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
-use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
+use App\Delivery\Workflow\OrbitResolutionReceiptValidator;
 use App\Models\PhaseRun;
 use Illuminate\Console\Attributes\Description;
 use Illuminate\Console\Attributes\Signature;
@@ -33,7 +33,7 @@ final class SubmitOrbitResolutionReceiptCommand extends Command
 {
     public function handle(
         ProjectConfigRegistry $configs,
-        OrbitPullRequestResolutionReceiptValidator $receipts,
+        OrbitResolutionReceiptValidator $receipts,
         CaptureOrbitPullRequestResolutionReceipt $capture,
     ): int {
         $phaseRunId = $this->positiveIntegerArgument('phase-run');

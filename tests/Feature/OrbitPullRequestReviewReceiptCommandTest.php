@@ -11,6 +11,7 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPullRequestResolution;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
@@ -2611,6 +2612,7 @@ it('recovers an exhausted pull request review publication through authoritative 
     ]])->save();
     (new ReconcileDeliveries)->handle(
         app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
         app(BindOrbitPullRequestReviewPublicationRecovery::class),
     );
 
