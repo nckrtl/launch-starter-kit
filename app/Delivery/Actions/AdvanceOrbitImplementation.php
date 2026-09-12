@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace App\Delivery\Actions;
 
 use App\Delivery\Config\ProjectConfigRegistry;
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
-use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\OrbitIssueSnapshot;
@@ -38,7 +38,7 @@ final readonly class AdvanceOrbitImplementation
         private ResolveOrbitDeliveryPreparation $preparations,
         private OrbitRepository $repository,
         private OrbitImplementationRepository $implementations,
-        private OrbitIssueProvider $issues,
+        private OrbitActiveIssueProvider $issues,
         private OrbitPullRequestPublisher $pullRequests,
         private OrbitImplementationReceiptValidator $receipts,
         private OrbitIssueSnapshotFactory $snapshots,
@@ -103,11 +103,16 @@ final readonly class AdvanceOrbitImplementation
                 throw new OrbitImplementationAdvancementFailed('The implementation ledger changed before advancement.');
             }
 
-            $issue = $this->issues->fetch(
+            $issue = $this->issues->fetchActive(
                 $preparation->snapshot->issueId,
                 $preparation->snapshot->issueKey,
             );
-            $this->assertCurrentIssue($delivery, $preparation->snapshot, $issue);
+            $this->assertCurrentIssue(
+                $delivery,
+                $preparation->snapshot,
+                $issue,
+                $phase->attempt > 1,
+            );
             $verified = $this->implementations->verifyImplementationOutcome(
                 $config,
                 $preparation->worktree,
@@ -198,8 +203,14 @@ final readonly class AdvanceOrbitImplementation
         Delivery $delivery,
         PreparedIssueSnapshot $expected,
         OrbitIssueSnapshot $issue,
+        bool $allowPullRequestReviewState,
     ): void {
         $state = $issue->payload['state'] ?? null;
+        $validState = is_array($state)
+            && ($state['type'] ?? null) === 'started'
+            && ($allowPullRequestReviewState
+                ? in_array($state['name'] ?? null, ['In Progress', 'In Review'], true)
+                : ($state['name'] ?? null) === 'In Progress');
 
         if ($issue->issueId !== $expected->issueId
             || $issue->issueKey !== $expected->issueKey
@@ -208,9 +219,7 @@ final readonly class AdvanceOrbitImplementation
                 $expected->contractHash,
                 $delivery->pull_request_url,
             )
-            || ! is_array($state)
-            || ($state['name'] ?? null) !== 'In Progress'
-            || ($state['type'] ?? null) !== 'started') {
+            || ! $validState) {
             throw new OrbitIssueContractChanged('The Orbit issue changed before implementation advancement.');
         }
     }

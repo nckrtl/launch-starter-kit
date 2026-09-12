@@ -193,6 +193,8 @@ final class ImplementationAdvancementIssueProvider implements OrbitActiveIssuePr
 
     public int $calls = 0;
 
+    public int $activeCalls = 0;
+
     public function __construct(public OrbitIssueSnapshot $snapshot) {}
 
     public function fetch(string $issueId, string $issueKey): OrbitIssueSnapshot
@@ -205,6 +207,8 @@ final class ImplementationAdvancementIssueProvider implements OrbitActiveIssuePr
 
     public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
+        $this->activeCalls++;
+
         return $this->fetch($issueId, $issueKey);
     }
 }
@@ -615,6 +619,7 @@ function promoteImplementationAdvancementToCorrection(object $test, string $resu
     $test->pullRequests->mergeable = true;
     $test->verifier->calls = 0;
     $test->issues->calls = 0;
+    $test->issues->activeCalls = 0;
     $test->pullRequests->calls = 0;
 }
 
@@ -1067,6 +1072,27 @@ it('publishes the corrected candidate to the same pull request and creates one P
         ->and($this->issues->calls)->toBe(1)
         ->and($this->pullRequests->calls)->toBe(1)
         ->and(PhaseRun::where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)->count())->toBe(1);
+});
+
+it('advances a corrected candidate after Linear returns to in review', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    $payload = $this->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-1', 'name' => 'In Review', 'type' => 'started'];
+    $payload['assignee'] = null;
+    $this->issues->snapshot = new OrbitIssueSnapshot(
+        $this->issues->snapshot->issueId,
+        $this->issues->snapshot->issueKey,
+        $payload,
+        $this->issues->snapshot->contractHash,
+    );
+
+    expect(app(AdvanceOrbitImplementation::class)->handle($this->delivery->id))->toBeFalse();
+
+    expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->and($this->correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->issues->activeCalls)->toBe(1)
+        ->and($this->verifier->calls)->toBe(1)
+        ->and($this->pullRequests->calls)->toBe(1);
 });
 
 it('allows the known pull request attachment while advancing a corrected candidate', function () {
