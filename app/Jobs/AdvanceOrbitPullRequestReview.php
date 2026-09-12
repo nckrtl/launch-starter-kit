@@ -5,12 +5,15 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Delivery\Actions\AdvanceOrbitPullRequestReview as AdvanceAction;
+use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
-use App\Delivery\Exceptions\OrbitPullRequestReviewPublicationFailed;
+use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
+use App\Models\Receipt;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Contracts\Queue\ShouldQueue;
@@ -96,31 +99,42 @@ final class AdvanceOrbitPullRequestReview implements ShouldQueue, ShouldQueueAft
                 return;
             }
 
-            $publication = $phase->current_block === 'review_publication'
-                || $this->hasPublicationFailure($exception);
-            $delivery->status = $publication ? DeliveryStatus::Blocked : DeliveryStatus::Failed;
-            $delivery->failed_at = $publication ? null : now();
-            $delivery->failure_details = [
-                'code' => $publication
-                    ? 'pr_review_publication_reconciliation_required'
-                    : 'pr_review_advancement_exhausted',
-                'message' => $exception?->getMessage(),
-            ];
+            $dispatches = $phase->agentDispatches()->get();
+            $receipts = $phase->receipts()->where('kind', 'orbit_pr_review')->get();
+            $dispatch = $dispatches->first();
+            $receipt = $receipts->first();
+            $publicationAttempted = $phase->current_block === 'review_publication';
+            $recoverablePublication = $publicationAttempted
+                && $dispatches->count() === 1
+                && $receipts->count() === 1
+                && $dispatch instanceof AgentDispatch
+                && $receipt instanceof Receipt
+                && $dispatch->status === AgentDispatchStatus::Settled
+                && $dispatch->settled_at !== null
+                && $receipt->validation_status === ReceiptValidationStatus::Valid;
+            $delivery->status = $publicationAttempted ? DeliveryStatus::Blocked : DeliveryStatus::Failed;
+            $delivery->failed_at = $publicationAttempted ? null : now();
+            if ($recoverablePublication) {
+                $delivery->failure_details = [
+                    'code' => 'pr_review_publication_reconciliation_required',
+                    'phase_run_id' => $phase->id,
+                    'dispatch_id' => $dispatch->id,
+                    'receipt_id' => $receipt->id,
+                    'message' => $exception?->getMessage(),
+                ];
+            } elseif ($publicationAttempted) {
+                $delivery->failure_details = [
+                    'code' => 'pr_review_publication_reconciliation_required',
+                    'message' => $exception?->getMessage(),
+                ];
+            } else {
+                $delivery->failure_details = [
+                    'code' => 'pr_review_advancement_exhausted',
+                    'message' => $exception?->getMessage(),
+                ];
+            }
             $delivery->save();
         });
-    }
-
-    private function hasPublicationFailure(?Throwable $exception): bool
-    {
-        while ($exception !== null) {
-            if ($exception instanceof OrbitPullRequestReviewPublicationFailed) {
-                return true;
-            }
-
-            $exception = $exception->getPrevious();
-        }
-
-        return false;
     }
 
     private function queueContinuation(): void

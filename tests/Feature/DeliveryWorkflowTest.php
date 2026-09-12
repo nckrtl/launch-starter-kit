@@ -1,6 +1,7 @@
 <?php
 
 use App\Delivery\Actions\AdvanceDeliveryAction;
+use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\CaptureHarmlessReceipt;
 use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
@@ -430,7 +431,10 @@ it('completes a transition recovered from a lost receipt continuation enqueue', 
         'validated_at' => now(),
     ]);
 
-    (new ReconcileDeliveries)->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
     Queue::assertPushed(
         AdvanceDelivery::class,
         fn (AdvanceDelivery $job): bool => $job->deliveryId === $this->delivery->id,

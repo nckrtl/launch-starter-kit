@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
@@ -19,6 +20,7 @@ use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdoptOrbitResolution;
 use App\Jobs\AdvanceDelivery;
+use App\Jobs\AdvanceOrbitPullRequestReview;
 use App\Jobs\AdvanceOrbitResolution;
 use App\Jobs\ReconcileDeliveries;
 use App\Jobs\ReconcileDelivery;
@@ -138,6 +140,7 @@ function waitingReconciliationDelivery(string $status = 'working', int $sequence
 it('queues per-delivery recovery only for enabled recoverable deliveries', function (): void {
     Queue::fake([
         AdvanceDelivery::class,
+        AdvanceOrbitPullRequestReview::class,
         AdoptOrbitResolution::class,
         AdvanceOrbitResolution::class,
         ReconcileDelivery::class,
@@ -185,6 +188,20 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
         static fn (DeliveryStatus $status): Delivery => $delivery($enabled, $status),
         $recoverableStatuses,
     );
+    $reviewPublication = Delivery::create([
+        'project_orchestration_id' => $enabled->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'review-publication',
+        'external_issue_key' => 'ORB-313',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'failure_details' => [
+            'code' => 'pr_review_publication_reconciliation_required',
+            'phase_run_id' => 313,
+        ],
+    ]);
     $resolutionPublication = Delivery::create([
         'project_orchestration_id' => $enabled->id,
         'external_issue_provider' => 'linear',
@@ -251,9 +268,17 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
     ];
 
     $job = new ReconcileDeliveries;
-    $job->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
 
     Queue::assertPushed(AdvanceDelivery::class, count($recoverable));
+    Queue::assertPushed(
+        AdvanceOrbitPullRequestReview::class,
+        fn (AdvanceOrbitPullRequestReview $queued): bool => $queued->deliveryId === $reviewPublication->id
+            && $queued->phaseRunId === 313,
+    );
     Queue::assertPushed(
         AdvanceOrbitResolution::class,
         fn (AdvanceOrbitResolution $queued): bool => $queued->deliveryId === $resolutionPublication->id
@@ -360,7 +385,10 @@ it('recovers an exhausted untouched planning correction only when project capaci
     ]);
     $recover = app(RecoverExhaustedOrbitPlanningCorrection::class);
 
-    (new ReconcileDeliveries)->handle($recover);
+    (new ReconcileDeliveries)->handle(
+        $recover,
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
 
     expect($delivery->fresh()->status)->toBe(DeliveryStatus::Failed)
         ->and($delivery->fresh()->failure_details['code'])
@@ -371,7 +399,10 @@ it('recovers an exhausted untouched planning correction only when project capaci
         'status' => DeliveryStatus::Completed,
         'completed_at' => now(),
     ])->save();
-    (new ReconcileDeliveries)->handle($recover);
+    (new ReconcileDeliveries)->handle(
+        $recover,
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
 
     expect($delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
         ->and($delivery->fresh()->failure_details)->toBeNull()
@@ -446,7 +477,10 @@ it('requeues advancement when a current valid receipt outlives its settled-event
     ]);
     Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
 
-    (new ReconcileDeliveries)->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
 
     Queue::assertPushed(AdvanceDelivery::class, 1);
     Queue::assertPushed(
@@ -492,7 +526,10 @@ it('keeps settlement reconciliation until both settlement and a valid receipt ex
     }
 
     Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
-    (new ReconcileDeliveries)->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
 
     Queue::assertNotPushed(AdvanceDelivery::class);
     Queue::assertPushed(
@@ -535,7 +572,10 @@ it('ignores a valid receipt retained by an older phase', function (): void {
     ]);
     Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
 
-    (new ReconcileDeliveries)->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
 
     Queue::assertNotPushed(AdvanceDelivery::class);
     Queue::assertPushed(

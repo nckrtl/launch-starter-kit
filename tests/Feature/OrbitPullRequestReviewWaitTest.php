@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
@@ -558,7 +559,10 @@ it('queues exact review reconciliation identity and uses a bounded unique job', 
     [, $delivery, $phase, $dispatch] = orbitReviewWaitFixture();
     Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
 
-    (new ReconcileDeliveries)->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
 
     Queue::assertPushed(ReconcileDelivery::class, fn (ReconcileDelivery $job): bool => $job->deliveryId === $delivery->id
         && $job->phaseRunId === $phase->id

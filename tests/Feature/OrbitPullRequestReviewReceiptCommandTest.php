@@ -5,10 +5,12 @@ use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitImplementation;
 use App\Delivery\Actions\AdvanceOrbitPullRequestReview;
 use App\Delivery\Actions\AdvanceOrbitResolution;
+use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPullRequestResolution;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
@@ -44,7 +46,6 @@ use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPullRequestReviewAdvancementFailed;
-use App\Delivery\Exceptions\OrbitPullRequestReviewPublicationFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Exceptions\OrbitResolutionAdoptionFailed;
 use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
@@ -59,6 +60,7 @@ use App\Jobs\AdvanceOrbitPullRequestReview as AdvancePullRequestReviewJob;
 use App\Jobs\AdvanceOrbitResolution as AdvanceResolutionJob;
 use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPullRequestResolution as DispatchResolutionJob;
+use App\Jobs\ReconcileDeliveries;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
@@ -2560,12 +2562,10 @@ it('rejects corrupted completed review identity during replay', function (string
 ]);
 
 it('bounds review advancement and blocks exhausted publication for reconciliation', function () {
+    $receipt = capturePullRequestReviewForAdvancement($this, 'approved');
+    $this->phaseRun->forceFill(['current_block' => 'review_publication'])->save();
     $job = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id);
-    $job->failed(new RuntimeException(
-        'Worker exhausted.',
-        0,
-        new OrbitPullRequestReviewPublicationFailed('Publication outcome is unresolved.'),
-    ));
+    $job->failed(new RuntimeException('Worker exhausted.'));
 
     expect($job->tries)->toBe(0)
         ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
@@ -2574,8 +2574,95 @@ it('bounds review advancement and blocks exhausted publication for reconciliatio
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
         ->and($this->delivery->fresh()->failure_details)->toBe([
             'code' => 'pr_review_publication_reconciliation_required',
+            'phase_run_id' => $this->phaseRun->id,
+            'dispatch_id' => $this->dispatch->id,
+            'receipt_id' => $receipt->id,
             'message' => 'Worker exhausted.',
         ]);
+});
+
+it('recovers an exhausted pull request review publication through authoritative replay', function () {
+    $receipt = capturePullRequestReviewForAdvancement($this, 'approved');
+    $this->reviewPublisher->afterPublish = static function (): void {
+        throw new RuntimeException('The review publication response was lost.');
+    };
+    $job = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id);
+
+    expect(fn () => $job->handle(app(AdvanceOrbitPullRequestReview::class)))
+        ->toThrow(RuntimeException::class, 'review publication response was lost');
+
+    expect($this->phaseRun->fresh()->current_block)->toBe('review_publication')
+        ->and($this->reviewPublisher->calls)->toBe(1);
+
+    $job->failed(new RuntimeException('Review publication retries exhausted.'));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'pr_review_publication_reconciliation_required',
+            'phase_run_id' => $this->phaseRun->id,
+            'dispatch_id' => $this->dispatch->id,
+            'receipt_id' => $receipt->id,
+            'message' => 'Review publication retries exhausted.',
+        ]);
+
+    $this->delivery->forceFill(['failure_details' => [
+        'code' => 'pr_review_publication_reconciliation_required',
+        'message' => 'Legacy publication recovery evidence.',
+    ]])->save();
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    expect($this->delivery->fresh()->failure_details)->toBe([
+        'code' => 'pr_review_publication_reconciliation_required',
+        'phase_run_id' => $this->phaseRun->id,
+        'dispatch_id' => $this->dispatch->id,
+        'receipt_id' => $receipt->id,
+        'message' => 'Legacy publication recovery evidence.',
+    ]);
+    Queue::assertPushed(
+        AdvancePullRequestReviewJob::class,
+        fn (AdvancePullRequestReviewJob $queued): bool => $queued->deliveryId === $this->delivery->id
+            && $queued->phaseRunId === $this->phaseRun->id,
+    );
+
+    $this->reviewPublisher->afterPublish = null;
+    $job->handle(app(AdvanceOrbitPullRequestReview::class));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::ReadyToMerge)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::LANDING_PHASE)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->phaseRun->fresh()->current_block)->toBeNull()
+        ->and($this->reviewPublisher->calls)->toBe(2)
+        ->and(PhaseRun::query()->where('phase_name', OrbitFeatureWorkflow::LANDING_PHASE)->count())->toBe(1);
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $queued): bool => $queued->deliveryId === $this->delivery->id,
+    );
+});
+
+it('keeps an attempted review publication blocked when its evidence is not safe to bind', function () {
+    $receipt = capturePullRequestReviewForAdvancement($this, 'approved');
+    $this->phaseRun->forceFill(['current_block' => 'review_publication'])->save();
+    $receipt->forceFill([
+        'validation_status' => ReceiptValidationStatus::Invalid,
+        'validation_errors' => ['The retained receipt is invalid.'],
+    ])->save();
+    $job = new AdvancePullRequestReviewJob($this->delivery->id, $this->phaseRun->id);
+
+    $job->failed(new RuntimeException('Unsafe publication evidence.'));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failed_at)->toBeNull()
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'pr_review_publication_reconciliation_required',
+            'message' => 'Unsafe publication evidence.',
+        ])
+        ->and(app(BindOrbitPullRequestReviewPublicationRecovery::class)->handle(
+            $this->delivery->id,
+        ))->toBeNull();
 });
 
 it('queues delivery continuation after pull request review routing completes', function () {

@@ -155,7 +155,10 @@ final readonly class AdvanceOrbitPullRequestReview
     private function reviewState(Delivery $delivery, ?int $expectedPhaseId): ?array
     {
         if ($delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || $delivery->status !== DeliveryStatus::WaitingForAgent) {
+            || ! in_array($delivery->status, [
+                DeliveryStatus::WaitingForAgent,
+                DeliveryStatus::Blocked,
+            ], true)) {
             return null;
         }
 
@@ -183,6 +186,13 @@ final readonly class AdvanceOrbitPullRequestReview
             );
         }
 
+        if ($delivery->status === DeliveryStatus::Blocked
+            && ($dispatch->status !== AgentDispatchStatus::Settled || $receipt === null)) {
+            throw new OrbitPullRequestReviewAdvancementFailed(
+                'The retained pull request review publication recovery is inconsistent.',
+            );
+        }
+
         if ($dispatch->status !== AgentDispatchStatus::Settled || $receipt === null) {
             return null;
         }
@@ -193,7 +203,35 @@ final readonly class AdvanceOrbitPullRequestReview
             );
         }
 
+        if ($delivery->status === DeliveryStatus::Blocked
+            && ! $this->isPublicationRecovery($delivery, $phase, $dispatch, $receipt)) {
+            throw new OrbitPullRequestReviewAdvancementFailed(
+                'The retained pull request review publication recovery is inconsistent.',
+            );
+        }
+
         return [$phase, $dispatch, $receipt, $source];
+    }
+
+    private function isPublicationRecovery(
+        Delivery $delivery,
+        ?PhaseRun $phase,
+        ?AgentDispatch $dispatch,
+        ?Receipt $receipt,
+    ): bool {
+        $failure = $delivery->failure_details;
+
+        return $delivery->status === DeliveryStatus::Blocked
+            && $delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            && is_array($failure)
+            && ($failure['code'] ?? null) === 'pr_review_publication_reconciliation_required'
+            && $phase !== null
+            && $dispatch !== null
+            && $receipt !== null
+            && ($failure['phase_run_id'] ?? null) === $phase->id
+            && ($failure['dispatch_id'] ?? null) === $dispatch->id
+            && ($failure['receipt_id'] ?? null) === $receipt->id
+            && $phase->current_block === 'review_publication';
     }
 
     private function verifySource(
@@ -341,7 +379,8 @@ final readonly class AdvanceOrbitPullRequestReview
                 || $project->config !== $config->toArray()
                 || ! $this->configs->hydrate($project->config) instanceof OrbitProjectConfig
                 || $delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-                || $delivery->status !== DeliveryStatus::WaitingForAgent
+                || ($delivery->status !== DeliveryStatus::WaitingForAgent
+                    && ! $this->isPublicationRecovery($delivery, $phase, $dispatch, $receipt))
                 || $latestReview?->id !== $phase->id
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
@@ -431,7 +470,8 @@ final readonly class AdvanceOrbitPullRequestReview
             if ($phase === null || $dispatch === null || $receipt === null || $source === null
                 || $project->state !== ProjectOrchestrationState::Enabled
                 || $project->config !== $config->toArray()
-                || $delivery->status !== DeliveryStatus::WaitingForAgent
+                || ($delivery->status !== DeliveryStatus::WaitingForAgent
+                    && ! $this->isPublicationRecovery($delivery, $phase, $dispatch, $receipt))
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
                 || $phase->attempt < 1 || $phase->status !== PhaseRunStatus::Running
