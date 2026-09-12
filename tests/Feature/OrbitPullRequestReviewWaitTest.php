@@ -6,6 +6,7 @@ use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
@@ -557,7 +558,7 @@ it('queues exact review reconciliation identity and uses a bounded unique job', 
     [, $delivery, $phase, $dispatch] = orbitReviewWaitFixture();
     Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
 
-    (new ReconcileDeliveries)->handle();
+    (new ReconcileDeliveries)->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
 
     Queue::assertPushed(ReconcileDelivery::class, fn (ReconcileDelivery $job): bool => $job->deliveryId === $delivery->id
         && $job->phaseRunId === $phase->id

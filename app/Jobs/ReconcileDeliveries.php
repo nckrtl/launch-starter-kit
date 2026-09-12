@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Jobs;
 
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
@@ -51,7 +52,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         return $this->retryDeadline;
     }
 
-    public function handle(): void
+    public function handle(RecoverExhaustedOrbitPlanningCorrection $planningCorrections): void
     {
         Delivery::query()
             ->select([
@@ -66,6 +67,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
             ->where(function (Builder $query): void {
                 $query->whereIn('status', $this->reconcilableStatuses())
                     ->orWhere(function (Builder $query): void {
+                        $query->where('status', DeliveryStatus::Failed)
+                            ->where('current_phase', OrbitFeatureWorkflow::INITIAL_PHASE)
+                            ->where('failure_details->code', 'planning_correction_dispatch_exhausted');
+                    })
+                    ->orWhere(function (Builder $query): void {
                         $query->where('status', DeliveryStatus::Blocked)
                             ->where('current_phase', OrbitFeatureWorkflow::RESOLUTION_PHASE)
                             ->whereIn('failure_details->code', [
@@ -76,15 +82,25 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                     });
             })
             ->orderBy('deliveries.id')
-            ->chunkById(self::CHUNK_SIZE, function ($deliveries): void {
+            ->chunkById(self::CHUNK_SIZE, function ($deliveries) use ($planningCorrections): void {
                 foreach ($deliveries as $delivery) {
-                    $this->dispatchRecovery($delivery);
+                    $this->dispatchRecovery($delivery, $planningCorrections);
                 }
             }, 'deliveries.id', 'id');
     }
 
-    private function dispatchRecovery(Delivery $delivery): void
-    {
+    private function dispatchRecovery(
+        Delivery $delivery,
+        RecoverExhaustedOrbitPlanningCorrection $planningCorrections,
+    ): void {
+        if ($delivery->status === DeliveryStatus::Failed) {
+            if ($planningCorrections->handle($delivery->id)) {
+                AdvanceDelivery::dispatch($delivery->id);
+            }
+
+            return;
+        }
+
         if ($delivery->status === DeliveryStatus::Blocked) {
             $phaseRunId = $delivery->failure_details['phase_run_id'] ?? null;
             $failureCode = $delivery->failure_details['code'] ?? null;

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
@@ -13,6 +14,7 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\HerdrSettlementReconciliationFailed;
+use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdoptOrbitResolution;
 use App\Jobs\AdvanceDelivery;
@@ -247,7 +249,7 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
     ];
 
     $job = new ReconcileDeliveries;
-    $job->handle();
+    $job->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
 
     Queue::assertPushed(AdvanceDelivery::class, count($recoverable));
     Queue::assertPushed(
@@ -290,6 +292,92 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
         ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
         ->and($job->tries)->toBe(0)
         ->and($job->retryUntil() > now())->toBeTrue();
+});
+
+it('recovers an exhausted untouched planning correction only when project capacity is free', function (): void {
+    Queue::fake([AdvanceDelivery::class]);
+    $project = ProjectOrchestration::create([
+        'manifest_project_id' => 'orbit',
+        'config' => [
+            'type' => 'orbit',
+            'repository' => '/home/nckrtl/orbit',
+            'worktreeRoot' => '/fast/worktrees/orbit',
+            'herdrSession' => 'orbit',
+            'concurrency' => 1,
+            'defaultFlow' => 'discovery',
+        ],
+        'state' => ProjectOrchestrationState::Enabled,
+    ]);
+    $delivery = Delivery::create([
+        'project_orchestration_id' => $project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => '11111111-2222-4333-8444-555555555555',
+        'external_issue_key' => 'ORB-83',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Failed,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'worktree_path' => '/fast/worktrees/orbit/orb-83',
+        'failure_details' => [
+            'code' => 'planning_correction_dispatch_exhausted',
+            'message' => 'The correction dispatcher exhausted its retry window.',
+        ],
+        'failed_at' => now(),
+    ]);
+    $correction = PhaseRun::create([
+        'delivery_id' => $delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Pending,
+    ]);
+    AgentDispatch::create([
+        'phase_run_id' => $correction->id,
+        'agent_role' => OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $delivery->id,
+            OrbitFeatureWorkflow::INITIAL_PHASE,
+            2,
+            OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-83-loop-builder',
+        'prompt_name' => 'orbit_planning_correction',
+        'prompt_version' => OrbitFeatureWorkflow::PLANNING_CORRECTION_PROMPT_VERSION,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Pending,
+    ]);
+    $occupying = Delivery::create([
+        'project_orchestration_id' => $project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => '66666666-7777-4888-8999-000000000000',
+        'external_issue_key' => 'ORB-227',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'failure_details' => ['code' => 'operator_attention_required'],
+    ]);
+    $recover = app(RecoverExhaustedOrbitPlanningCorrection::class);
+
+    (new ReconcileDeliveries)->handle($recover);
+
+    expect($delivery->fresh()->status)->toBe(DeliveryStatus::Failed)
+        ->and($delivery->fresh()->failure_details['code'])
+        ->toBe('planning_correction_dispatch_exhausted');
+    Queue::assertNothingPushed();
+
+    $occupying->forceFill([
+        'status' => DeliveryStatus::Completed,
+        'completed_at' => now(),
+    ])->save();
+    (new ReconcileDeliveries)->handle($recover);
+
+    expect($delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($delivery->fresh()->failure_details)->toBeNull()
+        ->and($delivery->fresh()->failed_at)->toBeNull();
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $job): bool => $job->deliveryId === $delivery->id,
+    );
 });
 
 it('recovers one missed terminal Herdr event from the exact later agent state', function (): void {
