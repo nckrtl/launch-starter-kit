@@ -1,14 +1,14 @@
 # Project delivery orchestration
 
-Status: implementation in progress; live cutover remains disabled
+Status: implementation in progress; label-scoped live routing is enabled while
+broad cutover remains disabled
 
 Continuation thread: `codex://threads/01a08cc2-0105-74b1-aeb0-be013aa73267`
 
-The implementation thread should begin with the discovery checklist near the
-end of this document. It should then implement stages 1 through 4 as the first
-reviewable slice. Keep real pull request merging disabled until event
-correlation, receipt validation, and idempotent advancement have passed in
-shadow mode.
+The discovery checklist and stages 1 through 6 are implemented. Real pull
+request merging is enabled only for explicit `controller:commander` canaries
+after event correlation, receipt validation, idempotent advancement, shadow
+parity, and one end-to-end live delivery passed.
 
 ## Purpose
 
@@ -98,20 +98,31 @@ Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
 repository checks still support only discovery. Before proof is enabled, move
 the potentially hour-long topology operation out of the 540-second landing job
 envelope and bind every prompt and repository check to the delivery's immutable
-flow. The discovery workflow now reaches Commander `Completed`. The normal
-`bin/loop ISSUE` entry point still invokes the legacy controller. Commander now
-ships a dedicated, restartable systemd queue-worker unit with timeouts bounded
-below the database queue reservation. Its systemd timer queues unique scheduled
+flow. The discovery workflow now reaches Commander `Completed`. Commander ships
+a dedicated, restartable systemd queue-worker unit with timeouts bounded below
+the database queue reservation. Its systemd timer queues unique scheduled
 reconciliation that wakes the existing advancement path for recoverable
-deliveries on enabled projects. Route the entry point through Commander only
-after live shadow parity passes.
+deliveries on enabled projects.
+
+The installed `bin/loop ISSUE` driver now routes a new issue with the complete,
+non-conflicting `controller:commander` ownership label through
+`delivery:start-orbit --idempotent`. It strips the interactive SSH agent before
+Commander calls the Hermes RPC. A repeated start returns the existing active
+delivery without creating another worktree, ledger, or job. Any issue without
+that label, and every issue with an existing legacy journal, stays on the legacy
+controller. A non-advance command for a Commander-owned issue returns an
+ownership marker without starting either controller; detailed delivery state
+remains available through Commander. This is a label-scoped entry-point cutover,
+not broad automatic admission.
 
 The read-only `delivery:shadow-parity` gate now compares each legacy debounced
 Herdr notification with one raw Commander event. A live run on 2026-09-11
 passed: every compatibility notification in the observed capture window
 matched, none were missing, and none had a pending Tom notification. This
-proves live listener-capture parity only. End-to-end issue delivery parity is
-still required before the normal entry point can move.
+proved live listener-capture parity. The ORB-73 canary subsequently completed
+the discovery workflow through merge, cleanup, Linear closeout, and terminal
+Commander recording. That evidence permits the explicit label-scoped entry
+point route while broad cutover remains disabled.
 
 Scheduled reconciliation now queues one bounded, unique job per recoverable
 delivery instead of only replaying advancement. For a delivery waiting on an
@@ -142,8 +153,9 @@ handoff again on the final issue read. The legacy semantic monitor excludes
 only complete, non-conflicting Commander ownership from its active, Todo,
 maintenance, capacity, and recovery routing. Unlabeled or conflicting issues
 remain on the legacy path, while an incomplete or malformed page exposing the
-Commander label is held from legacy Todo admission. This boundary remains in
-place until the normal entry point is deliberately cut over.
+Commander label is held from legacy Todo admission. The normal entry point now
+honors this same boundary for new starts; the boundary remains in place until
+broad cutover is deliberately enabled.
 
 ## Ownership boundaries
 
@@ -641,9 +653,9 @@ later legacy start stop at its existing-worktree check.
 
 This verification timestamp is audit evidence, not reusable authorization for
 a later planning dispatch. Live planning must repeat the provider and candidate
-checks at its own dispatch boundary. A later cutover will route the existing
-driver entry point through the same start service after those authorization and
-eligibility adapters exist.
+checks at its own dispatch boundary. The installed label-scoped route now sends
+the existing driver entry point through that start service without weakening
+the repeated dispatch-boundary checks.
 
 The next shadow boundary is `PrepareOrbitPlanningHandoff`. It reloads the
 delivery and live project config, acquires the same per-issue controller lock,
@@ -654,12 +666,11 @@ checks does it fetch Linear again and compare the current schema-2 contract. It
 returns the fresh normalized issue payload and all verified repository bindings
 in a readonly handoff.
 
-This handoff is deliberately non-runnable. It does not create an agent dispatch,
-queue advancement, call Herdr, change workflow state, or mutate Linear. An
-eligible `Todo` issue can produce the handoff, but the handoff remains marked
-non-dispatchable. Live planning still needs a separate Linear transition to `In
-Progress`, a read-back, and the same final verification immediately before the
-prompt is submitted.
+This handoff remains deliberately non-runnable by itself. It does not create an
+agent dispatch, queue advancement, call Herdr, change workflow state, or mutate
+Linear. The live planning dispatch composes it with the separate Linear
+transition to `In Progress`, authoritative read-back, durable dispatch identity,
+and final verification immediately before the prompt is submitted.
 
 The Linear transition is now isolated behind `OrbitIssueTransitioner`; the
 read-only `OrbitIssueProvider` contract remains unchanged. The SSH adapter
@@ -667,9 +678,8 @@ resolves exactly one team state named `In Progress`, sends only that state
 mutation through the installed Hermes controller RPC, and always performs an
 authoritative read-back. A lost or failed mutation response is accepted only
 when the read-back proves the exact state ID, name, type, unchanged ownership,
-and unchanged planning contract. This primitive is not yet wired to a delivery
-or dispatch, so it cannot mutate Linear until the durable live-planning stage
-explicitly invokes it.
+and unchanged planning contract. The durable live-planning stage invokes this
+primitive only after it has recorded the exact delivery and dispatch boundary.
 
 The live ledger identity is `orbit-feature` version 1, with `planning` as its
 initial phase. `StartOrbitDelivery` validates an enabled discovery-mode Orbit
@@ -684,8 +694,9 @@ path therefore uses its real `Delivery` and `PhaseRun` instead of a second
 planning-only ledger. The explicit `delivery:start-orbit` boundary resolves the
 same uppercase issue key accepted by `bin/loop`, holds the shared controller
 reservation through preparation, and queues the generic advancement entry
-point. The normal `bin/loop` start still belongs to the legacy controller until
-a live Commander canary passes.
+point. After the successful ORB-73 live canary, the normal `bin/loop` start
+delegates only explicit Commander-owned issues to this boundary. All other
+starts still belong to the legacy controller.
 
 ### Project registry boundary
 

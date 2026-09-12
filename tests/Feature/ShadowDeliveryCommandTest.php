@@ -15,6 +15,7 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\ShadowWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -360,6 +361,121 @@ it('refuses a duplicate active live Orbit delivery before resolving the issue ag
         ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234']);
     Queue::assertNothingPushed();
     Process::assertRanTimes(fn () => true, 5);
+});
+
+it('reports an existing active delivery as success for an idempotent entry point retry', function () {
+    $arguments = runOrbitCommand('orbit', 'ORB-234');
+    $this->artisan('delivery:start-orbit', $arguments)->assertSuccessful();
+    Queue::fake();
+
+    $this->artisan('delivery:start-orbit', [...$arguments, '--idempotent' => true])
+        ->expectsOutput('Orbit delivery 1 is already active for ORB-234 in project orbit.')
+        ->assertSuccessful();
+
+    expect(Delivery::count())->toBe(1)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234']);
+    Queue::assertNothingPushed();
+    Process::assertRanTimes(fn () => true, 5);
+});
+
+it('reconciles an idempotent retry when the active delivery appears under the reservation', function () {
+    $lockPath = $this->commonDirectory.'/orbit-delivery/v1/orb-234/controller.lock';
+    File::makeDirectory(dirname($lockPath), 0755, true);
+    $handle = fopen($lockPath, 'c+');
+
+    if ($handle === false || ! flock($handle, LOCK_EX | LOCK_NB)) {
+        throw new RuntimeException('Could not create the test controller reservation.');
+    }
+
+    $reservation = new OrbitDeliveryReservation($handle, $lockPath);
+    $repository = mock(OrbitRepository::class);
+    $repository->expects('reserveDelivery')
+        ->once()
+        ->andReturnUsing(function () use ($reservation): OrbitDeliveryReservation {
+            Delivery::query()->create([
+                'project_orchestration_id' => $this->project->id,
+                'external_issue_provider' => 'linear',
+                'external_issue_id' => shadowIssueId(),
+                'external_issue_key' => 'ORB-234',
+                'workflow_type' => OrbitFeatureWorkflow::TYPE,
+                'workflow_version' => OrbitFeatureWorkflow::VERSION,
+                'status' => DeliveryStatus::Preparing,
+                'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+                'branch' => 'orb-234',
+                'worktree_path' => $this->worktree,
+                'candidate_sha' => $this->headSha,
+            ]);
+
+            return $reservation;
+        });
+    app()->instance(OrbitRepository::class, $repository);
+
+    $this->artisan('delivery:start-orbit', [
+        ...runOrbitCommand('orbit', 'ORB-234'),
+        '--idempotent' => true,
+    ])->expectsOutput('Orbit delivery 1 is already active for ORB-234 in project orbit.')
+        ->assertSuccessful();
+
+    expect(Delivery::count())->toBe(1)
+        ->and($this->issueProvider->resolveRequests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
+});
+
+it('does not accept a different workflow as the idempotent live delivery', function () {
+    Delivery::query()->create([
+        'project_orchestration_id' => $this->project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => shadowIssueId(),
+        'external_issue_key' => 'ORB-234',
+        'workflow_type' => ShadowWorkflow::TYPE,
+        'workflow_version' => ShadowWorkflow::VERSION,
+        'status' => DeliveryStatus::Preparing,
+        'current_phase' => 'herdr_test',
+        'branch' => 'shadow-orb-234',
+        'worktree_path' => $this->worktreeRoot.'/shadow-orb-234',
+        'candidate_sha' => $this->headSha,
+    ]);
+
+    $this->artisan('delivery:start-orbit', [
+        ...runOrbitCommand('orbit', 'ORB-234'),
+        '--idempotent' => true,
+    ])->expectsOutput('An active delivery already exists for [ORB-234].')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(1)
+        ->and($this->issueProvider->resolveRequests)->toBe([]);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+});
+
+it('reconciles an idempotent retry by issue id before worktree preparation', function () {
+    Delivery::query()->create([
+        'project_orchestration_id' => $this->project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => shadowIssueId(),
+        'external_issue_key' => null,
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Preparing,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'branch' => 'orb-234',
+        'worktree_path' => $this->worktree,
+        'candidate_sha' => $this->headSha,
+    ]);
+
+    $this->artisan('delivery:start-orbit', [
+        ...runOrbitCommand('orbit', 'ORB-234'),
+        '--idempotent' => true,
+    ])->expectsOutput('Orbit delivery 1 is already active for ORB-234 in project orbit.')
+        ->assertSuccessful();
+
+    expect(Delivery::count())->toBe(1)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234']);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
 });
 
 it('does not start a live Orbit delivery when key resolution fails', function () {

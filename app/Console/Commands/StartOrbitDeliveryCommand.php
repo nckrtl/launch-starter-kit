@@ -16,6 +16,7 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\Delivery;
 use App\Models\ProjectOrchestration;
@@ -30,6 +31,7 @@ use InvalidArgumentException;
 #[Signature('delivery:start-orbit
     {project : Configured project slug}
     {issue-key : Human-readable issue key, for example ORB-234}
+    {--idempotent : Treat an existing active delivery as success}
     {--force : Run without confirmation in production}')]
 #[Description('Start one live Orbit feature delivery through Commander')]
 final class StartOrbitDeliveryCommand extends Command
@@ -97,10 +99,10 @@ final class StartOrbitDeliveryCommand extends Command
             return self::FAILURE;
         }
 
-        if ($this->hasActiveDeliveryForKey($project, $input['issue_key'])) {
-            $this->error("An active delivery already exists for [{$input['issue_key']}].");
+        $active = $this->activeDeliveryForKey($project, $input['issue_key']);
 
-            return self::FAILURE;
+        if ($active !== null) {
+            return $this->existingDelivery($active, $input['project'], $input['issue_key']);
         }
 
         $reservation = null;
@@ -108,10 +110,10 @@ final class StartOrbitDeliveryCommand extends Command
         try {
             $reservation = $repository->reserveDelivery($config, $input['issue_key']);
 
-            if ($this->hasActiveDeliveryForKey($project, $input['issue_key'])) {
-                $this->error("An active delivery already exists for [{$input['issue_key']}].");
+            $active = $this->activeDeliveryForKey($project, $input['issue_key']);
 
-                return self::FAILURE;
+            if ($active !== null) {
+                return $this->existingDelivery($active, $input['project'], $input['issue_key']);
             }
 
             $issue = $resolver->resolve($input['issue_key']);
@@ -122,10 +124,10 @@ final class StartOrbitDeliveryCommand extends Command
                 return self::FAILURE;
             }
 
-            if ($this->hasActiveDeliveryForId($project, $issue->issueId)) {
-                $this->error("An active delivery already exists for [{$input['issue_key']}].");
+            $active = $this->activeDeliveryForId($project, $issue->issueId);
 
-                return self::FAILURE;
+            if ($active !== null) {
+                return $this->existingDelivery($active, $input['project'], $input['issue_key']);
             }
 
             $retiredWorktree = $retireStaleWorktree->handle($config, $issue);
@@ -163,25 +165,40 @@ final class StartOrbitDeliveryCommand extends Command
     }
 
     /** @phpstan-impure */
-    private function hasActiveDeliveryForKey(ProjectOrchestration $project, string $issueKey): bool
+    private function activeDeliveryForKey(ProjectOrchestration $project, string $issueKey): ?Delivery
     {
         return Delivery::query()
             ->whereBelongsTo($project)
             ->where('external_issue_provider', 'linear')
             ->where('external_issue_key', $issueKey)
             ->active()
-            ->exists();
+            ->first();
     }
 
     /** @phpstan-impure */
-    private function hasActiveDeliveryForId(ProjectOrchestration $project, string $issueId): bool
+    private function activeDeliveryForId(ProjectOrchestration $project, string $issueId): ?Delivery
     {
         return Delivery::query()
             ->whereBelongsTo($project)
             ->where('external_issue_provider', 'linear')
             ->where('external_issue_id', $issueId)
             ->active()
-            ->exists();
+            ->first();
+    }
+
+    private function existingDelivery(Delivery $delivery, string $project, string $issueKey): int
+    {
+        if ($this->option('idempotent') !== true
+            || $delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+            || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION) {
+            $this->error("An active delivery already exists for [{$issueKey}].");
+
+            return self::FAILURE;
+        }
+
+        $this->info("Orbit delivery {$delivery->id} is already active for {$issueKey} in project {$project}.");
+
+        return self::SUCCESS;
     }
 
     /** @param array<string, mixed> $payload */
