@@ -206,7 +206,12 @@ final class CorrectionDispatchHerdrRuntime implements HerdrRuntime
             ($this->beforePromptReturn)();
         }
 
-        return correctionAgent($this->agent->workingDirectory, 'working', 42);
+        return correctionAgent(
+            $this->agent->workingDirectory,
+            'working',
+            42,
+            agentId: $this->agent->agentId,
+        );
     }
 
     public function getAgent(string $name): HerdrAgentIdentifiers
@@ -221,14 +226,19 @@ final class CorrectionDispatchHerdrRuntime implements HerdrRuntime
     }
 }
 
-function correctionAgent(?string $cwd, string $status, int $sequence = 41, string $pane = 'builder-pane'): HerdrAgentIdentifiers
-{
+function correctionAgent(
+    ?string $cwd,
+    string $status,
+    int $sequence = 41,
+    string $pane = 'builder-pane',
+    ?string $agentId = 'builder-agent-id',
+): HerdrAgentIdentifiers {
     return new HerdrAgentIdentifiers(
         'workspace-1',
         'tab-1',
         $pane,
         'builder-terminal',
-        'builder-agent-id',
+        $agentId,
         'orb-234-loop-builder',
         $sequence,
         $cwd,
@@ -410,6 +420,30 @@ it('prompts the exact retained Builder with immutable review findings', function
     app(DispatchOrbitPlanningCorrection::class)->handle($this->delivery->id);
     expect($this->herdr->calls)->toBe(['get', 'prompt'])
         ->and(AgentDispatch::where('herdr_pane_id', 'builder-pane')->count())->toBe(2);
+});
+
+it('prompts the retained Builder without protocol agent ids', function () {
+    $this->builder->forceFill(['herdr_agent_id' => null])->save();
+    $this->herdr->agent = correctionAgent($this->worktree, 'done', agentId: null);
+
+    $dispatch = app(DispatchOrbitPlanningCorrection::class)->handle($this->delivery->id);
+
+    expect($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->herdr_agent_id)->toBeNull()
+        ->and($dispatch->herdr_pane_id)->toBe($this->builder->herdr_pane_id)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
+});
+
+it('adopts a newly available protocol agent id for the retained Builder', function () {
+    $this->builder->forceFill(['herdr_agent_id' => null])->save();
+
+    $dispatch = app(DispatchOrbitPlanningCorrection::class)->handle($this->delivery->id);
+
+    expect($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->herdr_agent_id)->toBe('builder-agent-id')
+        ->and($dispatch->herdr_pane_id)->toBe($this->builder->herdr_pane_id);
 });
 
 it('correlates retained Builder completion to the correction dispatch', function () {

@@ -335,7 +335,9 @@ final readonly class DispatchOrbitPlanningCorrection
             && $agent->tabId === $builder->herdr_tab_id
             && $agent->paneId === $builder->herdr_pane_id
             && $agent->terminalId === $builder->herdr_terminal_id
-            && $agent->agentId === $builder->herdr_agent_id
+            && ($agent->agentId === null
+                || $builder->herdr_agent_id === null
+                || $agent->agentId === $builder->herdr_agent_id)
             && $agent->agentName === $builder->herdr_agent_name
             && $agent->workingDirectory === $preparation->worktree->path
             && in_array($agent->agentStatus, ['idle', 'done'], true);
@@ -541,8 +543,7 @@ final readonly class DispatchOrbitPlanningCorrection
             || $dispatch->herdr_tab_id !== $builder->herdr_tab_id
             || $dispatch->herdr_pane_id !== $builder->herdr_pane_id
             || $dispatch->herdr_terminal_id !== $builder->herdr_terminal_id
-            || $dispatch->herdr_agent_id !== $builder->herdr_agent_id
-            || $dispatch->herdr_agent_name !== $builder->herdr_agent_name) {
+            || ! $this->sameStoredAgent($dispatch, $builder)) {
             throw new OrbitPlanningDispatchFailed('The planning-correction ledger changed before prompting.');
         }
     }
@@ -603,8 +604,7 @@ final readonly class DispatchOrbitPlanningCorrection
             || $builder->herdr_workspace_id === null
             || $builder->herdr_tab_id === null
             || $builder->herdr_pane_id === null
-            || $builder->herdr_terminal_id === null
-            || $builder->herdr_agent_id === null) {
+            || $builder->herdr_terminal_id === null) {
             throw new OrbitPlanningDispatchFailed('The planning correction has no exact retained Builder.');
         }
 
@@ -640,6 +640,19 @@ final readonly class DispatchOrbitPlanningCorrection
                 || $dispatch->herdr_agent_id === null
                 || $agent->agentId === $dispatch->herdr_agent_id)
             && $agent->agentName === $dispatch->herdr_agent_name;
+    }
+
+    private function sameStoredAgent(AgentDispatch $left, AgentDispatch $right): bool
+    {
+        return $left->herdr_session === $right->herdr_session
+            && $left->herdr_workspace_id === $right->herdr_workspace_id
+            && $left->herdr_tab_id === $right->herdr_tab_id
+            && $left->herdr_pane_id === $right->herdr_pane_id
+            && $left->herdr_terminal_id === $right->herdr_terminal_id
+            && ($left->herdr_agent_id === null
+                || $right->herdr_agent_id === null
+                || $left->herdr_agent_id === $right->herdr_agent_id)
+            && $left->herdr_agent_name === $right->herdr_agent_name;
     }
 
     private function receiptCommand(PhaseRun $phase, AgentDispatch $dispatch): string
