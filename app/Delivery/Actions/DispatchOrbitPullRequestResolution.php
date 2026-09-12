@@ -13,7 +13,6 @@ use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
 use App\Delivery\Data\OrbitDeliveryPreparation;
-use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
@@ -224,7 +223,7 @@ final readonly class DispatchOrbitPullRequestResolution
                 || ! in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing, DeliveryStatus::WaitingForAgent], true)
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || $phase->attempt !== 1
+                || $phase->attempt < 1
                 || $dispatches->count() !== 1
                 || $dispatch->agent_role !== OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
                 || $dispatch->prompt_name !== 'orbit_resolution'
@@ -312,7 +311,7 @@ final readonly class DispatchOrbitPullRequestResolution
                 || ! in_array($delivery->status, [DeliveryStatus::Preparing, DeliveryStatus::WaitingForAgent], true)
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || $phase->attempt !== 1
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Running
                 || $dispatch->phase_run_id !== $phase->id
                 || ! in_array($dispatch->status, [
@@ -342,11 +341,100 @@ final readonly class DispatchOrbitPullRequestResolution
             : null;
         $review = is_array($input) ? $this->map($input['pr_review_receipt'] ?? null) : null;
         $publishedReview = is_array($input) ? $this->map($input['published_review'] ?? null) : null;
+        $pullRequestEvidence = is_array($input) ? ($input['pull_request'] ?? null) : null;
 
-        if (! is_array($implementation) || ! is_array($review) || ! is_array($publishedReview)) {
+        if (! is_array($implementation)) {
             throw new OrbitResolutionDispatchFailed('The resolution evidence is malformed.');
         }
 
+        if ($review === null) {
+            $this->verifyImplementationResolution(
+                $delivery,
+                $config,
+                $preparation,
+                $implementation,
+                $pullRequestEvidence,
+            );
+            $this->assertCurrentIssue($delivery, $preparation, false);
+
+            return;
+        }
+
+        if (! is_array($pullRequestEvidence)
+            || array_is_list($pullRequestEvidence)
+            || ($pullRequestEvidence['mergeable'] ?? null) !== true) {
+            throw new OrbitResolutionDispatchFailed('The resolution pull request evidence is malformed.');
+        }
+
+        $this->verifyImplementationAndPullRequest(
+            $delivery,
+            $config,
+            $preparation,
+            $implementation,
+            true,
+        );
+
+        $result = $review['result'] ?? null;
+
+        if ($result === 'changes') {
+            if (! is_array($publishedReview)) {
+                throw new OrbitResolutionDispatchFailed('The published review evidence is malformed.');
+            }
+
+            $this->verifyPublishedReview($implementation, $review, $publishedReview);
+        } elseif ($result !== 'blocked' || $publishedReview !== null) {
+            throw new OrbitResolutionDispatchFailed('The resolution review evidence is malformed.');
+        }
+
+        $this->assertCurrentIssue($delivery, $preparation, true);
+    }
+
+    /**
+     * @param  array<string, mixed>  $implementation
+     */
+    private function verifyImplementationResolution(
+        Delivery $delivery,
+        OrbitProjectConfig $config,
+        OrbitDeliveryPreparation $preparation,
+        array $implementation,
+        mixed $pullRequestEvidence,
+    ): void {
+        $result = $implementation['result'] ?? null;
+
+        if ($result === 'blocked') {
+            if ($pullRequestEvidence !== null) {
+                throw new OrbitResolutionDispatchFailed('The blocked implementation pull request evidence is malformed.');
+            }
+
+            return;
+        }
+
+        if ($result !== 'ready'
+            || ! is_array($pullRequestEvidence)
+            || array_is_list($pullRequestEvidence)
+            || ($pullRequestEvidence['mergeable'] ?? null) !== false) {
+            throw new OrbitResolutionDispatchFailed('The implementation resolution evidence is malformed.');
+        }
+
+        $this->verifyImplementationAndPullRequest(
+            $delivery,
+            $config,
+            $preparation,
+            $implementation,
+            false,
+        );
+    }
+
+    /**
+     * @param  array<string, mixed>  $implementation
+     */
+    private function verifyImplementationAndPullRequest(
+        Delivery $delivery,
+        OrbitProjectConfig $config,
+        OrbitDeliveryPreparation $preparation,
+        array $implementation,
+        bool $expectedMergeable,
+    ): void {
         $body = $this->string($implementation, 'pull_request_body');
         $candidate = $this->sha($implementation, 'candidate_sha');
         $verified = $this->implementations->verifyImplementationOutcome(
@@ -387,11 +475,25 @@ final readonly class DispatchOrbitPullRequestResolution
             || $pullRequest->url !== $delivery->pull_request_url
             || $pullRequest->candidateSha !== $candidate
             || $pullRequest->bodyHash !== hash('sha256', $body)
-            || $pullRequest->mergeable !== true) {
+            || $pullRequest->mergeable !== $expectedMergeable) {
             throw new OrbitResolutionDispatchFailed(
                 'The published pull request no longer matches the resolution evidence.',
             );
         }
+    }
+
+    /**
+     * @param  array<string, mixed>  $implementation
+     * @param  array<string, mixed>  $review
+     * @param  array<string, mixed>  $publishedReview
+     */
+    private function verifyPublishedReview(
+        array $implementation,
+        array $review,
+        array $publishedReview,
+    ): void {
+        $body = $this->string($implementation, 'pull_request_body');
+        $candidate = $this->sha($implementation, 'candidate_sha');
 
         if (! is_int($publishedReview['id'] ?? null) || $publishedReview['id'] < 1
             || ($publishedReview['reviewer_login'] ?? null) !== 'tom-nckrtl[bot]'
@@ -403,23 +505,30 @@ final readonly class DispatchOrbitPullRequestResolution
                 'The published review no longer matches the resolution evidence.',
             );
         }
-
-        $issue = $this->issues->fetchActive(
-            $preparation->snapshot->issueId,
-            $preparation->snapshot->issueKey,
-        );
-        $this->assertCurrentIssue($delivery, $preparation, $issue);
     }
 
     private function assertCurrentIssue(
         Delivery $delivery,
         OrbitDeliveryPreparation $preparation,
-        OrbitIssueSnapshot $issue,
+        bool $inReview,
     ): void {
+        $issue = $this->issues->fetchActive(
+            $preparation->snapshot->issueId,
+            $preparation->snapshot->issueKey,
+        );
         $state = $issue->payload['state'] ?? null;
         $delegate = $issue->payload['delegate'] ?? null;
         $assignee = $issue->payload['assignee'] ?? null;
         $viewerId = config('commander.hermes.tom_linear_viewer_id');
+        $nickId = config('commander.hermes.nick_linear_user_id');
+        $validState = is_array($state)
+            && ($state['type'] ?? null) === 'started'
+            && ($inReview
+                ? ($state['name'] ?? null) === 'In Review'
+                : in_array($state['name'] ?? null, ['In Progress', 'In Review'], true));
+        $validAssignee = $inReview
+            ? $assignee === null
+            : $assignee === null || (is_array($assignee) && ($assignee['id'] ?? null) === $nickId);
 
         if ($issue->issueId !== $preparation->snapshot->issueId
             || $issue->issueKey !== $preparation->snapshot->issueKey
@@ -428,14 +537,12 @@ final readonly class DispatchOrbitPullRequestResolution
                 $preparation->snapshot->contractHash,
                 $delivery->pull_request_url,
             )
-            || ! is_string($viewerId)
-            || ! is_array($state)
-            || ($state['type'] ?? null) !== 'started'
-            || ($state['name'] ?? null) !== 'In Review'
+            || ! is_string($viewerId) || ! is_string($nickId)
+            || ! $validState
             || ! is_array($delegate)
             || ($delegate['id'] ?? null) !== $viewerId
             || ! array_key_exists('assignee', $issue->payload)
-            || $assignee !== null) {
+            || ! $validAssignee) {
             throw new OrbitResolutionDispatchFailed(
                 'The Orbit issue changed before resolution dispatch.',
             );

@@ -73,7 +73,7 @@ final class SubmitOrbitImplementationReceiptCommand extends Command
                     && $dispatch->status === AgentDispatchStatus::Starting
                     && $dispatch->error_code === 'herdr_prompt_attempted'))
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            || ! in_array($phaseRun->attempt, [1, 2], true)
+            || $phaseRun->attempt < 1
             || $phaseRun->status !== PhaseRunStatus::Running
             || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
             || (! ($dispatch->status === AgentDispatchStatus::Starting

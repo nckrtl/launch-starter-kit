@@ -113,12 +113,12 @@ final readonly class AdvanceDeliveryAction
                     ->latest('attempt')
                     ->first()
                 : null;
-            if (in_array($implementation?->attempt, [1, 2], true)
+            if ($implementation !== null
                 && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                 DispatchOrbitImplementation::dispatch($deliveryId)->afterCommit();
             }
 
-            if (in_array($implementation?->attempt, [1, 2], true)
+            if ($implementation !== null
                 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 AdvanceOrbitImplementationJob::dispatch($deliveryId, $implementation->id)->afterCommit();
             }
@@ -130,12 +130,12 @@ final readonly class AdvanceDeliveryAction
                     ->first()
                 : null;
 
-            if (in_array($pullRequestReview?->attempt, [1, 2], true)
+            if ($pullRequestReview !== null
                 && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                 DispatchOrbitPullRequestReview::dispatch($deliveryId, $pullRequestReview->id)->afterCommit();
             }
 
-            if (in_array($pullRequestReview?->attempt, [1, 2], true)
+            if ($pullRequestReview !== null
                 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 AdvanceOrbitPullRequestReviewJob::dispatch($deliveryId, $pullRequestReview->id)->afterCommit();
             }
@@ -147,18 +147,18 @@ final readonly class AdvanceDeliveryAction
                     ->first()
                 : null;
 
-            if ($resolution?->attempt === 1
+            if ($resolution !== null
                 && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
                 DispatchOrbitPullRequestResolution::dispatch($deliveryId, $resolution->id)->afterCommit();
             }
 
-            if ($resolution?->attempt === 1 && $delivery->status === DeliveryStatus::WaitingForAgent) {
+            if ($resolution !== null && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 $this->advanceOrbitResolution($deliveryId, $resolution->id);
                 $delivery->refresh();
                 $resolution->refresh();
             }
 
-            if ($resolution?->attempt === 1
+            if ($resolution !== null
                 && $delivery->status === DeliveryStatus::Blocked
                 && ($delivery->failure_details['code'] ?? null) === 'resolution_proposal_ready') {
                 AdvanceOrbitResolutionJob::dispatch($deliveryId, $resolution->id)->afterCommit();
@@ -334,7 +334,7 @@ final readonly class AdvanceDeliveryAction
                 || $delivery->status !== DeliveryStatus::WaitingForAgent
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || $phase->attempt !== 1
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Running
                 || $phase->finished_at !== null
                 || $dispatches->count() !== 1

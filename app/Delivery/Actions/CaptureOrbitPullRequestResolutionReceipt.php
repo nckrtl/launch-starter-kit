@@ -85,7 +85,7 @@ final readonly class CaptureOrbitPullRequestResolutionReceipt
                         && $lockedDispatch->error_code === 'herdr_prompt_attempted'))
                 || $lockedPhase->delivery_id !== $delivery->id
                 || $lockedPhase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || $lockedPhase->attempt !== 1
+                || $lockedPhase->attempt < 1
                 || $lockedPhase->status !== PhaseRunStatus::Running
                 || $lockedPhase->finished_at !== null
                 || $phaseDispatches->count() !== 1

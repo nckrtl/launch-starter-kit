@@ -153,7 +153,7 @@ final readonly class AdvanceOrbitResolution
                 || $latestResolution?->id !== $phase->id
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || $phase->attempt !== 1
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Completed
                 || $phase->finished_at === null
                 || $phase->output !== ['receipt_id' => $receipt->id, 'result' => 'proposal']
@@ -252,7 +252,7 @@ final readonly class AdvanceOrbitResolution
                 || $latestResolution?->id !== $phase->id
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || $phase->attempt !== 1
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Completed
                 || $phase->finished_at === null
                 || $phase->current_block !== 'resolution_publication'
@@ -375,7 +375,7 @@ final readonly class AdvanceOrbitResolution
                 || $latestResolution?->id !== $phase->id
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || $phase->attempt !== 1
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Completed
                 || $phase->finished_at === null
                 || $phase->current_block !== 'resolution_publication'
@@ -465,7 +465,7 @@ final readonly class AdvanceOrbitResolution
             || $delivery->status !== DeliveryStatus::Blocked
             || $phase->delivery_id !== $delivery->id
             || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-            || $phase->attempt !== 1
+            || $phase->attempt < 1
             || $phase->status !== PhaseRunStatus::Completed
             || $phase->finished_at === null
             || $phase->current_block !== null

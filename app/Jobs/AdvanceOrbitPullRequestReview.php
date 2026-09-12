@@ -92,7 +92,7 @@ final class AdvanceOrbitPullRequestReview implements ShouldQueue, ShouldQueueAft
                 ->first();
 
             if ($phase === null || $phase->id !== $this->phaseRunId
-                || $phase->attempt !== 1 || $phase->status !== PhaseRunStatus::Running) {
+                || $phase->attempt < 1 || $phase->status !== PhaseRunStatus::Running) {
                 return;
             }
 

@@ -278,7 +278,7 @@ final readonly class ReconcileOrbitPullRequestReviewWait
             || $latestReview?->id !== $phase->id
             || $phase->delivery_id !== $delivery->id
             || $phase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || ! in_array($phase->attempt, [1, 2], true)
+            || $phase->attempt < 1
             || $phase->status !== PhaseRunStatus::Running
             || $phase->failure_code !== null
             || $phase->failure_message !== null

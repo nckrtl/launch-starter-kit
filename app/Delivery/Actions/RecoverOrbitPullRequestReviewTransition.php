@@ -49,12 +49,21 @@ final readonly class RecoverOrbitPullRequestReviewTransition
             $preparation->snapshot->issueId,
             $preparation->snapshot->issueKey,
         );
-        $this->assertExactActiveState($delivery, $preparation, $issue, 'In Review');
         $failure = $delivery->failure_details;
         $failureCode = is_array($failure) ? ($failure['code'] ?? null) : null;
         $mergeable = true;
 
         if ($failureCode === 'pr_review_mergeability_changed') {
+            $state = $issue->payload['state'] ?? null;
+            $stateName = is_array($state) ? ($state['name'] ?? null) : null;
+
+            if (! is_string($stateName) || ! in_array($stateName, ['In Review', 'In Progress'], true)) {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'Linear does not confirm an exact active state and ownership for recovery.',
+                );
+            }
+
+            $this->assertExactActiveState($delivery, $preparation, $issue, $stateName);
             $phase = $delivery->phaseRuns()
                 ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
                 ->latest('attempt')
@@ -63,22 +72,30 @@ final readonly class RecoverOrbitPullRequestReviewTransition
             $mergeable = $this->inspectPullRequest($delivery, $source);
 
             if (! $mergeable) {
-                try {
-                    $issue = $this->transitions->transitionToInProgress($issue, $issue->contractHash);
-                } catch (OrbitIssueTransitionFailed $exception) {
-                    throw new OrbitPullRequestReviewDispatchFailed(
-                        'The Linear merge-conflict correction transition could not be verified.',
-                        0,
-                        $exception,
-                    );
+                if ($stateName === 'In Review') {
+                    try {
+                        $issue = $this->transitions->transitionToInProgress($issue, $issue->contractHash);
+                    } catch (OrbitIssueTransitionFailed $exception) {
+                        throw new OrbitPullRequestReviewDispatchFailed(
+                            'The Linear merge-conflict correction transition could not be verified.',
+                            0,
+                            $exception,
+                        );
+                    }
                 }
 
                 $this->assertExactActiveState($delivery, $preparation, $issue, 'In Progress');
+            } elseif ($stateName !== 'In Review') {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'Linear already entered correction while the pull request is mergeable.',
+                );
             }
         } elseif ($failureCode !== 'linear_pr_review_transition_ambiguous') {
             throw new OrbitPullRequestReviewDispatchFailed(
                 'The blocked pull request review failure is not recoverable.',
             );
+        } else {
+            $this->assertExactActiveState($delivery, $preparation, $issue, 'In Review');
         }
         $expectedDispatchStatus = $failureCode === 'linear_pr_review_transition_ambiguous'
             ? AgentDispatchStatus::Ambiguous
@@ -130,7 +147,7 @@ final readonly class RecoverOrbitPullRequestReviewTransition
                 || ! is_array($failure)
                 || ($failure['code'] ?? null) !== $failureCode
                 || $project->state !== ProjectOrchestrationState::Enabled
-                || ! in_array($phase->attempt, [1, 2], true)
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Running
                 || $source === null
                 || $dispatches->count() !== 1
@@ -167,7 +184,7 @@ final readonly class RecoverOrbitPullRequestReviewTransition
                 return $phase;
             }
 
-            if ($phase->attempt !== 1 || $phase->receipts()->exists()) {
+            if ($phase->receipts()->exists()) {
                 throw new OrbitPullRequestReviewDispatchFailed(
                     'The merge-conflicted pull request review cannot enter a Builder correction.',
                 );

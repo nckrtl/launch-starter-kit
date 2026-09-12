@@ -95,7 +95,7 @@ final class SubmitOrbitPullRequestReviewReceiptCommand extends Command
             || $phaseRun->delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
             || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || ! in_array($phaseRun->attempt, [1, 2], true)
+            || $phaseRun->attempt < 1
             || $dispatch->agent_role !== OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
             || (! $active && ! $recovering)) {
             $this->error('The pull request review phase run and dispatch do not match an active reviewer.');

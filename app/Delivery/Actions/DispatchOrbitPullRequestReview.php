@@ -255,7 +255,7 @@ final readonly class DispatchOrbitPullRequestReview
             || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
             || $project->state !== ProjectOrchestrationState::Enabled
-            || ! in_array($phase?->attempt, [1, 2], true)
+            || $phase === null
             || ($expectedPhaseId !== null && $phase->id !== $expectedPhaseId)
             || ! in_array($delivery->status, [
                 DeliveryStatus::Queued,
@@ -300,7 +300,7 @@ final readonly class DispatchOrbitPullRequestReview
                 ->sortByDesc('attempt')
                 ->first();
 
-            if ($phase === null || ! in_array($phase->attempt, [1, 2], true)
+            if ($phase === null || $phase->attempt < 1
                 || ($expectedPhaseId !== null && $phase->id !== $expectedPhaseId)) {
                 throw new OrbitPullRequestReviewDispatchFailed(
                     'The retained Orbit pull request review phase is inconsistent.',
@@ -728,7 +728,7 @@ final readonly class DispatchOrbitPullRequestReview
             || $project->config !== $config->toArray()
             || $phase === null
             || $phase->id !== $phaseId
-            || ! in_array($phase->attempt, [1, 2], true)
+            || $phase->attempt < 1
             || $phase->status !== PhaseRunStatus::Running
             || $phase->receipts()->exists()
             || $phase->agentDispatches()->count() !== 1

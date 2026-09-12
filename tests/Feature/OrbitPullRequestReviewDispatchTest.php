@@ -206,6 +206,8 @@ final class PullRequestReviewDispatchTransitioner implements OrbitIssueTransitio
 
     public ?Closure $afterTransition = null;
 
+    public ?Closure $afterProgressTransition = null;
+
     public function transitionToInProgress(
         OrbitIssueSnapshot $current,
         string $expectedContractHash,
@@ -215,12 +217,19 @@ final class PullRequestReviewDispatchTransitioner implements OrbitIssueTransitio
         $payload = $current->payload;
         $payload['state'] = ['id' => 'state-progress', 'name' => 'In Progress', 'type' => 'started'];
 
-        return new OrbitIssueSnapshot(
+        $transitioned = new OrbitIssueSnapshot(
             $current->issueId,
             $current->issueKey,
             $payload,
             $current->contractHash,
         );
+
+        if ($this->afterProgressTransition instanceof Closure) {
+            ($this->afterProgressTransition)($transitioned);
+            $this->afterProgressTransition = null;
+        }
+
+        return $transitioned;
     }
 
     public function transitionToInReview(
@@ -1471,6 +1480,67 @@ it('routes a newly conflicting pull request back to the retained Builder', funct
         DispatchImplementationJob::class,
         fn (DispatchImplementationJob $job): bool => $job->deliveryId === $this->delivery->id,
     );
+});
+
+it('recovers one Builder correction after crashing following the In Progress transition', function () {
+    $this->pullRequests->mergeable = false;
+    $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Failed,
+        'error_code' => 'pr_review_mergeability_changed',
+        'error_message' => 'The published pull request became unmergeable before independent review.',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'pr_review_mergeability_changed',
+            'dispatch_id' => $this->dispatch->id,
+            'message' => 'The published pull request became unmergeable before independent review.',
+        ],
+    ])->save();
+    addKnownPullRequestAttachment($this);
+    $payload = $this->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+    $payload['assignee'] = null;
+    $this->issues->snapshot = new OrbitIssueSnapshot(
+        $this->issues->snapshot->issueId,
+        $this->issues->snapshot->issueKey,
+        $payload,
+        $this->issues->snapshot->contractHash,
+    );
+    $this->transitions->afterProgressTransition = function (OrbitIssueSnapshot $transitioned): never {
+        $this->issues->snapshot = $transitioned;
+
+        throw new RuntimeException('The process crashed after the Linear transition.');
+    };
+
+    expect(fn () => app(RecoverOrbitPullRequestReviewTransition::class)->handle($this->delivery->id))
+        ->toThrow(RuntimeException::class, 'crashed after the Linear transition');
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->and($this->review->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->transitions->progressCalls)->toBe(1)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->where('attempt', 2)
+            ->doesntExist())->toBeTrue();
+
+    $correction = app(RecoverOrbitPullRequestReviewTransition::class)->handle($this->delivery->id);
+
+    expect($correction->phase_name)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->and($correction->attempt)->toBe(2)
+        ->and($correction->status)->toBe(PhaseRunStatus::Pending)
+        ->and($correction->input['implementation_receipt_id'])->toBe($this->implementationReceipt->id)
+        ->and($correction->input['pull_request']['mergeable'])->toBeFalse()
+        ->and($correction->agentDispatches()->sole()->herdr_agent_name)->toBe('orb-234-loop-builder')
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->and($this->transitions->progressCalls)->toBe(1)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->where('attempt', 2)
+            ->count())->toBe(1);
 });
 
 it('rejects reviewer identity reuse before agent start', function () {

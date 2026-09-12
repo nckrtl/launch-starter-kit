@@ -153,7 +153,7 @@ final readonly class AdvanceOrbitImplementation
             ->latest('attempt')
             ->first();
 
-        if ($phase === null || ! in_array($phase->attempt, [1, 2], true)) {
+        if ($phase === null || $phase->attempt < 1) {
             throw new OrbitImplementationAdvancementFailed('The implementation phase is not running.');
         }
 
@@ -275,7 +275,7 @@ final readonly class AdvanceOrbitImplementation
                 || $phase->delivery_id !== $delivery->id
                 || $latestPhase?->id !== $phase->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-                || ! in_array($phase->attempt, [1, 2], true)
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Running
                 || $dispatch->phase_run_id !== $phase->id
                 || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
@@ -295,9 +295,10 @@ final readonly class AdvanceOrbitImplementation
                 $delivery,
                 $receipt,
                 OrbitFeatureWorkflow::RESOLUTION_PHASE,
-                1,
+                $this->nextResolutionAttempt($delivery),
                 OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
-                strtolower((string) $delivery->external_issue_key).'-loop-resolution-1',
+                strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.
+                    $this->nextResolutionAttempt($delivery),
                 'orbit_resolution',
                 null,
             );
@@ -348,7 +349,7 @@ final readonly class AdvanceOrbitImplementation
                 || $phase->delivery_id !== $delivery->id
                 || $latestPhase?->id !== $phase->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-                || ! in_array($phase->attempt, [1, 2], true)
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Running
                 || $dispatch->phase_run_id !== $phase->id
                 || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
@@ -366,7 +367,7 @@ final readonly class AdvanceOrbitImplementation
                 || $pullRequest->bodyHash !== $verified->pullRequestBodyHash
                 || $pullRequest->number < 1
                 || $pullRequest->url !== "https://github.com/nckrtl/orbit/pull/{$pullRequest->number}"
-                || ($phase->attempt === 2 && ($delivery->pull_request_number !== $pullRequest->number
+                || ($phase->attempt > 1 && ($delivery->pull_request_number !== $pullRequest->number
                     || $delivery->pull_request_url !== $pullRequest->url))) {
                 throw new OrbitImplementationAdvancementFailed(
                     'The published pull request does not match the implementation receipt.',
@@ -432,9 +433,10 @@ final readonly class AdvanceOrbitImplementation
                     $delivery,
                     $receipt,
                     OrbitFeatureWorkflow::RESOLUTION_PHASE,
-                    1,
+                    $this->nextResolutionAttempt($delivery),
                     OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
-                    strtolower((string) $delivery->external_issue_key).'-loop-resolution-1',
+                    strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.
+                        $this->nextResolutionAttempt($delivery),
                     'orbit_resolution',
                     $pullRequest,
                 );
@@ -529,11 +531,11 @@ final readonly class AdvanceOrbitImplementation
             || $project?->state !== ProjectOrchestrationState::Enabled
             || $phase->delivery_id !== $delivery->id
             || $phase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            || ! in_array($phase->attempt, [1, 2], true)
-            || ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE && $next->attempt !== 2)
+            || $phase->attempt < 1
+            || ($delivery->current_phase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+                && $next->attempt !== $phase->attempt + 1)
             || ($delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
                 && $next->attempt !== $this->pullRequestReviewAttempt($phase))
-            || ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE && $next->attempt !== 1)
             || $phase->status !== PhaseRunStatus::Completed || $phase->finished_at === null) {
             throw new OrbitImplementationAdvancementFailed('The retained implementation transition is inconsistent.');
         }
@@ -562,7 +564,7 @@ final readonly class AdvanceOrbitImplementation
                 && $mergeable === true)
             || ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
                 && ($result === 'blocked'
-                    || ($result === 'ready' && $phase->attempt === 2 && $mergeable === false)));
+                    || ($result === 'ready' && $phase->attempt > 1 && $mergeable === false)));
 
         if (! $validRoute) {
             throw new OrbitImplementationAdvancementFailed('The retained implementation route is inconsistent.');
@@ -588,7 +590,7 @@ final readonly class AdvanceOrbitImplementation
         $expectedAgent = match ($delivery->current_phase) {
             OrbitFeatureWorkflow::IMPLEMENTATION_PHASE => strtolower((string) $delivery->external_issue_key).'-loop-builder',
             OrbitFeatureWorkflow::PR_REVIEW_PHASE => strtolower((string) $delivery->external_issue_key).'-loop-pr-review-'.$next->attempt,
-            default => strtolower((string) $delivery->external_issue_key).'-loop-resolution-1',
+            default => strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$next->attempt,
         };
         $expectedPrompt = match ($delivery->current_phase) {
             OrbitFeatureWorkflow::IMPLEMENTATION_PHASE => 'orbit_implementation_correction',
@@ -643,7 +645,7 @@ final readonly class AdvanceOrbitImplementation
         AgentDispatch $dispatch,
         Receipt $receipt,
     ): bool {
-        if ($phase->attempt !== 2) {
+        if ($phase->attempt === 1) {
             return $this->receipts->matches($delivery, $phase, $dispatch, $receipt);
         }
 
@@ -679,22 +681,32 @@ final readonly class AdvanceOrbitImplementation
 
     private function pullRequestReviewAttempt(PhaseRun $implementation): int
     {
-        if ($implementation->attempt !== 2) {
-            return 1;
+        $input = $implementation->input;
+        $review = is_array($input) ? ($input['pr_review_receipt'] ?? null) : null;
+        $reviewAttempt = is_array($review) ? ($review['attempt'] ?? null) : null;
+
+        if (is_int($reviewAttempt) && $reviewAttempt >= 1) {
+            return $reviewAttempt + 1;
         }
 
-        if (is_array($implementation->input)
-            && array_key_exists('pr_review_receipt_id', $implementation->input)) {
-            return 2;
-        }
-
-        return PhaseRun::query()
+        $failedReviewAttempt = PhaseRun::query()
             ->where('delivery_id', $implementation->delivery_id)
             ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
-            ->where('attempt', 1)
             ->where('status', PhaseRunStatus::Failed)
             ->where('failure_code', 'pr_review_mergeability_changed')
-            ->exists() ? 2 : 1;
+            ->latest('attempt')
+            ->value('attempt');
+
+        return is_int($failedReviewAttempt) ? $failedReviewAttempt + 1 : 1;
+    }
+
+    private function nextResolutionAttempt(Delivery $delivery): int
+    {
+        $latest = $delivery->phaseRuns()
+            ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+            ->max('attempt');
+
+        return is_int($latest) ? $latest + 1 : 1;
     }
 
     /** @param array<string, mixed> $payload */

@@ -182,6 +182,19 @@ final class ImplementationCorrectionVerifier implements OrbitImplementationRepos
 {
     public int $calls = 0;
 
+    public string $expectedReviewedCandidateSha;
+
+    public string $expectedCandidateSha;
+
+    public string $expectedArtifactSha;
+
+    public function __construct()
+    {
+        $this->expectedReviewedCandidateSha = str_repeat('b', 40);
+        $this->expectedCandidateSha = str_repeat('c', 40);
+        $this->expectedArtifactSha = str_repeat('d', 40);
+    }
+
     public function verifyImplementationOutcome(
         OrbitProjectConfig $config,
         PreparedWorktree $startupWorktree,
@@ -195,9 +208,9 @@ final class ImplementationCorrectionVerifier implements OrbitImplementationRepos
         $this->calls++;
 
         expect($startupWorktree->headSha)->toBe(str_repeat('a', 40))
-            ->and($reviewedCandidateSha)->toBe(str_repeat('b', 40))
-            ->and($candidateSha)->toBe(str_repeat('c', 40))
-            ->and($artifactSha)->toBe(str_repeat('d', 40));
+            ->and($reviewedCandidateSha)->toBe($this->expectedReviewedCandidateSha)
+            ->and($candidateSha)->toBe($this->expectedCandidateSha)
+            ->and($artifactSha)->toBe($this->expectedArtifactSha);
 
         return new VerifiedOrbitImplementationOutcome(
             candidateSha: $candidateSha,
@@ -676,6 +689,141 @@ function promoteImplementationToMergeConflictCorrection(object $test): void
     $test->implementationVerifier->calls = 0;
 }
 
+function promoteImplementationToThirdCorrection(object $test): void
+{
+    promoteImplementationToMergeConflictCorrection($test);
+    app(DispatchOrbitImplementation::class)->handle($test->delivery->id);
+    $test->correctionDispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    $body = implode("\n", [
+        'Issue: ORB-234',
+        'Candidate: '.str_repeat('e', 40),
+        'Artifact: '.str_repeat('f', 40),
+        'Flow: discovery',
+        'Builder gate: passed (/home/nckrtl/orbit/.git/orbit-checks/correction/result.json)',
+    ]);
+    $payload = [
+        'kind' => 'orbit_implementation', 'schema_version' => 1,
+        'delivery_id' => $test->delivery->id, 'dispatch_id' => $test->correctionDispatch->id,
+        'issue_key' => 'ORB-234', 'phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'attempt' => 2, 'result' => 'ready', 'worktree' => $test->worktree,
+        'reviewed_candidate_sha' => str_repeat('c', 40),
+        'candidate_sha' => str_repeat('e', 40),
+        'handoff_path' => '.loop/runtime/implementation-correction.md',
+        'handoff' => 'The first merge conflict was corrected.',
+        'artifact_sha' => str_repeat('f', 40),
+        'gate_receipt_path' => '/home/nckrtl/orbit/.git/orbit-checks/correction/result.json',
+        'pull_request_body_path' => '.loop/runtime/pull-request-body.md',
+        'pull_request_body' => $body,
+        'pull_request_body_sha256' => hash('sha256', $body),
+        'flow' => 'discovery',
+    ];
+    $test->secondImplementationReceipt = Receipt::query()->create([
+        'phase_run_id' => $test->correction->id,
+        'kind' => 'orbit_implementation',
+        'schema_version' => 1,
+        'payload' => $payload,
+        'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+        'candidate_sha' => str_repeat('e', 40),
+        'validation_status' => ReceiptValidationStatus::Valid,
+        'captured_at' => now(),
+        'validated_at' => now(),
+    ]);
+    $test->correction->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'output' => [
+            'receipt_id' => $test->secondImplementationReceipt->id,
+            'result' => 'ready',
+            'pull_request_number' => 42,
+            'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+            'mergeable' => true,
+        ],
+        'finished_at' => now(),
+    ])->save();
+    $review = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Failed,
+        'input' => [
+            'implementation_receipt_id' => $test->secondImplementationReceipt->id,
+            'implementation_receipt' => $payload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => true,
+            ],
+        ],
+        'failure_code' => 'pr_review_mergeability_changed',
+        'failure_message' => 'The pull request became unmergeable before review.',
+        'started_at' => now(),
+        'finished_at' => now(),
+    ]);
+    AgentDispatch::query()->create([
+        'phase_run_id' => $review->id,
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $test->delivery->id,
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+            2,
+            OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-pr-review-2',
+        'prompt_name' => 'orbit_pr_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('6', 64),
+        'status' => AgentDispatchStatus::Failed,
+        'error_code' => 'pr_review_mergeability_changed',
+        'error_message' => 'The pull request became unmergeable before review.',
+    ]);
+    $test->thirdCorrection = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'attempt' => 3,
+        'status' => PhaseRunStatus::Pending,
+        'input' => [
+            'implementation_receipt_id' => $test->secondImplementationReceipt->id,
+            'implementation_receipt' => $payload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => false,
+            ],
+        ],
+    ]);
+    $test->thirdCorrectionDispatch = AgentDispatch::query()->create([
+        'phase_run_id' => $test->thirdCorrection->id,
+        'agent_role' => OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $test->delivery->id,
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+            3,
+            OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-builder',
+        'prompt_name' => 'orbit_implementation_correction',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Pending,
+    ]);
+    $test->delivery->refresh()->forceFill([
+        'candidate_sha' => str_repeat('e', 40),
+        'current_phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'status' => DeliveryStatus::Queued,
+    ])->save();
+    $test->implementationVerifier->expectedReviewedCandidateSha = str_repeat('c', 40);
+    $test->implementationVerifier->expectedCandidateSha = str_repeat('e', 40);
+    $test->implementationVerifier->expectedArtifactSha = str_repeat('f', 40);
+    $test->repository->calls = [];
+    $test->issues->calls = 0;
+    $test->issues->activeCalls = 0;
+    $test->herdr->calls = [];
+    $test->herdr->prompts = [];
+    $test->implementationVerifier->calls = 0;
+}
+
 function promoteImplementationToPullRequestReviewCorrection(object $test): void
 {
     app(DispatchOrbitImplementation::class)->handle($test->delivery->id);
@@ -974,6 +1122,26 @@ it('prompts the exact retained Builder to correct verified merge conflicts', fun
 
     app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
     expect($this->herdr->calls)->toBe(['get', 'prompt']);
+});
+
+it('prompts implementation attempt three through the exact recursive Builder chain', function () {
+    promoteImplementationToThirdCorrection($this);
+
+    $dispatch = app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
+
+    expect($dispatch->id)->toBe($this->thirdCorrectionDispatch->id)
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->herdr_pane_id)->toBe($this->builder->herdr_pane_id)
+        ->and($this->thirdCorrection->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($this->implementationVerifier->calls)->toBe(2)
+        ->and($this->herdr->prompts[0])->toContain(
+            "delivery:submit-orbit-implementation-receipt {$this->thirdCorrection->id} {$this->thirdCorrectionDispatch->id} --result=ready",
+            '"attempt": 2',
+            str_repeat('e', 40),
+        )
+        ->and($dispatch->prompt_hash)->toBe(hash('sha256', $this->herdr->prompts[0]));
 });
 
 it('returns Linear to In Progress and prompts the retained Builder with immutable review findings', function () {

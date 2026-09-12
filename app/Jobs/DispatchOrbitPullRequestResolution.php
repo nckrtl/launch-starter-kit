@@ -94,7 +94,7 @@ final class DispatchOrbitPullRequestResolution implements ShouldQueue, ShouldQue
                 ->lockForUpdate()
                 ->first();
 
-            if ($phase === null || $phase->id !== $this->phaseRunId || $phase->attempt !== 1
+            if ($phase === null || $phase->id !== $this->phaseRunId || $phase->attempt < 1
                 || ! in_array($phase->status, [PhaseRunStatus::Pending, PhaseRunStatus::Running], true)) {
                 return;
             }

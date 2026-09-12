@@ -271,7 +271,7 @@ final readonly class AdvanceOrbitLanding
             || $phase->agentDispatches()->exists() || $phase->receipts()->exists()
             || $reviewPhase->delivery_id !== $delivery->id
             || $reviewPhase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || ! in_array($reviewPhase->attempt, [1, 2], true)
+            || $reviewPhase->attempt < 1
             || $reviewPhase->status !== PhaseRunStatus::Completed
             || $reviewPhase->finished_at === null || $reviewDispatches->count() !== 1
             || $review->phase_run_id !== $reviewPhase->id

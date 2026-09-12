@@ -16,71 +16,37 @@ final readonly class OrbitPullRequestResolutionReceiptValidator
 {
     public function __construct(
         private OrbitFeatureWorkflow $workflow,
+        private OrbitImplementationReceiptValidator $implementations,
         private OrbitPullRequestReviewReceiptValidator $reviews,
         private OrbitPullRequestReviewSourceValidator $sources,
     ) {}
 
     public function matchesInput(Delivery $delivery, PhaseRun $resolution, AgentDispatch $dispatch): bool
     {
-        $input = $resolution->input;
+        $input = $this->associativeArray($resolution->input);
 
-        if (! is_array($input)
-            || array_keys($input) !== [
+        if ($input === null) {
+            return false;
+        }
+
+        $matchesSource = match (array_keys($input)) {
+            [
                 'pr_review_receipt_id',
                 'pr_review_receipt',
                 'implementation_receipt_id',
                 'implementation_receipt',
                 'pull_request',
                 'published_review',
-            ]) {
-            return false;
-        }
+            ] => $this->matchesReviewInput($delivery, $input),
+            [
+                'implementation_receipt_id',
+                'implementation_receipt',
+                'pull_request',
+            ] => $this->matchesImplementationInput($delivery, $input),
+            default => false,
+        };
 
-        $reviewReceiptId = $input['pr_review_receipt_id'] ?? null;
-        $reviewPayload = $input['pr_review_receipt'] ?? null;
-        $implementationReceiptId = $input['implementation_receipt_id'] ?? null;
-        $implementationPayload = $input['implementation_receipt'] ?? null;
-        $pullRequest = $input['pull_request'] ?? null;
-        $publishedReview = $input['published_review'] ?? null;
-
-        if (! is_int($reviewReceiptId) || ! is_array($reviewPayload) || array_is_list($reviewPayload)
-            || ! is_int($implementationReceiptId) || ! is_array($implementationPayload) || array_is_list($implementationPayload)
-            || ! is_array($pullRequest) || array_is_list($pullRequest)
-            || ! is_array($publishedReview) || array_is_list($publishedReview)) {
-            return false;
-        }
-
-        $reviewReceipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($reviewReceiptId);
-        $review = $reviewReceipt?->phaseRun;
-        $reviewDispatches = $review?->agentDispatches;
-        $reviewDispatch = $reviewDispatches?->first();
-        $source = $review === null ? null : $this->sources->sourceReceipt($delivery, $review, true);
-
-        if ($reviewReceipt === null || $review === null || $reviewDispatches === null || $reviewDispatch === null
-            || $source === null || $source->id !== $implementationReceiptId
-            || $review->delivery_id !== $delivery->id
-            || $review->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || $review->attempt !== 2
-            || $review->status !== PhaseRunStatus::Completed
-            || $review->finished_at === null
-            || $reviewDispatches->count() !== 1
-            || $reviewDispatch->status !== AgentDispatchStatus::Settled
-            || $reviewReceipt->payload !== $reviewPayload
-            || $source->payload !== $implementationPayload
-            || ($reviewPayload['result'] ?? null) !== 'changes'
-            || ($reviewPayload['candidate_sha'] ?? null) !== $delivery->candidate_sha
-            || ($implementationPayload['candidate_sha'] ?? null) !== $delivery->candidate_sha
-            || ! $this->reviews->matches($delivery, $review, $reviewDispatch, $reviewReceipt, true)
-            || $review->output !== [
-                'receipt_id' => $reviewReceipt->id,
-                'result' => 'changes',
-                'published_review' => $publishedReview,
-            ]
-            || $pullRequest !== [
-                'number' => $delivery->pull_request_number,
-                'url' => $delivery->pull_request_url,
-                'mergeable' => true,
-            ]) {
+        if (! $matchesSource) {
             return false;
         }
 
@@ -103,20 +69,168 @@ final readonly class OrbitPullRequestResolutionReceiptValidator
 
         return $resolution->delivery_id === $delivery->id
             && $resolution->phase_name === OrbitFeatureWorkflow::RESOLUTION_PHASE
-            && $resolution->attempt === 1
+            && $resolution->attempt >= 1
             && $resolution->agentDispatches()->count() === 1
             && $dispatch->phase_run_id === $resolution->id
             && $dispatch->agent_role === OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
             && $dispatch->idempotency_key === IdempotencyKey::forDispatch(
                 $delivery->id,
                 OrbitFeatureWorkflow::RESOLUTION_PHASE,
-                1,
+                $resolution->attempt,
                 OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
             )->value
-            && $dispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-resolution-1'
+            && $dispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$resolution->attempt
             && $dispatch->prompt_name === 'orbit_resolution'
             && $dispatch->prompt_version === OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION
             && hash_equals($dispatch->prompt_hash, hash('sha256', $expectedPrompt));
+    }
+
+    /** @return array<string, mixed>|null */
+    private function associativeArray(mixed $value): ?array
+    {
+        if (! is_array($value) || array_is_list($value)) {
+            return null;
+        }
+
+        foreach ($value as $key => $_item) {
+            if (! is_string($key)) {
+                return null;
+            }
+        }
+
+        return $value;
+    }
+
+    /** @param array<string, mixed> $input */
+    private function matchesReviewInput(Delivery $delivery, array $input): bool
+    {
+        $reviewReceiptId = $input['pr_review_receipt_id'] ?? null;
+        $reviewPayload = $input['pr_review_receipt'] ?? null;
+        $implementationReceiptId = $input['implementation_receipt_id'] ?? null;
+        $implementationPayload = $input['implementation_receipt'] ?? null;
+        $pullRequest = $input['pull_request'] ?? null;
+        $publishedReview = $input['published_review'] ?? null;
+
+        $result = is_array($reviewPayload) ? ($reviewPayload['result'] ?? null) : null;
+
+        if (! is_int($reviewReceiptId) || ! is_array($reviewPayload) || array_is_list($reviewPayload)
+            || ! is_int($implementationReceiptId) || ! is_array($implementationPayload) || array_is_list($implementationPayload)
+            || ! is_array($pullRequest) || array_is_list($pullRequest)
+            || ! in_array($result, ['changes', 'blocked'], true)
+            || ($result === 'changes' && (! is_array($publishedReview) || array_is_list($publishedReview)))
+            || ($result === 'blocked' && $publishedReview !== null)) {
+            return false;
+        }
+
+        $reviewReceipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($reviewReceiptId);
+        $review = $reviewReceipt?->phaseRun;
+        $reviewDispatches = $review?->agentDispatches;
+        $reviewDispatch = $reviewDispatches?->first();
+        $source = $review === null ? null : $this->sources->sourceReceipt($delivery, $review, true);
+
+        if ($reviewReceipt === null || $review === null || $reviewDispatches === null || $reviewDispatch === null
+            || $source === null || $source->id !== $implementationReceiptId
+            || $review->delivery_id !== $delivery->id
+            || $review->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            || $review->attempt < 1
+            || $review->status !== PhaseRunStatus::Completed
+            || $review->finished_at === null
+            || $reviewDispatches->count() !== 1
+            || $reviewDispatch->status !== AgentDispatchStatus::Settled
+            || $reviewReceipt->payload !== $reviewPayload
+            || $source->payload !== $implementationPayload
+            || ($reviewPayload['result'] ?? null) !== $result
+            || ($reviewPayload['candidate_sha'] ?? null) !== $delivery->candidate_sha
+            || ($implementationPayload['candidate_sha'] ?? null) !== $delivery->candidate_sha
+            || ! $this->reviews->matches($delivery, $review, $reviewDispatch, $reviewReceipt, true)
+            || $review->output !== [
+                'receipt_id' => $reviewReceipt->id,
+                'result' => $result,
+                'published_review' => $publishedReview,
+            ]
+            || $pullRequest !== [
+                'number' => $delivery->pull_request_number,
+                'url' => $delivery->pull_request_url,
+                'mergeable' => true,
+            ]) {
+            return false;
+        }
+
+        return true;
+    }
+
+    /** @param array<string, mixed> $input */
+    private function matchesImplementationInput(Delivery $delivery, array $input): bool
+    {
+        $receiptId = $input['implementation_receipt_id'] ?? null;
+        $payload = $input['implementation_receipt'] ?? null;
+        $pullRequest = $input['pull_request'] ?? null;
+
+        if (! is_int($receiptId) || ! is_array($payload) || array_is_list($payload)
+            || ($pullRequest !== null && (! is_array($pullRequest) || array_is_list($pullRequest)))) {
+            return false;
+        }
+
+        $receipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($receiptId);
+        $phase = $receipt?->phaseRun;
+        $dispatches = $phase?->agentDispatches;
+        $dispatch = $dispatches?->first();
+        $result = $payload['result'] ?? null;
+        $atStart = $phase === null ? null : $this->implementationDeliveryAtStart($delivery, $phase);
+        $expectedPullRequest = $result === 'ready' ? [
+            'number' => $delivery->pull_request_number,
+            'url' => $delivery->pull_request_url,
+            'mergeable' => false,
+        ] : null;
+        $expectedOutput = $result === 'ready' ? [
+            'receipt_id' => $receipt?->id,
+            'result' => 'ready',
+            'pull_request_number' => $delivery->pull_request_number,
+            'pull_request_url' => $delivery->pull_request_url,
+            'mergeable' => false,
+        ] : [
+            'receipt_id' => $receipt?->id,
+            'result' => 'blocked',
+        ];
+        $expectedCandidate = $result === 'ready'
+            ? ($payload['candidate_sha'] ?? null)
+            : ($payload['reviewed_candidate_sha'] ?? null);
+
+        return $receipt !== null && $phase !== null && $dispatches !== null && $dispatch !== null
+            && $atStart !== null
+            && in_array($result, ['ready', 'blocked'], true)
+            && $phase->delivery_id === $delivery->id
+            && $phase->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
+            && $phase->attempt >= 1
+            && $phase->status === PhaseRunStatus::Completed
+            && $phase->finished_at !== null
+            && $phase->output === $expectedOutput
+            && $dispatches->count() === 1
+            && $dispatch->status === AgentDispatchStatus::Settled
+            && $receipt->payload === $payload
+            && $delivery->candidate_sha === $expectedCandidate
+            && $pullRequest === $expectedPullRequest
+            && $this->implementations->matches($atStart, $phase, $dispatch, $receipt);
+    }
+
+    private function implementationDeliveryAtStart(Delivery $delivery, PhaseRun $implementation): ?Delivery
+    {
+        $input = $implementation->input;
+        $source = is_array($input)
+            ? ($input[$implementation->attempt === 1
+                ? 'plan_review_receipt'
+                : 'implementation_receipt'] ?? null)
+            : null;
+        $candidate = is_array($source) ? ($source['candidate_sha'] ?? null) : null;
+
+        if (! is_string($candidate)) {
+            return null;
+        }
+
+        $atStart = clone $delivery;
+        $atStart->candidate_sha = $candidate;
+
+        return $atStart;
     }
 
     /** @param array<string, mixed> $payload */
@@ -144,7 +258,7 @@ final readonly class OrbitPullRequestResolutionReceiptValidator
             && ($payload['dispatch_id'] ?? null) === $dispatch->id
             && ($payload['issue_key'] ?? null) === $delivery->external_issue_key
             && ($payload['phase'] ?? null) === OrbitFeatureWorkflow::RESOLUTION_PHASE
-            && ($payload['attempt'] ?? null) === 1
+            && ($payload['attempt'] ?? null) === $resolution->attempt
             && in_array($result, ['proposal', 'blocked'], true)
             && ($payload['worktree'] ?? null) === $delivery->worktree_path
             && ($payload['candidate_sha'] ?? null) === $delivery->candidate_sha

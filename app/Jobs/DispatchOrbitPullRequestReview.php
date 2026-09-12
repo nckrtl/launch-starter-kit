@@ -96,7 +96,7 @@ final class DispatchOrbitPullRequestReview implements ShouldQueue, ShouldQueueAf
 
             if ($phase === null
                 || $phase->id !== $this->phaseRunId
-                || $phase->attempt !== 1
+                || $phase->attempt < 1
                 || ! in_array($phase->status, [PhaseRunStatus::Pending, PhaseRunStatus::Running], true)) {
                 return;
             }

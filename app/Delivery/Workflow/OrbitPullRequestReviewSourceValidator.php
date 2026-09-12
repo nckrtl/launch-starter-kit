@@ -54,10 +54,10 @@ final readonly class OrbitPullRequestReviewSourceValidator
         if ($receipt === null || $implementation === null || $dispatch === null
             || $review->delivery_id !== $delivery->id
             || $review->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || ! in_array($review->attempt, [1, 2], true)
+            || $review->attempt < 1
             || $implementation->delivery_id !== $delivery->id
             || $implementation->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            || ! in_array($implementation->attempt, [1, 2], true)
+            || $implementation->attempt < 1
             || $review->attempt !== $this->reviewAttempt($implementation)
             || ! ($latest?->id === $implementation->id
                 || ($retainedTransition && $this->matchesRetainedSuccessor(
@@ -154,7 +154,7 @@ final readonly class OrbitPullRequestReviewSourceValidator
         AgentDispatch $dispatch,
         Receipt $receipt,
     ): bool {
-        if ($implementation->attempt !== 2) {
+        if ($implementation->attempt === 1) {
             return $this->receipts->matches($delivery, $implementation, $dispatch, $receipt);
         }
 
@@ -174,21 +174,22 @@ final readonly class OrbitPullRequestReviewSourceValidator
 
     private function reviewAttempt(PhaseRun $implementation): int
     {
-        if ($implementation->attempt !== 2) {
-            return 1;
+        $input = $implementation->input;
+        $review = is_array($input) ? ($input['pr_review_receipt'] ?? null) : null;
+        $reviewAttempt = is_array($review) ? ($review['attempt'] ?? null) : null;
+
+        if (is_int($reviewAttempt) && $reviewAttempt >= 1) {
+            return $reviewAttempt + 1;
         }
 
-        if (is_array($implementation->input)
-            && array_key_exists('pr_review_receipt_id', $implementation->input)) {
-            return 2;
-        }
-
-        return PhaseRun::query()
+        $failedReviewAttempt = PhaseRun::query()
             ->where('delivery_id', $implementation->delivery_id)
             ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
-            ->where('attempt', 1)
             ->where('status', PhaseRunStatus::Failed)
             ->where('failure_code', 'pr_review_mergeability_changed')
-            ->exists() ? 2 : 1;
+            ->latest('attempt')
+            ->value('attempt');
+
+        return is_int($failedReviewAttempt) ? $failedReviewAttempt + 1 : 1;
     }
 }

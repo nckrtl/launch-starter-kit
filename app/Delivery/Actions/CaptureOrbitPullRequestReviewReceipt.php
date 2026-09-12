@@ -105,7 +105,7 @@ final readonly class CaptureOrbitPullRequestReviewReceipt
                 || $delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
                 || $lockedPhase->delivery_id !== $delivery->id
                 || $lockedPhase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-                || ! in_array($lockedPhase->attempt, [1, 2], true)
+                || $lockedPhase->attempt < 1
                 || $phaseDispatches->count() !== 1
                 || $lockedDispatch->phase_run_id !== $lockedPhase->id
                 || $lockedDispatch->agent_role !== OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
@@ -179,7 +179,7 @@ final readonly class CaptureOrbitPullRequestReviewReceipt
             || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $phase->delivery_id !== $delivery->id
             || $phase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || ! in_array($phase->attempt, [1, 2], true)
+            || $phase->attempt < 1
             || $phase->status !== PhaseRunStatus::Failed
             || $phase->current_block !== null
             || $phase->output !== null

@@ -174,7 +174,7 @@ final readonly class AdvanceOrbitPullRequestReview
         $receipt = $reviewReceipts->first();
         $source = $this->sources->sourceReceipt($delivery, $phase);
 
-        if (! in_array($phase->attempt, [1, 2], true) || $phase->status !== PhaseRunStatus::Running
+        if ($phase->attempt < 1 || $phase->status !== PhaseRunStatus::Running
             || $dispatches->count() !== 1 || $reviewReceipts->count() > 1
             || $dispatch === null
             || $dispatch->agent_role !== OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE) {
@@ -345,7 +345,7 @@ final readonly class AdvanceOrbitPullRequestReview
                 || $latestReview?->id !== $phase->id
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-                || ! in_array($phase->attempt, [1, 2], true)
+                || $phase->attempt < 1
                 || $phase->status !== PhaseRunStatus::Running
                 || $phase->started_at === null
                 || $phase->finished_at !== null
@@ -434,7 +434,7 @@ final readonly class AdvanceOrbitPullRequestReview
                 || $delivery->status !== DeliveryStatus::WaitingForAgent
                 || $phase->delivery_id !== $delivery->id
                 || $phase->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-                || ! in_array($phase->attempt, [1, 2], true) || $phase->status !== PhaseRunStatus::Running
+                || $phase->attempt < 1 || $phase->status !== PhaseRunStatus::Running
                 || $phase->current_block !== ($published === null ? null : 'review_publication')
                 || $dispatch->phase_run_id !== $phase->id
                 || $dispatch->status !== AgentDispatchStatus::Settled
@@ -487,7 +487,11 @@ final readonly class AdvanceOrbitPullRequestReview
                     $source,
                     $input,
                 ),
-                in_array($result, ['changes', 'blocked'], true) => $this->createResolutionIntent($delivery, $input),
+                in_array($result, ['changes', 'blocked'], true) => $this->createResolutionIntent(
+                    $delivery,
+                    $phase,
+                    $input,
+                ),
                 default => throw new OrbitPullRequestReviewAdvancementFailed(
                     'The pull request review result cannot be routed.',
                 ),
@@ -592,13 +596,14 @@ final readonly class AdvanceOrbitPullRequestReview
     }
 
     /** @param array<string, mixed> $input */
-    private function createResolutionIntent(Delivery $delivery, array $input): void
+    private function createResolutionIntent(Delivery $delivery, PhaseRun $review, array $input): void
     {
+        $attempt = $this->nextResolutionAttempt($delivery);
         $phase = PhaseRun::query()->firstOrCreate(
             [
                 'delivery_id' => $delivery->id,
                 'phase_name' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
-                'attempt' => 1,
+                'attempt' => $attempt,
             ],
             ['status' => PhaseRunStatus::Pending, 'input' => $input],
         );
@@ -606,7 +611,7 @@ final readonly class AdvanceOrbitPullRequestReview
             $delivery,
             $phase,
             OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
-            strtolower((string) $delivery->external_issue_key).'-loop-resolution-1',
+            strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$attempt,
             'orbit_resolution',
         );
         $this->assertIntent(
@@ -614,7 +619,7 @@ final readonly class AdvanceOrbitPullRequestReview
             $dispatch,
             $input,
             OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
-            strtolower((string) $delivery->external_issue_key).'-loop-resolution-1',
+            strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$attempt,
             'orbit_resolution',
             'resolution',
         );
@@ -699,7 +704,7 @@ final readonly class AdvanceOrbitPullRequestReview
 
         if ($phase === null || ($expectedPhaseId !== null && $phase->id !== $expectedPhaseId)
             || ! $config instanceof OrbitProjectConfig
-            || ! in_array($phase->attempt, [1, 2], true) || $phase->status !== PhaseRunStatus::Completed
+            || $phase->attempt < 1 || $phase->status !== PhaseRunStatus::Completed
             || $phase->finished_at === null || $phase->current_block !== null
             || $phase->failure_code !== null || $phase->failure_message !== null
             || $phase->failure_details !== null
@@ -759,10 +764,15 @@ final readonly class AdvanceOrbitPullRequestReview
         $nextAttempt = $nextPhase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             ? $sourcePhase->attempt + 1
             : 1;
-        $next = $delivery->phaseRuns()
-            ->where('phase_name', $nextPhase)
-            ->where('attempt', $nextAttempt)
-            ->first();
+        $nextQuery = $delivery->phaseRuns()->where('phase_name', $nextPhase);
+        $next = $nextPhase === OrbitFeatureWorkflow::RESOLUTION_PHASE
+            ? $nextQuery->latest('attempt')->first()
+            : $nextQuery->where('attempt', $nextAttempt)->first();
+
+        if ($next !== null) {
+            $nextAttempt = $next->attempt;
+        }
+
         $expectedStatus = $result === 'approved' ? DeliveryStatus::ReadyToMerge : DeliveryStatus::Queued;
 
         if ($next === null || $next->status !== PhaseRunStatus::Pending || $next->input !== $input
@@ -786,7 +796,7 @@ final readonly class AdvanceOrbitPullRequestReview
             : OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE;
         $agent = $nextPhase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             ? strtolower((string) $delivery->external_issue_key).'-loop-builder'
-            : strtolower((string) $delivery->external_issue_key).'-loop-resolution-1';
+            : strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$nextAttempt;
         $prompt = $nextPhase === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             ? 'orbit_pr_review_correction'
             : 'orbit_resolution';
@@ -815,6 +825,15 @@ final readonly class AdvanceOrbitPullRequestReview
             && $nextDispatch->error_message === null
             && $nextDispatch->dispatched_at === null
             && $nextDispatch->settled_at === null;
+    }
+
+    private function nextResolutionAttempt(Delivery $delivery): int
+    {
+        $latest = $delivery->phaseRuns()
+            ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+            ->max('attempt');
+
+        return is_int($latest) ? $latest + 1 : 1;
     }
 
     /** @return array<string, int|string> */

@@ -40,11 +40,10 @@ final readonly class OrbitImplementationReceiptValidator
 
     public function matchesInput(Delivery $delivery, PhaseRun $implementation): bool
     {
-        return match ($implementation->attempt) {
-            1 => $this->matchesPlanReviewInput($delivery, $implementation),
-            2 => $this->matchesCorrectionInput($delivery, $implementation),
-            default => false,
-        };
+        return $implementation->attempt === 1
+            ? $this->matchesPlanReviewInput($delivery, $implementation)
+            : $implementation->attempt > 1
+                && $this->matchesCorrectionInput($delivery, $implementation);
     }
 
     private function matchesPlanReviewInput(Delivery $delivery, PhaseRun $implementation): bool
@@ -125,20 +124,29 @@ final readonly class OrbitImplementationReceiptValidator
         $sourceDispatches = $source?->agentDispatches;
         $sourceDispatch = $sourceDispatches?->first();
         $sourceCandidate = $payload['candidate_sha'] ?? null;
-        $sourceDelivery = clone $delivery;
-        $sourceDelivery->candidate_sha = is_string($sourceCandidate) ? $sourceCandidate : null;
+        $sourceDelivery = $source === null ? null : $this->deliveryAtStartOf($delivery, $source);
         $preReviewMergeabilityCorrection = ! $isPullRequestReviewCorrection
             && $receipt !== null
             && $this->matchesPreReviewMergeabilityCorrection($delivery, $correction, $receipt);
         $expectedSourceMergeable = $isPullRequestReviewCorrection || $preReviewMergeabilityCorrection;
+        $expectedSourcePrompt = match (true) {
+            $source?->attempt === 1 => 'orbit_implementation',
+            $source !== null && is_array($source->input)
+                && array_key_exists('pr_review_receipt_id', $source->input) => 'orbit_pr_review_correction',
+            default => 'orbit_implementation_correction',
+        };
+        $expectedSourceVersion = $source?->attempt === 1
+            ? OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION
+            : OrbitFeatureWorkflow::IMPLEMENTATION_CORRECTION_PROMPT_VERSION;
 
-        return $receipt !== null && $source !== null && $sourceDispatches !== null && $sourceDispatch !== null
+        return $receipt !== null && $source !== null && $sourceDelivery !== null
+            && $sourceDispatches !== null && $sourceDispatch !== null
             && $correction->delivery_id === $delivery->id
             && $correction->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            && $correction->attempt === 2
+            && $correction->attempt > 1
             && $source->delivery_id === $delivery->id
             && $source->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            && $source->attempt === 1
+            && $source->attempt === $correction->attempt - 1
             && $source->status === PhaseRunStatus::Completed
             && $source->finished_at !== null
             && $source->output === [
@@ -154,12 +162,12 @@ final readonly class OrbitImplementationReceiptValidator
             && $sourceDispatch->idempotency_key === IdempotencyKey::forDispatch(
                 $delivery->id,
                 OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
-                1,
+                $source->attempt,
                 OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
             )->value
             && $sourceDispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-builder'
-            && $sourceDispatch->prompt_name === 'orbit_implementation'
-            && $sourceDispatch->prompt_version === OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION
+            && $sourceDispatch->prompt_name === $expectedSourcePrompt
+            && $sourceDispatch->prompt_version === $expectedSourceVersion
             && preg_match('/^[a-f0-9]{64}$/', $sourceDispatch->prompt_hash) === 1
             && $sourceDispatch->prompt_hash !== str_repeat('0', 64)
             && $sourceDispatch->dispatched_at !== null
@@ -184,20 +192,43 @@ final readonly class OrbitImplementationReceiptValidator
             ));
     }
 
+    private function deliveryAtStartOf(Delivery $delivery, PhaseRun $implementation): ?Delivery
+    {
+        $input = $implementation->input;
+        $source = is_array($input)
+            ? ($input[$implementation->attempt === 1
+                ? 'plan_review_receipt'
+                : 'implementation_receipt'] ?? null)
+            : null;
+        $candidate = is_array($source) ? ($source['candidate_sha'] ?? null) : null;
+
+        if (! is_string($candidate)) {
+            return null;
+        }
+
+        $atStart = clone $delivery;
+        $atStart->candidate_sha = $candidate;
+
+        return $atStart;
+    }
+
     private function matchesPreReviewMergeabilityCorrection(
         Delivery $delivery,
         PhaseRun $correction,
         Receipt $implementationReceipt,
     ): bool {
+        $sourcePhase = $implementationReceipt->phaseRun()->first();
+        $reviewAttempt = $sourcePhase?->attempt;
         $review = $delivery->phaseRuns()
             ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
-            ->where('attempt', 1)
+            ->where('attempt', $reviewAttempt)
             ->first();
         $dispatches = $review?->agentDispatches()->get();
         $dispatch = $dispatches?->first();
 
         return $review !== null && $dispatches !== null && $dispatch !== null
-            && $correction->attempt === 2
+            && is_int($reviewAttempt)
+            && $correction->attempt === $reviewAttempt + 1
             && $review->status === PhaseRunStatus::Failed
             && $review->failure_code === 'pr_review_mergeability_changed'
             && $review->finished_at !== null
@@ -280,7 +311,7 @@ final readonly class OrbitImplementationReceiptValidator
             && $reviewDispatches !== null && $reviewDispatch !== null
             && $review->delivery_id === $delivery->id
             && $review->phase_name === OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            && $review->attempt === 1
+            && $review->attempt === $correction->attempt - 1
             && $review->status === PhaseRunStatus::Completed
             && $review->finished_at !== null
             && $review->current_block === null
@@ -291,10 +322,10 @@ final readonly class OrbitImplementationReceiptValidator
             && $reviewDispatch->idempotency_key === IdempotencyKey::forDispatch(
                 $delivery->id,
                 OrbitFeatureWorkflow::PR_REVIEW_PHASE,
-                1,
+                $review->attempt,
                 OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
             )->value
-            && $reviewDispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-pr-review-1'
+            && $reviewDispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-pr-review-'.$review->attempt
             && $reviewDispatch->prompt_name === 'orbit_pr_review'
             && $reviewDispatch->prompt_version === 1
             && is_string($expectedReviewPrompt)
@@ -319,7 +350,7 @@ final readonly class OrbitImplementationReceiptValidator
             && ($reviewPayload['dispatch_id'] ?? null) === $reviewDispatch->id
             && ($reviewPayload['issue_key'] ?? null) === $delivery->external_issue_key
             && ($reviewPayload['phase'] ?? null) === OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            && ($reviewPayload['attempt'] ?? null) === 1
+            && ($reviewPayload['attempt'] ?? null) === $review->attempt
             && ($reviewPayload['result'] ?? null) === 'changes'
             && ($reviewPayload['worktree'] ?? null) === $delivery->worktree_path
             && ($reviewPayload['candidate_sha'] ?? null) === ($implementationPayload['candidate_sha'] ?? null)

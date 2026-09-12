@@ -68,7 +68,7 @@ final class SubmitOrbitResolutionReceiptCommand extends Command
                     && $dispatch->status === AgentDispatchStatus::Starting
                     && $dispatch->error_code === 'herdr_prompt_attempted'))
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-            || $phaseRun->attempt !== 1
+            || $phaseRun->attempt < 1
             || $phaseRun->status !== PhaseRunStatus::Running
             || $dispatch->agent_role !== OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
             || (! ($dispatch->status === AgentDispatchStatus::Starting

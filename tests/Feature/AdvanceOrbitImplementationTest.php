@@ -3,12 +3,19 @@
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitImplementation;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
+use App\Delivery\Actions\DispatchOrbitPullRequestResolution;
 use App\Delivery\Actions\StartOrbitDelivery;
+use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\HerdrAgentIdentifiers;
+use App\Delivery\Data\HerdrAgentLaunch;
+use App\Delivery\Data\OpenedHerdrWorktree;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
@@ -180,7 +187,7 @@ final class ImplementationAdvancementVerifier implements OrbitImplementationRepo
     }
 }
 
-final class ImplementationAdvancementIssueProvider implements OrbitIssueProvider
+final class ImplementationAdvancementIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
 {
     public int $transactionLevel = 0;
 
@@ -195,13 +202,20 @@ final class ImplementationAdvancementIssueProvider implements OrbitIssueProvider
 
         return $this->snapshot;
     }
+
+    public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        return $this->fetch($issueId, $issueKey);
+    }
 }
 
-final class ImplementationAdvancementPullRequests implements OrbitPullRequestPublisher
+final class ImplementationAdvancementPullRequests implements OrbitPullRequestInspector, OrbitPullRequestPublisher
 {
     public int $transactionLevel = 0;
 
     public int $calls = 0;
+
+    public int $inspectCalls = 0;
 
     public ?Closure $afterPublish = null;
 
@@ -238,6 +252,94 @@ final class ImplementationAdvancementPullRequests implements OrbitPullRequestPub
             candidateSha: $candidateSha,
             bodyHash: hash('sha256', $pullRequestBody),
             mergeable: $this->mergeable,
+        );
+    }
+
+    public function inspect(
+        int $number,
+        string $issueKey,
+        string $candidateSha,
+        string $pullRequestBody,
+    ): PublishedOrbitPullRequest {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($number)->toBe($this->number)
+            ->and($issueKey)->toBe('ORB-234')
+            ->and($candidateSha)->toBe($this->expectedCandidateSha);
+        $this->inspectCalls++;
+
+        return new PublishedOrbitPullRequest(
+            number: $number,
+            url: "https://github.com/nckrtl/orbit/pull/{$number}",
+            candidateSha: $candidateSha,
+            bodyHash: hash('sha256', $pullRequestBody),
+            mergeable: $this->mergeable,
+        );
+    }
+}
+
+final class ImplementationResolutionHerdr implements HerdrRuntime
+{
+    /** @var list<string> */
+    public array $calls = [];
+
+    public function openWorktree(
+        string $repositoryPath,
+        string $worktreePath,
+        ?string $label = null,
+    ): OpenedHerdrWorktree {
+        $this->calls[] = 'open';
+
+        return new OpenedHerdrWorktree(
+            'resolution-workspace',
+            'resolution-tab',
+            'source-pane',
+            'source-terminal',
+            true,
+        );
+    }
+
+    public function splitPane(string $paneId, string $workingDirectory): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'split';
+
+        return $this->identifiers(null, 1);
+    }
+
+    public function startAgent(
+        string $paneId,
+        string $name,
+        ?HerdrAgentLaunch $launch = null,
+    ): HerdrAgentIdentifiers {
+        $this->calls[] = 'start';
+
+        return $this->identifiers('resolution-agent', 2);
+    }
+
+    public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'prompt';
+
+        return $this->identifiers('resolution-agent', 3);
+    }
+
+    public function getAgent(string $name): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'get';
+
+        return $this->identifiers('resolution-agent', 3);
+    }
+
+    private function identifiers(?string $agentId, int $sequence): HerdrAgentIdentifiers
+    {
+        return new HerdrAgentIdentifiers(
+            'resolution-workspace',
+            'resolution-tab',
+            'resolution-pane',
+            'resolution-terminal',
+            $agentId,
+            'orb-234-loop-resolution-1',
+            $sequence,
+            '/fast/worktrees/orbit/orb-234',
         );
     }
 }
@@ -362,6 +464,8 @@ beforeEach(function () {
         'identifier' => 'ORB-234',
         'title' => 'Build the feature',
         'state' => ['id' => 'state-1', 'name' => 'In Progress', 'type' => 'started'],
+        'assignee' => ['id' => config('commander.hermes.nick_linear_user_id')],
+        'delegate' => ['id' => config('commander.hermes.tom_linear_viewer_id')],
     ];
     $this->repository = new ImplementationAdvancementRepository;
     $this->verifier = new ImplementationAdvancementVerifier;
@@ -376,7 +480,9 @@ beforeEach(function () {
     $this->pullRequests->transactionLevel = $transactionLevel;
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitImplementationRepository::class, $this->verifier);
+    app()->instance(OrbitActiveIssueProvider::class, $this->issues);
     app()->instance(OrbitIssueProvider::class, $this->issues);
+    app()->instance(OrbitPullRequestInspector::class, $this->pullRequests);
     app()->instance(OrbitPullRequestPublisher::class, $this->pullRequests);
     Queue::fake();
 });
@@ -756,6 +862,28 @@ it('routes blocked implementation directly to one resolution intent without exte
         ->and($this->issues->calls)->toBe(0)
         ->and($this->pullRequests->calls)->toBe(0)
         ->and(PhaseRun::where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)->count())->toBe(1);
+
+    config()->set('herdr.session', 'orbit');
+    $herdr = new ImplementationResolutionHerdr;
+    app()->instance(HerdrRuntime::class, $herdr);
+
+    $dispatched = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+
+    expect($dispatched->id)->toBe($resolutionDispatch->id)
+        ->and($dispatched->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($resolution->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($resolution->input)->toBe([
+            'implementation_receipt_id' => $this->receipt->id,
+            'implementation_receipt' => $payload,
+            'pull_request' => null,
+        ])
+        ->and($herdr->calls)->toBe(['open', 'split', 'start', 'prompt'])
+        ->and($this->verifier->calls)->toBe(0)
+        ->and($this->pullRequests->inspectCalls)->toBe(0)
+        ->and($this->issues->calls)->toBe(2);
 });
 
 it('does not route a blocked implementation for a disabled project', function () {
@@ -1062,6 +1190,26 @@ it('routes a repeated merge conflict to one resolution intent without attempt th
             ->where('attempt', 3)
             ->doesntExist())->toBeTrue()
         ->and(PhaseRun::where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)->count())->toBe(1);
+
+    config()->set('herdr.session', 'orbit');
+    $herdr = new ImplementationResolutionHerdr;
+    app()->instance(HerdrRuntime::class, $herdr);
+
+    $dispatched = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+
+    expect($dispatched->id)->toBe($resolver->id)
+        ->and($dispatched->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($resolution->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($resolution->input['implementation_receipt_id'])->toBe($this->correctionReceipt->id)
+        ->and($resolution->input['pull_request']['mergeable'])->toBeFalse()
+        ->and($herdr->calls)->toBe(['open', 'split', 'start', 'prompt'])
+        ->and($this->verifier->calls)->toBe(3)
+        ->and($this->pullRequests->calls)->toBe(1)
+        ->and($this->pullRequests->inspectCalls)->toBe(2)
+        ->and($this->issues->calls)->toBe(3);
 });
 
 it('routes a blocked merge-conflict correction to resolution and preserves the published PR', function () {

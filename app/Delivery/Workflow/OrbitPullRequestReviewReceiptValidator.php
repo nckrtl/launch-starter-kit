@@ -146,7 +146,7 @@ final readonly class OrbitPullRequestReviewReceiptValidator
 
         return $phase->delivery_id === $delivery->id
             && $phase->phase_name === OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            && in_array($phase->attempt, [1, 2], true)
+            && $phase->attempt >= 1
             && $phase->agentDispatches()->count() === 1
             && $dispatch->phase_run_id === $phase->id
             && $dispatch->agent_role === OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
