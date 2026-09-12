@@ -87,6 +87,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $query->where('status', DeliveryStatus::Blocked)
                             ->where('current_phase', OrbitFeatureWorkflow::RESOLUTION_PHASE)
                             ->whereIn('failure_details->code', [
+                                'resolution_dispatch_failed',
                                 'resolution_publication_reconciliation_required',
                                 'resolution_adoption_ready',
                                 'resolution_adoption_reconciliation_required',
@@ -150,6 +151,10 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
 
             if ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
                 && is_int($phaseRunId)) {
+                if ($failureCode === 'resolution_dispatch_failed') {
+                    DispatchOrbitPullRequestResolution::dispatch($delivery->id, $phaseRunId);
+                }
+
                 if ($failureCode === 'resolution_publication_reconciliation_required') {
                     AdvanceOrbitResolution::dispatch($delivery->id, $phaseRunId);
                 }

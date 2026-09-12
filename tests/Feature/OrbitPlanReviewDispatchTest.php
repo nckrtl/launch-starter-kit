@@ -38,6 +38,7 @@ use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanReviewAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
+use App\Delivery\Exceptions\OrbitResolutionDispatchFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
@@ -210,6 +211,8 @@ final class PlanReviewHerdrRuntime implements HerdrRuntime
 
     public string $agentId = 'codex-reviewer-1';
 
+    public ?HerdrAgentIdentifiers $observedAgent = null;
+
     public function __construct(private readonly PlanReviewDispatchRepository $repository) {}
 
     public function openWorktree(
@@ -260,7 +263,7 @@ final class PlanReviewHerdrRuntime implements HerdrRuntime
     {
         $this->call('get');
 
-        return $this->identifiers($name);
+        return $this->observedAgent ?? $this->identifiers($name);
     }
 
     private function call(string $name): void
@@ -715,6 +718,119 @@ it('dispatches, captures, and publishes a blocked plan review through the planni
         ->and($this->delivery->fresh()->failure_details['code'])
         ->toBe('resolution_decision_required')
         ->and($this->resolutionPublisher->calls)->toBe(1);
+});
+
+it('resumes the exact retained idle resolver when dispatch stopped before its prompt', function () {
+    capturedPlanReviewResult($this, 'blocked');
+    app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $this->herdr->paneId = 'resolver-pane';
+    $this->herdr->terminalId = 'resolver-terminal';
+    $this->herdr->agentId = 'codex-resolver-1';
+    $resolver = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+    $message = 'The resolution ledger changed before external mutation.';
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Ambiguous,
+        'state_change_seq' => 40,
+        'error_code' => 'resolution_dispatch_failed',
+        'error_message' => $message,
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'resolution_dispatch_failed',
+            'phase_run_id' => $resolution->id,
+            'dispatch_id' => $resolver->id,
+            'message' => $message,
+        ],
+    ])->save();
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $resolver->herdr_workspace_id,
+        tabId: (string) $resolver->herdr_tab_id,
+        paneId: (string) $resolver->herdr_pane_id,
+        terminalId: (string) $resolver->herdr_terminal_id,
+        agentId: $resolver->herdr_agent_id,
+        agentName: (string) $resolver->herdr_agent_name,
+        stateChangeSeq: 40,
+        workingDirectory: $this->worktree,
+        agentStatus: 'idle',
+    );
+    $this->herdr->calls = [];
+    $this->herdr->prompts = [];
+
+    $recovered = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+
+    expect($recovered->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($recovered->error_code)->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($this->herdr->prompts)->toHaveCount(1)
+        ->and(AgentDispatch::query()
+            ->where('agent_role', OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE)
+            ->count())->toBe(1);
+});
+
+it('does not resume an interrupted resolver whose retained agent is working', function () {
+    capturedPlanReviewResult($this, 'blocked');
+    app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $this->herdr->paneId = 'resolver-pane';
+    $this->herdr->terminalId = 'resolver-terminal';
+    $this->herdr->agentId = 'codex-resolver-1';
+    $resolver = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+    $message = 'The resolution ledger changed before external mutation.';
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Ambiguous,
+        'state_change_seq' => 40,
+        'error_code' => 'resolution_dispatch_failed',
+        'error_message' => $message,
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'resolution_dispatch_failed',
+            'phase_run_id' => $resolution->id,
+            'dispatch_id' => $resolver->id,
+            'message' => $message,
+        ],
+    ])->save();
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $resolver->herdr_workspace_id,
+        tabId: (string) $resolver->herdr_tab_id,
+        paneId: (string) $resolver->herdr_pane_id,
+        terminalId: (string) $resolver->herdr_terminal_id,
+        agentId: $resolver->herdr_agent_id,
+        agentName: (string) $resolver->herdr_agent_name,
+        stateChangeSeq: 41,
+        workingDirectory: $this->worktree,
+        agentStatus: 'working',
+    );
+    $this->herdr->calls = [];
+    $this->herdr->prompts = [];
+
+    expect(fn () => app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    ))->toThrow(OrbitResolutionDispatchFailed::class, 'not safe to resume');
+
+    expect($resolver->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->herdr->calls)->toBe(['get'])
+        ->and($this->herdr->prompts)->toBe([]);
 });
 
 it('recovers an untouched exhausted plan resolver only after project capacity is free', function () {

@@ -33,6 +33,9 @@ use Throwable;
 
 final readonly class DispatchOrbitPullRequestResolution
 {
+    private const string INTERRUPTED_BEFORE_PROMPT_MESSAGE =
+        'The resolution ledger changed before external mutation.';
+
     public function __construct(
         private ProjectConfigRegistry $configs,
         private ResolveOrbitDeliveryPreparation $preparations,
@@ -61,6 +64,11 @@ final readonly class DispatchOrbitPullRequestResolution
         }
 
         $preparation = $this->preparations->startup($delivery);
+
+        if ($this->isInterruptedBeforePrompt($delivery, $phaseRunId)) {
+            return $this->recoverInterruptedBeforePrompt($delivery, $config, $preparation);
+        }
+
         [$delivery, $phase, $dispatch, $prompt] = $this->prepare(
             $deliveryId,
             $phaseRunId,
@@ -676,7 +684,416 @@ final readonly class DispatchOrbitPullRequestResolution
                 'error_code' => 'herdr_prompt_attempted',
                 'error_message' => null,
             ])->save();
-        });
+        }, 5);
+    }
+
+    private function isInterruptedBeforePrompt(Delivery $delivery, int $phaseRunId): bool
+    {
+        $failure = $delivery->failure_details;
+
+        return $delivery->status === DeliveryStatus::Blocked
+            && is_array($failure)
+            && $failure === [
+                'code' => 'resolution_dispatch_failed',
+                'phase_run_id' => $phaseRunId,
+                'dispatch_id' => $failure['dispatch_id'] ?? null,
+                'message' => self::INTERRUPTED_BEFORE_PROMPT_MESSAGE,
+            ]
+            && is_int($failure['dispatch_id'] ?? null);
+    }
+
+    private function recoverInterruptedBeforePrompt(
+        Delivery $delivery,
+        OrbitProjectConfig $config,
+        OrbitDeliveryPreparation $preparation,
+    ): AgentDispatch {
+        [$phase, $dispatch, $prompt] = $this->interruptedBeforePromptState(
+            $delivery->id,
+            $config,
+        );
+        $reservation = $this->repository->reserveDelivery(
+            $config,
+            $preparation->snapshot->issueKey,
+        );
+
+        try {
+            $current = Delivery::query()->with('projectOrchestration')->findOrFail($delivery->id);
+            [$phase, $dispatch, $prompt] = $this->interruptedBeforePromptState(
+                $current->id,
+                $config,
+            );
+            $this->verifyExternalState($current, $config, $preparation, $phase);
+
+            try {
+                $agent = $this->herdr->getAgent((string) $dispatch->herdr_agent_name);
+            } catch (Throwable $exception) {
+                throw new OrbitResolutionDispatchFailed(
+                    'The retained Orbit resolver could not be verified.',
+                    0,
+                    $exception,
+                );
+            }
+
+            if (! $this->sameInterruptedAgent($current, $dispatch, $agent)
+                || ! in_array($agent->agentStatus, ['idle', 'done'], true)) {
+                throw new OrbitResolutionDispatchFailed(
+                    'The retained Orbit resolver is not safe to resume.',
+                );
+            }
+
+            $this->markRecoveryPromptAttempted(
+                $current->id,
+                $phase->id,
+                $dispatch->id,
+                $config,
+                $agent,
+            );
+
+            try {
+                $prompted = $this->herdr->promptAgent($agent->agentName, $prompt);
+            } catch (Throwable $exception) {
+                $this->markRecoveryPromptAmbiguous(
+                    $current->id,
+                    $dispatch->id,
+                    'resolution_prompt_ambiguous',
+                    $exception->getMessage(),
+                );
+
+                throw new OrbitResolutionDispatchFailed(
+                    'The Herdr resolver prompt outcome is unresolved; Commander will not submit it again automatically.',
+                    0,
+                    $exception,
+                );
+            }
+
+            if (! $this->sameAgent($prompted, $dispatch->refresh())) {
+                $message = 'Herdr prompted an agent outside the recorded resolution dispatch.';
+                $this->markRecoveryPromptAmbiguous(
+                    $current->id,
+                    $dispatch->id,
+                    'resolution_prompt_identity_ambiguous',
+                    $message,
+                );
+
+                throw new OrbitResolutionDispatchFailed($message);
+            }
+
+            $this->completeRecoveredPrompt(
+                $current->id,
+                $phase->id,
+                $dispatch->id,
+                $config,
+                $prompted,
+            );
+        } finally {
+            $reservation->release();
+        }
+
+        return $dispatch->refresh();
+    }
+
+    /** @return array{PhaseRun, AgentDispatch, string} */
+    private function interruptedBeforePromptState(
+        int $deliveryId,
+        OrbitProjectConfig $config,
+    ): array {
+        return DB::transaction(function () use ($deliveryId, $config): array {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $project = $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+            $phases = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $dispatches = AgentDispatch::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $receipts = Receipt::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $failure = $delivery->failure_details;
+            $phaseId = is_array($failure) ? ($failure['phase_run_id'] ?? null) : null;
+            $dispatchId = is_array($failure) ? ($failure['dispatch_id'] ?? null) : null;
+            $phase = is_int($phaseId) ? $phases->firstWhere('id', $phaseId) : null;
+            $dispatch = is_int($dispatchId) ? $dispatches->firstWhere('id', $dispatchId) : null;
+            $phaseDispatches = $dispatches->where('phase_run_id', $phase?->id);
+            $phaseReceipts = $receipts->where('phase_run_id', $phase?->id);
+            $delivery->setRelation('projectOrchestration', $project);
+
+            if ($phase === null || $dispatch === null
+                || $project->state !== ProjectOrchestrationState::Enabled
+                || $project->config !== $config->toArray()
+                || $delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+                || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
+                || $delivery->current_phase !== OrbitFeatureWorkflow::RESOLUTION_PHASE
+                || ! $this->isInterruptedBeforePrompt($delivery, $phase->id)
+                || $phases->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+                    ->sortByDesc('attempt')->first()?->id !== $phase->id
+                || $phase->delivery_id !== $delivery->id
+                || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
+                || $phase->attempt < 1
+                || $phase->status !== PhaseRunStatus::Running
+                || $phase->finished_at !== null
+                || $phaseDispatches->count() !== 1
+                || $phaseReceipts->isNotEmpty()
+                || $dispatch->phase_run_id !== $phase->id
+                || $dispatch->agent_role !== OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
+                || $dispatch->status !== AgentDispatchStatus::Ambiguous
+                || $dispatch->error_code !== 'resolution_dispatch_failed'
+                || $dispatch->error_message !== self::INTERRUPTED_BEFORE_PROMPT_MESSAGE
+                || $dispatch->herdr_session !== $config->herdrSession
+                || $dispatch->herdr_workspace_id === null
+                || $dispatch->herdr_tab_id === null
+                || $dispatch->herdr_pane_id === null
+                || $dispatch->herdr_terminal_id === null
+                || $dispatch->herdr_agent_name !== strtolower((string) $delivery->external_issue_key)
+                    .'-loop-resolution-'.$phase->attempt
+                || $dispatch->state_change_seq === null
+                || $dispatch->state_change_seq < 0
+                || $dispatch->dispatched_at === null
+                || $dispatch->settled_at !== null
+                || ! $this->receipts->matchesInput($delivery, $phase, $dispatch)) {
+                throw new OrbitResolutionDispatchFailed(
+                    'The interrupted Orbit resolution dispatch is not safe to recover.',
+                );
+            }
+
+            $input = is_array($phase->input) ? $phase->input : [];
+            $prompt = $this->planReceipts->matchesSource($delivery, $phase, $dispatch)
+                ? $this->workflow->planResolutionPrompt(
+                    (string) $delivery->external_issue_key,
+                    $config->repository,
+                    (string) $delivery->worktree_path,
+                    $delivery->id,
+                    $phase->id,
+                    $dispatch->id,
+                    $this->receiptCommand($phase, $dispatch),
+                    $input,
+                )
+                : $this->workflow->pullRequestResolutionPrompt(
+                    (string) $delivery->external_issue_key,
+                    $config->repository,
+                    (string) $delivery->worktree_path,
+                    $delivery->id,
+                    $phase->id,
+                    $dispatch->id,
+                    $this->receiptCommand($phase, $dispatch),
+                    $input,
+                );
+
+            if (! hash_equals($dispatch->prompt_hash, hash('sha256', $prompt))) {
+                throw new OrbitResolutionDispatchFailed(
+                    'The interrupted Orbit resolution prompt changed before recovery.',
+                );
+            }
+
+            return [$phase, $dispatch, $prompt];
+        }, 5);
+    }
+
+    private function sameInterruptedAgent(
+        Delivery $delivery,
+        AgentDispatch $dispatch,
+        HerdrAgentIdentifiers $agent,
+    ): bool {
+        return $agent->workspaceId === $dispatch->herdr_workspace_id
+            && $agent->tabId === $dispatch->herdr_tab_id
+            && $agent->paneId === $dispatch->herdr_pane_id
+            && $agent->terminalId === $dispatch->herdr_terminal_id
+            && ($dispatch->herdr_agent_id === null
+                || ($agent->agentId !== null && $agent->agentId === $dispatch->herdr_agent_id))
+            && $agent->agentName === $dispatch->herdr_agent_name
+            && $agent->workingDirectory === $delivery->worktree_path
+            && $agent->stateChangeSeq !== null
+            && $dispatch->state_change_seq !== null
+            && $agent->stateChangeSeq >= $dispatch->state_change_seq
+            && $this->independentFromPriorAgents(
+                $delivery,
+                $dispatch->id,
+                $agent,
+                $agent->agentName,
+            );
+    }
+
+    private function markRecoveryPromptAttempted(
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        OrbitProjectConfig $config,
+        HerdrAgentIdentifiers $agent,
+    ): void {
+        DB::transaction(function () use (
+            $deliveryId,
+            $phaseRunId,
+            $dispatchId,
+            $config,
+            $agent,
+        ): void {
+            [$phase, $dispatch] = $this->lockedInterruptedBeforePromptState(
+                $deliveryId,
+                $phaseRunId,
+                $dispatchId,
+                $config,
+            );
+            $delivery = Delivery::query()->whereKey($deliveryId)->firstOrFail();
+
+            if (! $this->sameInterruptedAgent($delivery, $dispatch, $agent)) {
+                throw new OrbitResolutionDispatchFailed(
+                    'The retained Orbit resolver changed before prompt recovery.',
+                );
+            }
+
+            $dispatch->forceFill([
+                'status' => AgentDispatchStatus::Starting,
+                'herdr_agent_id' => $agent->agentId ?? $dispatch->herdr_agent_id,
+                'state_change_seq' => $agent->stateChangeSeq,
+                'error_code' => 'herdr_prompt_attempted',
+                'error_message' => null,
+            ])->save();
+            $delivery->forceFill([
+                'status' => DeliveryStatus::Preparing,
+                'failure_details' => null,
+            ])->save();
+        }, 5);
+    }
+
+    /** @return array{PhaseRun, AgentDispatch} */
+    private function lockedInterruptedBeforePromptState(
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        OrbitProjectConfig $config,
+    ): array {
+        $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+        $project = $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+        $phases = PhaseRun::query()
+            ->where('delivery_id', $delivery->id)
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+        $dispatches = AgentDispatch::query()
+            ->whereIn('phase_run_id', $phases->modelKeys())
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+        $receipts = Receipt::query()
+            ->whereIn('phase_run_id', $phases->modelKeys())
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get();
+        $phase = $phases->firstWhere('id', $phaseRunId);
+        $dispatch = $dispatches->firstWhere('id', $dispatchId);
+        $delivery->setRelation('projectOrchestration', $project);
+
+        if ($phase === null || $dispatch === null
+            || $project->state !== ProjectOrchestrationState::Enabled
+            || $project->config !== $config->toArray()
+            || ! $this->isInterruptedBeforePrompt($delivery, $phaseRunId)
+            || $phases->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+                ->sortByDesc('attempt')->first()?->id !== $phase->id
+            || $phase->status !== PhaseRunStatus::Running
+            || $phase->finished_at !== null
+            || $dispatches->where('phase_run_id', $phase->id)->count() !== 1
+            || $receipts->where('phase_run_id', $phase->id)->isNotEmpty()
+            || $dispatch->phase_run_id !== $phase->id
+            || $dispatch->status !== AgentDispatchStatus::Ambiguous
+            || $dispatch->error_code !== 'resolution_dispatch_failed'
+            || $dispatch->error_message !== self::INTERRUPTED_BEFORE_PROMPT_MESSAGE
+            || ! $this->receipts->matchesInput($delivery, $phase, $dispatch)) {
+            throw new OrbitResolutionDispatchFailed(
+                'The interrupted Orbit resolution ledger changed before recovery.',
+            );
+        }
+
+        return [$phase, $dispatch];
+    }
+
+    private function completeRecoveredPrompt(
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        OrbitProjectConfig $config,
+        HerdrAgentIdentifiers $prompted,
+    ): void {
+        DB::transaction(function () use (
+            $deliveryId,
+            $phaseRunId,
+            $dispatchId,
+            $config,
+            $prompted,
+        ): void {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $project = $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+            $phase = PhaseRun::query()->whereKey($phaseRunId)->lockForUpdate()->firstOrFail();
+            $dispatch = AgentDispatch::query()->whereKey($dispatchId)->lockForUpdate()->firstOrFail();
+            $delivery->setRelation('projectOrchestration', $project);
+
+            if ($project->state !== ProjectOrchestrationState::Enabled
+                || $project->config !== $config->toArray()
+                || $delivery->current_phase !== OrbitFeatureWorkflow::RESOLUTION_PHASE
+                || $delivery->status !== DeliveryStatus::Preparing
+                || $phase->delivery_id !== $delivery->id
+                || $phase->status !== PhaseRunStatus::Running
+                || $dispatch->phase_run_id !== $phase->id
+                || $dispatch->status !== AgentDispatchStatus::Starting
+                || $dispatch->error_code !== 'herdr_prompt_attempted'
+                || ! $this->sameAgent($prompted, $dispatch)) {
+                throw new OrbitResolutionDispatchFailed(
+                    'The recovered Orbit resolution dispatch changed while its prompt was submitted.',
+                );
+            }
+
+            $dispatch->forceFill([
+                'status' => AgentDispatchStatus::Waiting,
+                'herdr_agent_id' => $prompted->agentId ?? $dispatch->herdr_agent_id,
+                'state_change_seq' => $prompted->stateChangeSeq,
+                'error_code' => null,
+                'error_message' => null,
+            ])->save();
+            $delivery->forceFill([
+                'status' => DeliveryStatus::WaitingForAgent,
+                'failure_details' => null,
+            ])->save();
+        }, 5);
+    }
+
+    private function markRecoveryPromptAmbiguous(
+        int $deliveryId,
+        int $dispatchId,
+        string $code,
+        string $message,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $dispatchId, $code, $message): void {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->first();
+            $dispatch = AgentDispatch::query()->whereKey($dispatchId)->lockForUpdate()->first();
+
+            if ($delivery === null || $dispatch === null
+                || $delivery->current_phase !== OrbitFeatureWorkflow::RESOLUTION_PHASE
+                || $delivery->status !== DeliveryStatus::Preparing
+                || $dispatch->status !== AgentDispatchStatus::Starting
+                || $dispatch->error_code !== 'herdr_prompt_attempted') {
+                return;
+            }
+
+            $dispatch->forceFill([
+                'status' => AgentDispatchStatus::Ambiguous,
+                'error_code' => $code,
+                'error_message' => $message,
+            ])->save();
+            $delivery->forceFill([
+                'status' => DeliveryStatus::Blocked,
+                'failure_details' => [
+                    'code' => $code,
+                    'phase_run_id' => $dispatch->phase_run_id,
+                    'dispatch_id' => $dispatch->id,
+                    'message' => $message,
+                ],
+            ])->save();
+        }, 5);
     }
 
     private function startAgent(
