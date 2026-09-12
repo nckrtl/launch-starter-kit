@@ -826,10 +826,45 @@ final readonly class ShutdownOrbitHerdrWorkspace
 
     private function showsExactExitCommand(string $output, string $command): bool
     {
-        return preg_match(
-            '/^\h*[›❯>]\h*'.preg_quote($command, '/').'\h*$/mu',
-            $output,
-        ) === 1;
+        $lines = preg_split('/\R/u', $output);
+
+        if ($lines === false) {
+            return false;
+        }
+
+        foreach ($lines as $index => $line) {
+            if (preg_match('/^\h*[›❯>]\h*(.*)$/u', $line, $matches) !== 1) {
+                continue;
+            }
+
+            $candidate = preg_replace('/\h+/u', '', $matches[1]);
+
+            if ($candidate === null) {
+                continue;
+            }
+
+            for ($next = $index + 1; strlen($candidate) < strlen($command) && $next < count($lines); $next++) {
+                $continuation = trim($lines[$next]);
+
+                if ($continuation === '') {
+                    break;
+                }
+
+                $normalized = preg_replace('/\h+/u', '', $continuation);
+
+                if ($normalized === null) {
+                    break;
+                }
+
+                $candidate .= $normalized;
+            }
+
+            if (hash_equals($command, $candidate)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function workspace(HerdrSessionSnapshot $snapshot, string $workspaceId): ?HerdrSnapshotWorkspace

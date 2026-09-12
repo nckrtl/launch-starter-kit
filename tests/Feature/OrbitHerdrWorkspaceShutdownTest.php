@@ -197,6 +197,32 @@ it('exits owned agents, verifies idle shells, and closes only the recorded works
         ->and($this->herdr->closedWorkspaces)->toHaveCount(1);
 });
 
+it('confirms an exact exit command wrapped across narrow terminal lines', function () {
+    $withAgent = shutdownSnapshot($this->repository, $this->worktree, agentStatus: 'idle');
+    $withoutAgent = shutdownSnapshot($this->repository, $this->worktree);
+    $closed = shutdownSnapshot($this->repository, $this->worktree, includeTarget: false);
+    $this->herdr->snapshots = [$withAgent, $withAgent, $withoutAgent, $withoutAgent, $closed];
+    $this->herdr->agentOutput = implode("\n", [
+        '─ Work',
+        '',
+        '› /',
+        '  qui',
+        '  t',
+        '',
+        '  gpt…',
+    ]);
+
+    expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeTrue()
+        ->and($this->herdr->sentKeys)->toBe([
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+            ['name' => 'orb-234-loop-builder', 'keys' => ['enter']],
+        ])
+        ->and($this->herdr->closedWorkspaces)->toBe(['issue-workspace']);
+});
+
 it('ignores a recovered pre-start mergeability failure without a runtime identity', function () {
     $failedReview = PhaseRun::query()->create([
         'delivery_id' => $this->delivery->id,
