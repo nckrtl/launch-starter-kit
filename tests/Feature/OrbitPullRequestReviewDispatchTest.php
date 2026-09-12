@@ -308,6 +308,14 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
 
     public string $agentName = 'orb-234-loop-pr-review-1';
 
+    public ?string $agentId = 'reviewer-agent';
+
+    public int $agentSequence = 2;
+
+    public string $workingDirectory = '/fast/worktrees/orbit/orb-234';
+
+    public string $agentStatus = 'idle';
+
     public function openWorktree(string $repositoryPath, string $worktreePath, ?string $label = null): OpenedHerdrWorktree
     {
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
@@ -348,7 +356,7 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
             throw new RuntimeException('Start outcome is unknown.');
         }
 
-        return $this->identifiers('reviewer-agent', 2);
+        return $this->identifiers($this->agentId, $this->agentSequence);
     }
 
     public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers
@@ -376,7 +384,7 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
             throw new RuntimeException('Agent recovery failed.');
         }
 
-        return $this->identifiers('reviewer-agent', 2);
+        return $this->identifiers($this->agentId, $this->agentSequence);
     }
 
     private function identifiers(?string $agentId, int $sequence): HerdrAgentIdentifiers
@@ -389,8 +397,8 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
             $this->reuseBuilder ? 'builder-agent' : $agentId,
             $this->agentName,
             $sequence,
-            '/fast/worktrees/orbit/orb-234',
-            'idle',
+            $this->workingDirectory,
+            $this->agentStatus,
         );
     }
 }
@@ -663,6 +671,63 @@ function addKnownPullRequestAttachment(object $test, array $extraAttachments = [
         $payload,
         $factory->contractHash($payload),
     );
+}
+
+function interruptPullRequestReviewBeforePrompt(object $test): void
+{
+    $test->herdr->agentId = null;
+    $test->herdr->agentSequence = 0;
+    addKnownPullRequestAttachment($test);
+    $payload = $test->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+    $payload['assignee'] = null;
+    $test->issues->snapshot = new OrbitIssueSnapshot(
+        $test->issues->snapshot->issueId,
+        $test->issues->snapshot->issueKey,
+        $payload,
+        $test->issues->snapshot->contractHash,
+    );
+    $test->review->forceFill([
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now(),
+    ])->save();
+    $prompt = app(OrbitFeatureWorkflow::class)->pullRequestReviewPrompt(
+        'ORB-234',
+        $test->worktree,
+        $test->delivery->id,
+        $test->review->id,
+        $test->dispatch->id,
+        sprintf(
+            "'%s' '%s' delivery:submit-orbit-pr-review-receipt %d %d",
+            PHP_BINARY,
+            base_path('artisan'),
+            $test->review->id,
+            $test->dispatch->id,
+        ),
+        $test->implementationPayload,
+        $test->review->input['pull_request'],
+    );
+    $test->dispatch->forceFill([
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'workspace',
+        'herdr_tab_id' => 'tab',
+        'herdr_pane_id' => 'reviewer-pane',
+        'herdr_terminal_id' => 'reviewer-terminal',
+        'herdr_agent_id' => null,
+        'state_change_seq' => 0,
+        'prompt_hash' => hash('sha256', $prompt),
+        'status' => AgentDispatchStatus::Starting,
+        'error_code' => 'pr_review_final_verification',
+        'dispatched_at' => now(),
+    ])->save();
+    $test->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'pr_review_dispatch_interrupted',
+            'dispatch_id' => $test->dispatch->id,
+            'stage' => 'pr_review_final_verification',
+        ],
+    ])->save();
 }
 
 function promotePullRequestReviewSourceToCorrection(object $test): void
@@ -1182,6 +1247,79 @@ it('blocks ambiguous Linear and Herdr mutation failures', function (string $fail
         ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous)
         ->and($this->repository->reservationIsHeld())->toBeFalse();
 })->with(['linear', 'open', 'split', 'start', 'prompt']);
+
+it('resumes the exact existing reviewer after final-verification dispatch interruption', function () {
+    interruptPullRequestReviewBeforePrompt($this);
+
+    $result = app(DispatchOrbitPullRequestReview::class)->recoverInterrupted($this->delivery->id);
+
+    expect($result->is($this->dispatch))->toBeTrue()
+        ->and($result->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($result->error_code)->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($this->herdr->prompts)->toHaveCount(1)
+        ->and($this->verifier->calls)->toBe(1)
+        ->and($this->pullRequests->calls)->toBe(1)
+        ->and($this->transitions->calls)->toBe(0)
+        ->and($this->repository->reservationIsHeld())->toBeFalse();
+});
+
+it('runs interrupted reviewer recovery directly without queueing another dispatch', function () {
+    Queue::fake();
+    interruptPullRequestReviewBeforePrompt($this);
+
+    $this->artisan('delivery:recover-orbit-pr-review', [
+        'delivery' => (string) $this->delivery->id,
+    ])->assertSuccessful();
+
+    Queue::assertNothingPushed();
+    expect($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Waiting);
+});
+
+it('keeps an interrupted reviewer blocked when its ledger or live agent drifts', function (string $drift) {
+    interruptPullRequestReviewBeforePrompt($this);
+
+    match ($drift) {
+        'prompt' => $this->dispatch->forceFill(['prompt_hash' => str_repeat('0', 64)])->save(),
+        'stage' => $this->delivery->forceFill(['failure_details' => [
+            'code' => 'pr_review_dispatch_interrupted',
+            'dispatch_id' => $this->dispatch->id,
+            'stage' => 'herdr_prompt_attempted',
+        ]])->save(),
+        'sequence' => $this->herdr->agentSequence = -1,
+        'worktree' => $this->herdr->workingDirectory = '/fast/worktrees/orbit/other',
+        'status' => $this->herdr->agentStatus = 'working',
+        'mergeability' => $this->pullRequests->mergeable = false,
+    };
+
+    expect(fn () => app(DispatchOrbitPullRequestReview::class)->recoverInterrupted($this->delivery->id))
+        ->toThrow(OrbitPullRequestReviewDispatchFailed::class);
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('pr_review_dispatch_interrupted')
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Starting)
+        ->and($this->herdr->prompts)->toBe([])
+        ->and($this->repository->reservationIsHeld())->toBeFalse();
+})->with(['prompt', 'stage', 'sequence', 'worktree', 'status', 'mergeability']);
+
+it('never replays an interrupted reviewer after an ambiguous prompt outcome', function () {
+    interruptPullRequestReviewBeforePrompt($this);
+    $this->herdr->failure = 'prompt';
+
+    expect(fn () => app(DispatchOrbitPullRequestReview::class)->recoverInterrupted($this->delivery->id))
+        ->toThrow(OrbitPullRequestReviewDispatchFailed::class, 'will not submit it again');
+    expect(fn () => app(DispatchOrbitPullRequestReview::class)->recoverInterrupted($this->delivery->id))
+        ->toThrow(OrbitPullRequestReviewDispatchFailed::class);
+
+    expect($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($this->herdr->prompts)->toHaveCount(1)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('herdr_prompt_ambiguous')
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous);
+});
 
 it('rearms the same pull request review dispatch after exact Linear read-back', function () {
     $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();

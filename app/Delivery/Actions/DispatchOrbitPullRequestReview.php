@@ -132,6 +132,116 @@ final readonly class DispatchOrbitPullRequestReview
         }
     }
 
+    public function recoverInterrupted(int $deliveryId): AgentDispatch
+    {
+        $delivery = Delivery::query()->with('projectOrchestration')->find($deliveryId);
+
+        if ($delivery === null) {
+            throw new OrbitPullRequestReviewDispatchFailed('The Orbit delivery does not exist.');
+        }
+
+        $config = $this->configs->hydrate($delivery->projectOrchestration->config);
+
+        if (! $config instanceof OrbitProjectConfig || $config->herdrSession !== config('herdr.session')) {
+            throw new OrbitPullRequestReviewDispatchFailed(
+                'The blocked delivery does not use Commander\'s active Orbit configuration.',
+            );
+        }
+
+        $preparation = $this->preparations->startup($delivery);
+        [$phase, $dispatch, $receipt, $prompt] = $this->prepareInterruptedRecovery(
+            $delivery->id,
+            $config,
+        );
+        $reservation = $this->repository->reserveDelivery($config, $preparation->snapshot->issueKey);
+
+        try {
+            $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($delivery->id);
+            $this->assertInterruptedRecoveryLedger($delivery, $phase->id, $dispatch->id, $receipt->id, $config);
+            $this->verifyCandidateAndPullRequest(
+                $delivery,
+                $config,
+                $preparation,
+                $receipt,
+                $dispatch,
+                DeliveryStatus::Blocked,
+                false,
+            );
+            $issue = $this->issues->fetchActive(
+                $preparation->snapshot->issueId,
+                $preparation->snapshot->issueKey,
+            );
+            $this->assertCurrentIssue($delivery, $preparation, $issue, true);
+
+            try {
+                $agent = $this->herdr->getAgent((string) $dispatch->herdr_agent_name);
+            } catch (Exception $exception) {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'The retained pull request reviewer could not be verified.',
+                    0,
+                    $exception,
+                );
+            }
+
+            if (! $this->sameRecoveredAgent($agent, $dispatch)
+                || $agent->workingDirectory !== $preparation->worktree->path
+                || ! in_array($agent->agentStatus, ['idle', 'done'], true)
+                || ! $this->independentFromBuilders($delivery, $agent, $agent->agentName)) {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'The retained pull request reviewer is not safe to resume.',
+                );
+            }
+
+            $this->markRecoveryPromptAttempted(
+                $delivery->id,
+                $phase->id,
+                $dispatch->id,
+                $receipt->id,
+                $config,
+                $agent,
+            );
+
+            try {
+                $prompted = $this->herdr->promptAgent($agent->agentName, $prompt);
+            } catch (Exception $exception) {
+                $this->markBlocked(
+                    $delivery,
+                    $dispatch,
+                    AgentDispatchStatus::Ambiguous,
+                    'herdr_prompt_ambiguous',
+                    $exception,
+                );
+
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'The Herdr prompt outcome is unresolved; Commander will not submit it again automatically.',
+                    0,
+                    $exception,
+                );
+            }
+
+            if (! $this->sameAgent($prompted, $dispatch)) {
+                $exception = new OrbitPullRequestReviewDispatchFailed(
+                    'Herdr prompted an agent outside the recorded pull request review dispatch.',
+                );
+                $this->markBlocked(
+                    $delivery,
+                    $dispatch,
+                    AgentDispatchStatus::Ambiguous,
+                    'herdr_prompt_identity_ambiguous',
+                    $exception,
+                );
+
+                throw $exception;
+            }
+
+            $this->completePrompt($delivery->id, $dispatch->id, $prompted);
+
+            return $dispatch->refresh();
+        } finally {
+            $reservation->release();
+        }
+    }
+
     private function assertLiveDelivery(Delivery $delivery, ?int $expectedPhaseId): void
     {
         $project = $delivery->projectOrchestration;
@@ -347,11 +457,13 @@ final readonly class DispatchOrbitPullRequestReview
         OrbitDeliveryPreparation $preparation,
         Receipt $receipt,
         AgentDispatch $reviewDispatch,
+        DeliveryStatus $expectedStatus = DeliveryStatus::Preparing,
+        bool $blockOnUnmergeable = true,
     ): void {
         if ($delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
             || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || $delivery->status !== DeliveryStatus::Preparing
+            || $delivery->status !== $expectedStatus
             || $delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
             || $delivery->projectOrchestration->config !== $config->toArray()) {
             throw new OrbitPullRequestReviewDispatchFailed(
@@ -377,7 +489,13 @@ final readonly class DispatchOrbitPullRequestReview
             $verified->candidateSha,
             $this->string($payload, 'pull_request_body'),
         );
-        $this->assertPullRequest($delivery, $verified, $pullRequest, $reviewDispatch);
+        $this->assertPullRequest(
+            $delivery,
+            $verified,
+            $pullRequest,
+            $reviewDispatch,
+            $blockOnUnmergeable,
+        );
     }
 
     private function assertVerifiedOutcome(Receipt $receipt, VerifiedOrbitImplementationOutcome $verified): void
@@ -400,6 +518,7 @@ final readonly class DispatchOrbitPullRequestReview
         VerifiedOrbitImplementationOutcome $verified,
         PublishedOrbitPullRequest $pullRequest,
         AgentDispatch $reviewDispatch,
+        bool $blockOnUnmergeable,
     ): void {
         if ($pullRequest->number !== $delivery->pull_request_number
             || $pullRequest->url !== $delivery->pull_request_url
@@ -418,13 +537,16 @@ final readonly class DispatchOrbitPullRequestReview
             $exception = new OrbitPullRequestReviewDispatchFailed(
                 'The published pull request became unmergeable before independent review.',
             );
-            $this->markBlocked(
-                $delivery,
-                $reviewDispatch,
-                AgentDispatchStatus::Failed,
-                'pr_review_mergeability_changed',
-                $exception,
-            );
+
+            if ($blockOnUnmergeable) {
+                $this->markBlocked(
+                    $delivery,
+                    $reviewDispatch,
+                    AgentDispatchStatus::Failed,
+                    'pr_review_mergeability_changed',
+                    $exception,
+                );
+            }
 
             throw $exception;
         }
@@ -483,6 +605,225 @@ final readonly class DispatchOrbitPullRequestReview
                 'error_code' => 'pr_review_dispatch_starting',
                 'error_message' => null,
             ]) === 1;
+    }
+
+    /** @return array{PhaseRun, AgentDispatch, Receipt, string} */
+    private function prepareInterruptedRecovery(int $deliveryId, OrbitProjectConfig $config): array
+    {
+        return DB::transaction(function () use ($deliveryId, $config): array {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+            $phases = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            AgentDispatch::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            Receipt::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $phase = $phases
+                ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+                ->sortByDesc('attempt')
+                ->first();
+
+            if ($phase === null) {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'The interrupted pull request review phase is missing.',
+                );
+            }
+
+            $dispatch = $phase->agentDispatches()->first();
+
+            if ($dispatch === null) {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'The interrupted pull request review dispatch is missing.',
+                );
+            }
+
+            $receipt = $this->sourceReceipt($delivery, $phase);
+            $this->assertInterruptedRecoveryLedger(
+                $delivery,
+                $phase->id,
+                $dispatch->id,
+                $receipt->id,
+                $config,
+            );
+            $prompt = $this->workflow->pullRequestReviewPrompt(
+                (string) $delivery->external_issue_key,
+                (string) $delivery->worktree_path,
+                $delivery->id,
+                $phase->id,
+                $dispatch->id,
+                $this->receiptCommand($phase, $dispatch),
+                $receipt->payload,
+                $this->pullRequestInput($phase),
+            );
+
+            if (! hash_equals($dispatch->prompt_hash, hash('sha256', $prompt))) {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'The interrupted pull request review prompt no longer matches its ledger.',
+                );
+            }
+
+            return [$phase, $dispatch, $receipt, $prompt];
+        });
+    }
+
+    private function assertInterruptedRecoveryLedger(
+        Delivery $delivery,
+        int $phaseId,
+        ?int $dispatchId,
+        int $receiptId,
+        OrbitProjectConfig $config,
+    ): void {
+        $project = $delivery->projectOrchestration()->firstOrFail();
+        $phase = $delivery->phaseRuns()
+            ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+            ->latest('attempt')
+            ->first();
+        $dispatches = $phase?->agentDispatches()
+            ->where('agent_role', OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE)
+            ->get();
+        $dispatch = $dispatches?->first();
+        $failure = $delivery->failure_details;
+        $source = $phase === null ? null : $this->sources->sourceReceipt($delivery, $phase);
+        $expectedKey = $phase === null ? null : IdempotencyKey::forDispatch(
+            $delivery->id,
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+            $phase->attempt,
+            OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        )->value;
+        $expectedPromptHash = null;
+
+        if ($phase !== null && $dispatch !== null && $source !== null) {
+            $prompt = $this->workflow->pullRequestReviewPrompt(
+                (string) $delivery->external_issue_key,
+                (string) $delivery->worktree_path,
+                $delivery->id,
+                $phase->id,
+                $dispatch->id,
+                $this->receiptCommand($phase, $dispatch),
+                $source->payload,
+                $this->pullRequestInput($phase),
+            );
+            $expectedPromptHash = hash('sha256', $prompt);
+        }
+
+        if ($delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+            || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
+            || $delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            || $delivery->status !== DeliveryStatus::Blocked
+            || ! is_array($failure)
+            || ($failure['code'] ?? null) !== 'pr_review_dispatch_interrupted'
+            || ($failure['dispatch_id'] ?? null) !== $dispatchId
+            || ($failure['stage'] ?? null) !== 'pr_review_final_verification'
+            || $project->state !== ProjectOrchestrationState::Enabled
+            || $project->config !== $config->toArray()
+            || $phase === null
+            || $phase->id !== $phaseId
+            || ! in_array($phase->attempt, [1, 2], true)
+            || $phase->status !== PhaseRunStatus::Running
+            || $phase->receipts()->exists()
+            || $phase->agentDispatches()->count() !== 1
+            || $source === null
+            || $source->id !== $receiptId
+            || $dispatches?->count() !== 1
+            || $dispatch === null
+            || $dispatch->id !== $dispatchId
+            || $dispatch->idempotency_key !== $expectedKey
+            || $dispatch->status !== AgentDispatchStatus::Starting
+            || $dispatch->error_code !== 'pr_review_final_verification'
+            || $dispatch->error_message !== null
+            || $dispatch->herdr_session !== $config->herdrSession
+            || $dispatch->herdr_workspace_id === null
+            || $dispatch->herdr_tab_id === null
+            || $dispatch->herdr_pane_id === null
+            || $dispatch->herdr_terminal_id === null
+            || $dispatch->state_change_seq === null
+            || $dispatch->state_change_seq < 0
+            || $dispatch->herdr_agent_name !== strtolower((string) $delivery->external_issue_key).'-loop-pr-review-'.$phase->attempt
+            || $dispatch->prompt_name !== 'orbit_pr_review'
+            || $dispatch->prompt_version !== 1
+            || preg_match('/^[a-f0-9]{64}$/', $dispatch->prompt_hash) !== 1
+            || $expectedPromptHash === null
+            || ! hash_equals($dispatch->prompt_hash, $expectedPromptHash)
+            || $dispatch->dispatched_at === null
+            || $dispatch->settled_at !== null) {
+            throw new OrbitPullRequestReviewDispatchFailed(
+                'The interrupted pull request review dispatch is not safe to recover.',
+            );
+        }
+    }
+
+    private function markRecoveryPromptAttempted(
+        int $deliveryId,
+        int $phaseId,
+        int $dispatchId,
+        int $receiptId,
+        OrbitProjectConfig $config,
+        HerdrAgentIdentifiers $agent,
+    ): void {
+        DB::transaction(function () use (
+            $deliveryId,
+            $phaseId,
+            $dispatchId,
+            $receiptId,
+            $config,
+            $agent,
+        ): void {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+            $phases = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            AgentDispatch::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            Receipt::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $this->assertInterruptedRecoveryLedger(
+                $delivery,
+                $phaseId,
+                $dispatchId,
+                $receiptId,
+                $config,
+            );
+            $dispatch = AgentDispatch::query()->whereKey($dispatchId)->firstOrFail();
+
+            if (! $this->sameRecoveredAgent($agent, $dispatch)
+                || $agent->workingDirectory !== $delivery->worktree_path
+                || ! in_array($agent->agentStatus, ['idle', 'done'], true)
+                || ! $this->independentFromBuilders($delivery, $agent, $agent->agentName)) {
+                throw new OrbitPullRequestReviewDispatchFailed(
+                    'The retained pull request reviewer changed before prompt submission.',
+                );
+            }
+
+            $dispatch->forceFill([
+                'herdr_agent_id' => $agent->agentId ?? $dispatch->herdr_agent_id,
+                'state_change_seq' => $agent->stateChangeSeq,
+                'error_code' => 'herdr_prompt_attempted',
+                'error_message' => null,
+            ])->save();
+            $delivery->forceFill([
+                'status' => DeliveryStatus::Preparing,
+                'failure_details' => null,
+            ])->save();
+        });
     }
 
     private function startAndPrompt(
@@ -613,9 +954,19 @@ final readonly class DispatchOrbitPullRequestReview
             throw $exception;
         }
 
-        DB::transaction(function () use ($delivery, $dispatch, $prompted): void {
-            $lockedDelivery = Delivery::query()->whereKey($delivery->id)->lockForUpdate()->firstOrFail();
-            $lockedDispatch = AgentDispatch::query()->whereKey($dispatch->id)->lockForUpdate()->firstOrFail();
+        $this->completePrompt($delivery->id, $dispatch->id, $prompted);
+
+        return $dispatch->refresh();
+    }
+
+    private function completePrompt(
+        int $deliveryId,
+        int $dispatchId,
+        HerdrAgentIdentifiers $prompted,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $dispatchId, $prompted): void {
+            $lockedDelivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $lockedDispatch = AgentDispatch::query()->whereKey($dispatchId)->lockForUpdate()->firstOrFail();
             $promptWasAttempted = $lockedDispatch->status === AgentDispatchStatus::Starting
                 && $lockedDispatch->error_code === 'herdr_prompt_attempted';
 
@@ -643,8 +994,6 @@ final readonly class DispatchOrbitPullRequestReview
                 $lockedDelivery->save();
             }
         });
-
-        return $dispatch->refresh();
     }
 
     private function startAgent(
@@ -781,6 +1130,20 @@ final readonly class DispatchOrbitPullRequestReview
                 || $dispatch->herdr_agent_id === null
                 || $agent->agentId === $dispatch->herdr_agent_id)
             && $agent->agentName === $dispatch->herdr_agent_name;
+    }
+
+    private function sameRecoveredAgent(HerdrAgentIdentifiers $agent, AgentDispatch $dispatch): bool
+    {
+        return $agent->workspaceId === $dispatch->herdr_workspace_id
+            && $agent->tabId === $dispatch->herdr_tab_id
+            && $agent->paneId === $dispatch->herdr_pane_id
+            && $agent->terminalId === $dispatch->herdr_terminal_id
+            && ($dispatch->herdr_agent_id === null
+                || ($agent->agentId !== null && $agent->agentId === $dispatch->herdr_agent_id))
+            && $agent->agentName === $dispatch->herdr_agent_name
+            && $agent->stateChangeSeq !== null
+            && $dispatch->state_change_seq !== null
+            && $agent->stateChangeSeq >= $dispatch->state_change_seq;
     }
 
     private function reviewLaunch(): HerdrAgentLaunch
