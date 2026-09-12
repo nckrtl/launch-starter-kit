@@ -15,6 +15,7 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
 use App\Delivery\Workflow\ValidatedReceipt;
 use App\Delivery\Workflow\WorkflowRegistry;
 use App\Jobs\AdvanceOrbitCleanup as AdvanceOrbitCleanupJob;
@@ -26,6 +27,7 @@ use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPlanning as DispatchOrbitPlanningJob;
 use App\Jobs\DispatchOrbitPlanningCorrection;
 use App\Jobs\DispatchOrbitPlanReview;
+use App\Jobs\DispatchOrbitPullRequestResolution;
 use App\Jobs\DispatchOrbitPullRequestReview;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -40,6 +42,7 @@ final readonly class AdvanceDeliveryAction
         private HerdrRuntime $herdr,
         private ProjectConfigRegistry $configs,
         private AdvanceOrbitPlanning $advanceOrbitPlanning,
+        private OrbitPullRequestResolutionReceiptValidator $resolutionReceipts,
     ) {}
 
     /** Return true when a continuation should be queued after the caller releases its lock. */
@@ -134,6 +137,22 @@ final readonly class AdvanceDeliveryAction
             if (in_array($pullRequestReview?->attempt, [1, 2], true)
                 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 AdvanceOrbitPullRequestReviewJob::dispatch($deliveryId, $pullRequestReview->id)->afterCommit();
+            }
+
+            $resolution = $delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
+                ? $delivery->phaseRuns()
+                    ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+                    ->latest('attempt')
+                    ->first()
+                : null;
+
+            if ($resolution?->attempt === 1
+                && in_array($delivery->status, [DeliveryStatus::Queued, DeliveryStatus::Preparing], true)) {
+                DispatchOrbitPullRequestResolution::dispatch($deliveryId, $resolution->id)->afterCommit();
+            }
+
+            if ($resolution?->attempt === 1 && $delivery->status === DeliveryStatus::WaitingForAgent) {
+                $this->advanceOrbitResolution($deliveryId, $resolution->id);
             }
 
             $landing = $delivery->current_phase === OrbitFeatureWorkflow::LANDING_PHASE
@@ -280,6 +299,82 @@ final readonly class AdvanceDeliveryAction
             $locked->save();
 
             return $transition->nextPhase !== null;
+        });
+    }
+
+    private function advanceOrbitResolution(int $deliveryId, int $phaseRunId): void
+    {
+        DB::transaction(function () use ($deliveryId, $phaseRunId): void {
+            $delivery = Delivery::query()
+                ->with('projectOrchestration')
+                ->whereKey($deliveryId)
+                ->lockForUpdate()
+                ->firstOrFail();
+            $phase = PhaseRun::query()->whereKey($phaseRunId)->lockForUpdate()->firstOrFail();
+            $dispatches = AgentDispatch::query()
+                ->where('phase_run_id', $phase->id)
+                ->lockForUpdate()
+                ->get();
+            $dispatch = $dispatches->first();
+            $receipts = $phase->receipts()->lockForUpdate()->get();
+            $receipt = $receipts->firstWhere('kind', 'orbit_resolution');
+
+            if ($delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+                || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
+                || $delivery->current_phase !== OrbitFeatureWorkflow::RESOLUTION_PHASE
+                || $delivery->status !== DeliveryStatus::WaitingForAgent
+                || $phase->delivery_id !== $delivery->id
+                || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
+                || $phase->attempt !== 1
+                || $phase->status !== PhaseRunStatus::Running
+                || $phase->finished_at !== null
+                || $dispatches->count() !== 1
+                || $dispatch === null
+                || $dispatch->agent_role !== OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE) {
+                return;
+            }
+
+            if ($dispatch->status !== AgentDispatchStatus::Settled || $receipt === null) {
+                return;
+            }
+
+            if ($receipts->count() !== 1
+                || ! $this->resolutionReceipts->matches($delivery, $phase, $dispatch, $receipt)) {
+                $phase->status = PhaseRunStatus::Failed;
+                $phase->failure_code = 'resolution_receipt_invalid';
+                $phase->failure_message = 'The settled resolver receipt failed immutable validation.';
+                $phase->failure_details = [
+                    'code' => 'resolution_receipt_invalid',
+                    'phase_run_id' => $phase->id,
+                    'dispatch_id' => $dispatch->id,
+                    'receipt_id' => $receipt->id,
+                ];
+                $phase->finished_at = now();
+                $phase->save();
+                $delivery->status = DeliveryStatus::Blocked;
+                $delivery->failure_details = $phase->failure_details;
+                $delivery->save();
+
+                return;
+            }
+
+            $result = $receipt->payload['result'];
+            $code = $result === 'proposal' ? 'resolution_proposal_ready' : 'resolution_blocked';
+            $phase->status = PhaseRunStatus::Completed;
+            $phase->output = [
+                'receipt_id' => $receipt->id,
+                'result' => $result,
+            ];
+            $phase->finished_at = now();
+            $phase->save();
+            $delivery->status = DeliveryStatus::Blocked;
+            $delivery->failure_details = [
+                'code' => $code,
+                'phase_run_id' => $phase->id,
+                'dispatch_id' => $dispatch->id,
+                'receipt_id' => $receipt->id,
+            ];
+            $delivery->save();
         });
     }
 

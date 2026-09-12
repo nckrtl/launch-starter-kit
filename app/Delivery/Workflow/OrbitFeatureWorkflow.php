@@ -46,6 +46,8 @@ final readonly class OrbitFeatureWorkflow
 
     public const int IMPLEMENTATION_CORRECTION_PROMPT_VERSION = 1;
 
+    public const int RESOLUTION_PROMPT_VERSION = 1;
+
     public function planningPrompt(
         string $issueKey,
         string $worktree,
@@ -521,6 +523,71 @@ Blocked:
 The receipt command independently validates the unchanged candidate, published artifact,
 submitted Builder gate, and review binding. It does not publish the GitHub review or advance the
 delivery. Correct a reported structural error before returning. Return the receipt ID and stop.
+PROMPT;
+    }
+
+    /** @param array<string, mixed> $resolutionInput */
+    public function pullRequestResolutionPrompt(
+        string $issueKey,
+        string $repository,
+        string $worktree,
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        string $receiptCommand,
+        array $resolutionInput,
+    ): string {
+        $evidence = json_encode(
+            $resolutionInput,
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+
+        return <<<PROMPT
+Independently propose a resolution for the repeated pull request review stop on {$issueKey}.
+
+Issue: {$issueKey}
+Worktree: {$worktree}
+Assigned phase: resolution
+Flow: discovery
+Delivery: {$deliveryId}
+Phase run: {$phaseRunId}
+Dispatch: {$dispatchId}
+Current process skill: {$repository}/.agents/skills/resolve-pipeline-issues/SKILL.md
+
+Use that skill in delegated advisory mode for this exact issue and stop. Inspect the live issue,
+its comments and relations, current origin/main, accepted ADRs, maintained documentation, the
+current candidate, and the immutable implementation and review evidence below:
+
+```json
+{$evidence}
+```
+
+This is advisory resolution only. Do not edit the repository, mutate Linear or GitHub, start
+another role, implement a correction, or invoke the legacy Orbit controller. Return the complete
+proposal contract required by the skill, including whether an ADR or human decision is required
+and the exact verification and restart condition. Write it to
+`.loop/runtime/resolution-handoff.md`. Also write this exact structured contract to
+`.loop/runtime/resolution.json`, using `planning` only when planning must restart:
+
+```json
+{"schema":1,"resume_phase":"implementing","required_adrs":[],"human_decisions":[],"issue_changes":[],"plan_changes":[]}
+```
+
+Every array is required. Each item must be a non-empty string. Empty means none, not omitted
+analysis. The JSON must agree with the complete proposal. Keep `.loop` untracked. These two
+runtime files are the only write exception to the resolver's otherwise read-only role.
+
+Before ending, run exactly one receipt command from the assigned worktree root:
+
+Complete proposal:
+`{$receiptCommand} --result=proposal --handoff=.loop/runtime/resolution-handoff.md --resolution=.loop/runtime/resolution.json`
+
+Resolver could not produce a complete proposal:
+`{$receiptCommand} --result=blocked --handoff=.loop/runtime/resolution-handoff.md`
+
+The receipt command validates the unchanged candidate, immutable dispatch, and exact proposal
+schema. It does not classify, publish, adopt, or apply the proposal. Commander owns those later
+steps. Return the receipt ID and stop.
 PROMPT;
     }
 }

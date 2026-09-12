@@ -4,14 +4,19 @@ use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitPullRequestReview;
 use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
+use App\Delivery\Actions\DispatchOrbitPullRequestResolution;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\StartOrbitDelivery;
+use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\HerdrAgentIdentifiers;
+use App\Delivery\Data\HerdrAgentLaunch;
+use App\Delivery\Data\OpenedHerdrWorktree;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
@@ -38,6 +43,7 @@ use App\Delivery\Workflow\OrbitPullRequestReviewReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitPullRequestReview as AdvancePullRequestReviewJob;
 use App\Jobs\DispatchOrbitImplementation;
+use App\Jobs\DispatchOrbitPullRequestResolution as DispatchResolutionJob;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
@@ -326,6 +332,75 @@ final class PullRequestReviewAdvancePublisher implements OrbitPullRequestReviewP
             state: $result === 'approved' ? 'APPROVED' : 'CHANGES_REQUESTED',
             reviewBodyHash: hash('sha256', $body),
             pullRequestBodyHash: hash('sha256', $pullRequestBody),
+        );
+    }
+}
+
+final class PullRequestResolutionHerdr implements HerdrRuntime
+{
+    /** @var list<string> */
+    public array $calls = [];
+
+    /** @var list<string> */
+    public array $prompts = [];
+
+    public ?HerdrAgentLaunch $launch = null;
+
+    public function openWorktree(
+        string $repositoryPath,
+        string $worktreePath,
+        ?string $label = null,
+    ): OpenedHerdrWorktree {
+        $this->calls[] = 'open';
+
+        return new OpenedHerdrWorktree('resolution-workspace', 'resolution-tab', 'worktree-pane', 'worktree-terminal', true);
+    }
+
+    public function splitPane(string $paneId, string $workingDirectory): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'split';
+
+        return $this->identifiers(null, 1);
+    }
+
+    public function startAgent(
+        string $paneId,
+        string $name,
+        ?HerdrAgentLaunch $launch = null,
+    ): HerdrAgentIdentifiers {
+        $this->calls[] = 'start';
+        $this->launch = $launch;
+
+        return $this->identifiers('resolver-agent', 2);
+    }
+
+    public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'prompt';
+        $this->prompts[] = $prompt;
+
+        return $this->identifiers('resolver-agent', 3);
+    }
+
+    public function getAgent(string $name): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'get';
+
+        return $this->identifiers('resolver-agent', 2);
+    }
+
+    private function identifiers(?string $agentId, int $sequence): HerdrAgentIdentifiers
+    {
+        return new HerdrAgentIdentifiers(
+            'resolution-workspace',
+            'resolution-tab',
+            'resolver-pane',
+            'resolver-terminal',
+            $agentId,
+            'orb-234-loop-resolution-1',
+            $sequence,
+            null,
+            null,
         );
     }
 }
@@ -766,6 +841,69 @@ function promotePullRequestReviewReceiptToSecondRound(object $test): void
     $test->repository->calls = 0;
     $test->pullRequests->calls = 0;
     $test->reviewPublisher->calls = 0;
+}
+
+/** @return array{PhaseRun, AgentDispatch} */
+function promotePullRequestReviewReceiptToResolution(object $test): array
+{
+    promotePullRequestReviewReceiptToSecondRound($test);
+    $arguments = [...$test->arguments, '--result' => 'changes'];
+    unset($arguments['--body']);
+    $test->repository->expectedBody = $test->submittedBody;
+    $test->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)->assertSuccessful();
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    app(AdvanceOrbitPullRequestReview::class)->handle($test->delivery->id, $test->phaseRun->id);
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+
+    return [$resolution, $resolution->agentDispatches()->sole()];
+}
+
+/** @return array{PhaseRun, AgentDispatch} */
+function activatePullRequestResolution(object $test): array
+{
+    [$resolution, $resolver] = promotePullRequestReviewReceiptToResolution($test);
+    $resolution->forceFill([
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now(),
+    ])->save();
+    $resolver->forceFill([
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'resolution-workspace',
+        'herdr_tab_id' => 'resolution-tab',
+        'herdr_pane_id' => 'resolver-pane',
+        'herdr_terminal_id' => 'resolver-terminal',
+        'herdr_agent_id' => 'resolver-agent',
+        'state_change_seq' => 2,
+        'dispatched_at' => now(),
+        'status' => AgentDispatchStatus::Waiting,
+    ])->save();
+    $prompt = app(OrbitFeatureWorkflow::class)->pullRequestResolutionPrompt(
+        'ORB-234',
+        $test->repositoryPath,
+        $test->worktreePath,
+        $test->delivery->id,
+        $resolution->id,
+        $resolver->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-resolution-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $resolution->id,
+            $resolver->id,
+        ),
+        $resolution->input,
+    );
+    $resolver->forceFill(['prompt_hash' => hash('sha256', $prompt)])->save();
+    $test->delivery->refresh()->forceFill([
+        'status' => DeliveryStatus::WaitingForAgent,
+    ])->save();
+
+    return [$resolution->fresh(), $resolver->fresh()];
 }
 
 function blockPullRequestReviewReceiptAsMissing(object $test): void
@@ -1547,4 +1685,195 @@ it('releases a contended phase-scoped review advancement lock for retry', functi
     } finally {
         $lock->release();
     }
+});
+
+it('queues the exact retained pull request resolution dispatch', function () {
+    [$resolution] = promotePullRequestReviewReceiptToResolution($this);
+
+    expect(app(AdvanceDeliveryAction::class)->handle($this->delivery->id))->toBeFalse();
+
+    Queue::assertPushed(
+        DispatchResolutionJob::class,
+        fn (DispatchResolutionJob $job): bool => $job->deliveryId === $this->delivery->id
+            && $job->phaseRunId === $resolution->id,
+    );
+});
+
+it('dispatches one independent advisory resolver with the legacy proposal contract', function () {
+    [$resolution, $resolver] = promotePullRequestReviewReceiptToResolution($this);
+    config()->set('herdr.session', 'orbit');
+    $herdr = new PullRequestResolutionHerdr;
+    app()->instance(HerdrRuntime::class, $herdr);
+    $this->repository->expectedBody = $this->submittedBody;
+    $this->repository->calls = 0;
+    $this->pullRequests->calls = 0;
+    $this->advanceIssues->calls = 0;
+
+    $result = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+
+    expect($result->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($result->id)->toBe($resolver->id)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($resolution->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($herdr->calls)->toBe(['open', 'split', 'start', 'prompt'])
+        ->and($herdr->launch?->kind)->toBe('codex')
+        ->and($herdr->launch?->arguments)->toContain(
+            'gpt-5.6-sol',
+            'model_reasoning_effort="high"',
+            'features.multi_agent=false',
+            'mcp_servers.context7.enabled=false',
+            'mcp_servers.solo_nick.enabled=false',
+            'mcp_servers.solo_mini.enabled=false',
+        )
+        ->and($herdr->prompts)->toHaveCount(1)
+        ->and($herdr->prompts[0])->toContain(
+            $this->repositoryPath.'/.agents/skills/resolve-pipeline-issues/SKILL.md',
+            'This is advisory resolution only.',
+            '--result=proposal',
+            '--resolution=.loop/runtime/resolution.json',
+            '"resume_phase":"implementing"',
+        )
+        ->and($herdr->prompts[0])->not->toContain('--result=implementation')
+        ->and($this->repository->calls)->toBe(2)
+        ->and($this->pullRequests->calls)->toBe(2)
+        ->and($this->advanceIssues->calls)->toBe(2)
+        ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+});
+
+it('captures one immutable structured resolution proposal and reaches its owned stop', function () {
+    [$resolution, $resolver] = activatePullRequestResolution($this);
+    $handoff = 'Use the loaded worker configuration as the health authority.';
+    $proposal = [
+        'schema' => 1,
+        'resume_phase' => 'implementing',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => [],
+        'plan_changes' => [],
+    ];
+    File::put($this->worktreePath.'/.loop/runtime/resolution-handoff.md', $handoff."\n");
+    File::put(
+        $this->worktreePath.'/.loop/runtime/resolution.json',
+        json_encode($proposal, JSON_THROW_ON_ERROR)."\n",
+    );
+    $arguments = [
+        'phase-run' => (string) $resolution->id,
+        'dispatch' => (string) $resolver->id,
+        '--result' => 'proposal',
+        '--handoff' => '.loop/runtime/resolution-handoff.md',
+        '--resolution' => '.loop/runtime/resolution.json',
+    ];
+
+    $this->artisan('delivery:submit-orbit-resolution-receipt', $arguments)->assertSuccessful();
+    $this->artisan('delivery:submit-orbit-resolution-receipt', $arguments)
+        ->expectsOutputToContain('was already captured')
+        ->assertSuccessful();
+    File::put($this->worktreePath.'/.loop/runtime/resolution-handoff.md', "Different proposal.\n");
+    $this->artisan('delivery:submit-orbit-resolution-receipt', $arguments)
+        ->expectsOutputToContain('different resolution receipt')
+        ->assertFailed();
+
+    $receipt = $resolution->receipts()->where('kind', 'orbit_resolution')->sole();
+    expect($receipt->payload['result'])->toBe('proposal')
+        ->and($receipt->payload['handoff'])->toBe($handoff)
+        ->and($receipt->payload['resolution'])->toBe($proposal)
+        ->and($receipt->payload['resolution_sha256'])->toBe(
+            hash('sha256', json_encode($proposal, JSON_THROW_ON_ERROR)),
+        )
+        ->and($resolution->receipts()->count())->toBe(1);
+
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
+
+    expect($resolution->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($resolution->fresh()->output)->toBe([
+            'receipt_id' => $receipt->id,
+            'result' => 'proposal',
+        ])
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'resolution_proposal_ready',
+            'phase_run_id' => $resolution->id,
+            'dispatch_id' => $resolver->id,
+            'receipt_id' => $receipt->id,
+        ]);
+});
+
+it('rejects a malformed structured resolution proposal', function (array $proposal) {
+    [$resolution, $resolver] = activatePullRequestResolution($this);
+    File::put($this->worktreePath.'/.loop/runtime/resolution-handoff.md', "Complete proposal.\n");
+    File::put(
+        $this->worktreePath.'/.loop/runtime/resolution.json',
+        json_encode($proposal, JSON_THROW_ON_ERROR)."\n",
+    );
+
+    $this->artisan('delivery:submit-orbit-resolution-receipt', [
+        'phase-run' => (string) $resolution->id,
+        'dispatch' => (string) $resolver->id,
+        '--result' => 'proposal',
+        '--handoff' => '.loop/runtime/resolution-handoff.md',
+        '--resolution' => '.loop/runtime/resolution.json',
+    ])->expectsOutputToContain('no longer matches')->assertFailed();
+
+    expect($resolution->receipts()->where('kind', 'orbit_resolution')->doesntExist())->toBeTrue();
+})->with([
+    'missing required array' => [[
+        'schema' => 1,
+        'resume_phase' => 'implementing',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => [],
+    ]],
+    'invalid resume phase' => [[
+        'schema' => 1,
+        'resume_phase' => 'resolution',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => [],
+        'plan_changes' => [],
+    ]],
+    'empty requirement' => [[
+        'schema' => 1,
+        'resume_phase' => 'implementing',
+        'required_adrs' => [''],
+        'human_decisions' => [],
+        'issue_changes' => [],
+        'plan_changes' => [],
+    ]],
+]);
+
+it('captures a blocked resolver result without a proposal document', function () {
+    [$resolution, $resolver] = activatePullRequestResolution($this);
+    File::put(
+        $this->worktreePath.'/.loop/runtime/resolution-handoff.md',
+        "The resolver could not produce a safe proposal.\n",
+    );
+
+    $this->artisan('delivery:submit-orbit-resolution-receipt', [
+        'phase-run' => (string) $resolution->id,
+        'dispatch' => (string) $resolver->id,
+        '--result' => 'blocked',
+        '--handoff' => '.loop/runtime/resolution-handoff.md',
+    ])->assertSuccessful();
+
+    $receipt = $resolution->receipts()->where('kind', 'orbit_resolution')->sole();
+    expect($receipt->payload['resolution'])->toBeNull()
+        ->and($receipt->payload['resolution_path'])->toBeNull()
+        ->and($receipt->payload['resolution_sha256'])->toBeNull();
+
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
+
+    expect($resolution->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('resolution_blocked');
 });
