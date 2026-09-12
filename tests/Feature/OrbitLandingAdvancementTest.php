@@ -7,6 +7,7 @@ use App\Delivery\Actions\RunOrbitMainCacheRefresh;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
+use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitMainCacheRefreshRequester;
@@ -506,20 +507,37 @@ final class LandingWorktreeCleaner implements OrbitWorktreeCleaner
     }
 }
 
-final class LandingIssues implements OrbitActiveIssueProvider
+final class LandingIssues implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider
 {
     public int $transactionLevel = 0;
 
     public int $calls = 0;
 
+    public int $activeCalls = 0;
+
+    public int $closeoutCalls = 0;
+
     public string $state = 'In Review';
 
     public mixed $assignee = null;
+
+    public string $closeoutState = 'In Review';
+
+    public mixed $closeoutAssignee = null;
+
+    public mixed $closeoutDelegate = ['id' => '4fa61558-9052-45f7-8a7c-49e0b891d4bf'];
+
+    public bool $completeAfterCleanup = false;
 
     public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         expect(DB::transactionLevel())->toBe($this->transactionLevel);
         $this->calls++;
+        $this->activeCalls++;
+
+        if ($this->completeAfterCleanup && test()->worktreeCleaner->calls > 0) {
+            return $this->closeoutSnapshot($issueId, $issueKey);
+        }
 
         return new OrbitIssueSnapshot(
             $issueId,
@@ -530,6 +548,37 @@ final class LandingIssues implements OrbitActiveIssueProvider
                 'state' => ['id' => 'review', 'name' => $this->state, 'type' => 'started'],
                 'assignee' => $this->assignee,
                 'delegate' => ['id' => config('commander.hermes.tom_linear_viewer_id')],
+            ],
+            str_repeat('d', 64),
+        );
+    }
+
+    public function fetchForCloseout(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel);
+        $this->calls++;
+        $this->closeoutCalls++;
+
+        return $this->closeoutSnapshot($issueId, $issueKey);
+    }
+
+    private function closeoutSnapshot(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        $completed = $this->closeoutState === 'Done';
+
+        return new OrbitIssueSnapshot(
+            $issueId,
+            $issueKey,
+            [
+                'id' => $issueId,
+                'identifier' => $issueKey,
+                'state' => [
+                    'id' => $completed ? '77777777-8888-4999-8aaa-bbbbbbbbbbbb' : 'review',
+                    'name' => $this->closeoutState,
+                    'type' => $completed ? 'completed' : 'started',
+                ],
+                'assignee' => $this->closeoutAssignee,
+                'delegate' => $this->closeoutDelegate,
             ],
             str_repeat('d', 64),
         );
@@ -1083,6 +1132,7 @@ beforeEach(function () {
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitImplementationRepository::class, $this->implementations);
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
+    app()->instance(OrbitCloseoutIssueProvider::class, $this->issues);
     app()->instance(OrbitIssueCompletionTransitioner::class, $this->issueCompletion);
     app()->instance(OrbitMainCorrectnessInspector::class, $this->main);
     app()->instance(OrbitPullRequestLandingGateway::class, $this->gateway);
@@ -1810,6 +1860,29 @@ it('retains cleanup evidence and the merge reservation while Linear closeout ret
         ->and($this->worktreeCleaner->calls)->toBe(1)
         ->and($this->issueCompletion->calls)->toBe(2)
         ->and($this->issueCompletion->mutationCalls)->toBe(1)
+        ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('records closeout when Linear already completed the merged issue', function () {
+    $this->issues->closeoutState = 'Done';
+    $this->issues->closeoutDelegate = null;
+    $this->issues->completeAfterCleanup = true;
+    $this->issueCompletion->completed = true;
+
+    expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))
+        ->toBeNull();
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Completed)
+        ->and($this->landing->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->landing->fresh()->output['linear_closeout']['state'])->toBe([
+            'id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            'name' => 'Done',
+            'type' => 'completed',
+        ])
+        ->and($this->issues->activeCalls)->toBe(1)
+        ->and($this->issues->closeoutCalls)->toBe(1)
+        ->and($this->issueCompletion->calls)->toBe(1)
+        ->and($this->issueCompletion->mutationCalls)->toBe(0)
         ->and($this->gateway->releaseCalls)->toBe(1);
 });
 

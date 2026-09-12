@@ -6,6 +6,7 @@ namespace App\Delivery\Actions;
 
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
+use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitMainCorrectnessInspector;
@@ -58,6 +59,7 @@ final readonly class AdvanceOrbitLanding
         private OrbitRepository $repository,
         private OrbitImplementationRepository $implementations,
         private OrbitActiveIssueProvider $issues,
+        private OrbitCloseoutIssueProvider $closeoutIssues,
         private OrbitMainCorrectnessInspector $main,
         private OrbitPullRequestLandingGateway $pullRequests,
         private OrbitMergeLineageVerifier $merges,
@@ -1914,8 +1916,8 @@ final readonly class AdvanceOrbitLanding
             );
         }
 
-        $current = $this->issues->fetchActive($expected->issueId, $expected->issueKey);
-        $this->assertCurrentIssue($delivery, $preparation, $current);
+        $current = $this->closeoutIssues->fetchForCloseout($expected->issueId, $expected->issueKey);
+        $this->assertCloseoutIssue($delivery, $preparation, $current);
 
         $completed = $this->issueCompletion->transitionToDone(
             $expected->issueId,
@@ -1945,6 +1947,39 @@ final readonly class AdvanceOrbitLanding
         ];
 
         $this->recordLinearCloseout($deliveryId, $phaseId, $evidence);
+    }
+
+    private function assertCloseoutIssue(
+        Delivery $delivery,
+        OrbitDeliveryPreparation $preparation,
+        OrbitIssueSnapshot $issue,
+    ): void {
+        $state = $issue->payload['state'] ?? null;
+        $alreadyCompleted = is_array($state)
+            && ($state['name'] ?? null) === 'Done'
+            && ($state['type'] ?? null) === 'completed'
+            && array_key_exists('assignee', $issue->payload)
+            && $issue->payload['assignee'] === null
+            && array_key_exists('delegate', $issue->payload)
+            && $issue->payload['delegate'] === null;
+
+        if (! $alreadyCompleted) {
+            $this->assertCurrentIssue($delivery, $preparation, $issue);
+
+            return;
+        }
+
+        if ($issue->issueId !== $preparation->snapshot->issueId
+            || $issue->issueKey !== $preparation->snapshot->issueKey
+            || ! $this->snapshots->matchesExpectedContract(
+                $issue,
+                $preparation->snapshot->contractHash,
+                $delivery->pull_request_url,
+            )) {
+            throw new OrbitIssueContractChanged(
+                'The Orbit issue changed before Linear closeout.',
+            );
+        }
     }
 
     /** @param array<string, mixed> $evidence */
