@@ -2,7 +2,9 @@
 
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitPullRequestReview;
+use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
+use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
@@ -41,6 +43,7 @@ use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
@@ -585,6 +588,8 @@ beforeEach(function () {
 });
 
 afterEach(function () {
+    Carbon::setTestNow();
+
     if (is_string($this->originalDirectory)) {
         chdir($this->originalDirectory);
     }
@@ -763,6 +768,25 @@ function promotePullRequestReviewReceiptToSecondRound(object $test): void
     $test->reviewPublisher->calls = 0;
 }
 
+function blockPullRequestReviewReceiptAsMissing(object $test): void
+{
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'state_change_seq' => 37,
+        'settled_at' => now(),
+    ])->save();
+    Carbon::setTestNow(now()->addMinutes(5));
+
+    expect(app(ReconcileOrbitPullRequestReviewWait::class)->handle(
+        $test->delivery->id,
+        $test->phaseRun->id,
+        $test->dispatch->id,
+        null,
+    ))->toBeTrue()
+        ->and($test->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($test->phaseRun->fresh()->failure_code)->toBe('pr_review_receipt_missing');
+}
+
 it('captures one immutable approved pull request review receipt', function () {
     $this->artisan('delivery:submit-orbit-pr-review-receipt', $this->arguments)->assertSuccessful();
 
@@ -837,6 +861,124 @@ it('captures the second review without protocol agent ids', function () {
         ->where('kind', 'orbit_pr_review')
         ->sole()
         ->payload['result'])->toBe('approved');
+});
+
+it('recovers an exact late second-review receipt after the receipt grace timeout', function () {
+    promotePullRequestReviewReceiptToSecondRound($this);
+    $this->dispatch->forceFill(['herdr_agent_id' => null])->save();
+    blockPullRequestReviewReceiptAsMissing($this);
+    Queue::fake();
+    File::put($this->handoffPath, "The loaded PHP-FPM worker identity can drift from the restored files.\n");
+    $arguments = [...$this->arguments, '--result' => 'changes'];
+    unset($arguments['--body']);
+    $this->repository->expectedBody = $this->submittedBody;
+
+    $blockedDelivery = $this->delivery->fresh();
+    $failedPhase = $this->phaseRun->fresh();
+    $settledDispatch = $this->dispatch->fresh();
+    expect(app(CaptureOrbitPullRequestReviewReceipt::class)->canRecoverLateReceipt(
+        $blockedDelivery,
+        $failedPhase,
+        $settledDispatch,
+        1,
+        false,
+    ))->toBeTrue();
+
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)->assertSuccessful();
+
+    $receipt = Receipt::query()
+        ->where('phase_run_id', $this->phaseRun->id)
+        ->where('kind', 'orbit_pr_review')
+        ->sole();
+    $phase = $this->phaseRun->fresh();
+    $delivery = $this->delivery->fresh();
+    $dispatch = $this->dispatch->fresh();
+
+    expect($receipt->payload['result'])->toBe('changes')
+        ->and($receipt->payload['attempt'])->toBe(2)
+        ->and($phase->status)->toBe(PhaseRunStatus::Running)
+        ->and($phase->failure_code)->toBeNull()
+        ->and($phase->failure_message)->toBeNull()
+        ->and($phase->failure_details)->toBeNull()
+        ->and($phase->finished_at)->toBeNull()
+        ->and($delivery->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($delivery->failure_details)->toBeNull()
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Settled)
+        ->and($dispatch->state_change_seq)->toBe(37)
+        ->and($dispatch->settled_at)->not->toBeNull();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
+
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)
+        ->expectsOutputToContain('was already captured')
+        ->assertSuccessful();
+    expect(Receipt::query()
+        ->where('phase_run_id', $this->phaseRun->id)
+        ->where('kind', 'orbit_pr_review')
+        ->count())->toBe(1);
+});
+
+it('rejects malformed late-review recovery ledgers before repository verification', function (string $drift) {
+    promotePullRequestReviewReceiptToSecondRound($this);
+    blockPullRequestReviewReceiptAsMissing($this);
+
+    match ($drift) {
+        'delivery evidence' => $this->delivery->refresh()->forceFill([
+            'failure_details' => [...$this->delivery->failure_details, 'dispatch_id' => -1],
+        ])->save(),
+        'phase code' => $this->phaseRun->refresh()->forceFill([
+            'failure_code' => 'pr_review_wait_timeout',
+        ])->save(),
+        'phase output' => $this->phaseRun->refresh()->forceFill([
+            'output' => ['result' => 'changes'],
+        ])->save(),
+        'dispatch status' => $this->dispatch->forceFill([
+            'status' => AgentDispatchStatus::Waiting,
+        ])->save(),
+        'dispatch sequence' => $this->dispatch->forceFill([
+            'state_change_seq' => 38,
+        ])->save(),
+    };
+    $arguments = [...$this->arguments, '--result' => 'changes'];
+    unset($arguments['--body']);
+    $this->repository->expectedBody = $this->submittedBody;
+
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)
+        ->expectsOutput('The pull request review phase run and dispatch do not match an active reviewer.')
+        ->assertFailed();
+
+    expect($this->repository->calls)->toBe(0)
+        ->and(Receipt::query()
+            ->where('phase_run_id', $this->phaseRun->id)
+            ->where('kind', 'orbit_pr_review')
+            ->doesntExist())->toBeTrue();
+})->with([
+    'delivery evidence',
+    'phase code',
+    'phase output',
+    'dispatch status',
+    'dispatch sequence',
+]);
+
+it('rejects a late-review ledger race after external verification', function () {
+    promotePullRequestReviewReceiptToSecondRound($this);
+    blockPullRequestReviewReceiptAsMissing($this);
+    $arguments = [...$this->arguments, '--result' => 'changes'];
+    unset($arguments['--body']);
+    $this->repository->expectedBody = $this->submittedBody;
+    $this->repository->afterVerify = function (): void {
+        $this->dispatch->forceFill(['state_change_seq' => 38])->save();
+    };
+
+    $this->artisan('delivery:submit-orbit-pr-review-receipt', $arguments)
+        ->expectsOutput('The pull request review receipt no longer matches the active dispatch.')
+        ->assertFailed();
+
+    expect($this->repository->calls)->toBe(1)
+        ->and(Receipt::query()
+            ->where('phase_run_id', $this->phaseRun->id)
+            ->where('kind', 'orbit_pr_review')
+            ->doesntExist())->toBeTrue()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked);
 });
 
 it('routes second-round approval to landing', function () {

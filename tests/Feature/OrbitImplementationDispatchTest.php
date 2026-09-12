@@ -1179,7 +1179,7 @@ it('blocks an ambiguous prompt and never replays it', function () {
     expect($this->herdr->prompts)->toHaveCount(1);
 });
 
-it('preserves settlement while the implementation prompt returns', function () {
+it('ignores an idle completion event while the implementation prompt returns', function () {
     config()->set('herdr.orchestration.enabled', true);
     $this->herdr->beforePromptReturn = function (): void {
         app(CaptureHerdrEvent::class)->handle([
@@ -1195,13 +1195,13 @@ it('preserves settlement while the implementation prompt returns', function () {
 
     $dispatch = app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
 
-    expect($dispatch->status)->toBe(AgentDispatchStatus::Settled)
+    expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($dispatch->error_code)->toBeNull()
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
-    Queue::assertPushed(AdvanceDelivery::class, 1);
+    Queue::assertNothingPushed();
 });
 
-it('preserves correction settlement while the retained-Builder prompt returns', function () {
+it('ignores an idle completion event while the retained-Builder prompt returns', function () {
     promoteImplementationToMergeConflictCorrection($this);
     config()->set('herdr.orchestration.enabled', true);
     $this->herdr->beforePromptReturn = function (): void {
@@ -1219,11 +1219,11 @@ it('preserves correction settlement while the retained-Builder prompt returns', 
     $dispatch = app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
 
     expect($dispatch->id)->toBe($this->correctionDispatch->id)
-        ->and($dispatch->status)->toBe(AgentDispatchStatus::Settled)
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($dispatch->error_code)->toBeNull()
         ->and($this->implementation->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
-    Queue::assertPushed(AdvanceDelivery::class, 1);
+    Queue::assertNothingPushed();
 });
 
 it('bounds the implementation job and preserves blocked recovery on failure', function () {

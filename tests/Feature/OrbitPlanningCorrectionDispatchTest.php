@@ -533,7 +533,7 @@ it('blocks an ambiguous prompt and never replays it', function () {
     expect($this->herdr->prompts)->toHaveCount(1);
 });
 
-it('preserves settlement while the correction prompt returns', function () {
+it('ignores an idle completion event while the correction prompt returns', function () {
     config()->set('herdr.orchestration.enabled', true);
     $this->herdr->beforePromptReturn = function (): void {
         app(CaptureHerdrEvent::class)->handle([
@@ -549,10 +549,10 @@ it('preserves settlement while the correction prompt returns', function () {
 
     $dispatch = app(DispatchOrbitPlanningCorrection::class)->handle($this->delivery->id);
 
-    expect($dispatch->status)->toBe(AgentDispatchStatus::Settled)
+    expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($dispatch->error_code)->toBeNull()
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
-    Queue::assertPushed(AdvanceDelivery::class, 1);
+    Queue::assertNothingPushed();
 });
 
 it('bounds the correction job and preserves blocked recovery on failure', function () {

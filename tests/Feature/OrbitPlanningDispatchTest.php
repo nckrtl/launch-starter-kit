@@ -748,10 +748,10 @@ it('does not settle an unsequenced startup event while the planning prompt is in
 
     expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($dispatch->settled_at)->toBeNull()
-        ->and($event?->delivery_id)->toBe($this->delivery->id)
-        ->and($event?->agent_dispatch_id)->toBe($dispatch->id)
-        ->and($event?->failure_message)->toBe('unsequenced_dispatch_event')
-        ->and($event?->processed_at)->not->toBeNull()
+        ->and($event?->delivery_id)->toBeNull()
+        ->and($event?->agent_dispatch_id)->toBeNull()
+        ->and($event?->failure_message)->toBe('unmatched_dispatch')
+        ->and($event?->processed_at)->toBeNull()
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
     Queue::assertNothingPushed();
 });
@@ -796,12 +796,12 @@ it('does not overwrite a plan-review transition committed before the prompt call
 
     $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
 
-    expect($dispatch->status)->toBe(AgentDispatchStatus::Settled)
+    expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($dispatch->error_code)->toBeNull()
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
         ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
-        ->and(ExternalEvent::sole()->agent_dispatch_id)->toBe($dispatch->id)
-        ->and(ExternalEvent::sole()->failure_message)->toBeNull()
-        ->and(ExternalEvent::sole()->processed_at)->not->toBeNull();
-    Queue::assertPushed(AdvanceDelivery::class, 1);
+        ->and(ExternalEvent::sole()->agent_dispatch_id)->toBeNull()
+        ->and(ExternalEvent::sole()->failure_message)->toBe('unmatched_dispatch')
+        ->and(ExternalEvent::sole()->processed_at)->toBeNull();
+    Queue::assertNothingPushed();
 });

@@ -121,13 +121,7 @@ final readonly class CaptureHerdrEvent
             ->where('herdr_session', is_string($session) ? $session : '')
             ->when($paneId !== null, fn ($query) => $query->where('herdr_pane_id', $paneId))
             ->when($workspaceId !== null, fn ($query) => $query->where('herdr_workspace_id', $workspaceId))
-            ->where(function ($query): void {
-                $query->whereIn('status', [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled])
-                    ->orWhere(function ($query): void {
-                        $query->where('status', AgentDispatchStatus::Starting)
-                            ->where('error_code', 'herdr_prompt_attempted');
-                    });
-            })
+            ->whereIn('status', [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled])
             ->get()
             ->filter(static function (AgentDispatch $candidate): bool {
                 $phase = $candidate->phaseRun;
@@ -202,11 +196,7 @@ final readonly class CaptureHerdrEvent
                 return false;
             }
 
-            $promptWasAttempted = $locked->status === AgentDispatchStatus::Starting
-                && $locked->error_code === 'herdr_prompt_attempted';
-
-            if (! $promptWasAttempted
-                && ! in_array($locked->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true)) {
+            if (! in_array($locked->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true)) {
                 $event->failure_message = 'unmatched_dispatch';
                 $event->save();
 
@@ -239,12 +229,6 @@ final readonly class CaptureHerdrEvent
             $event->agent_dispatch_id = $locked->id;
             $event->failure_message = null;
             $event->save();
-
-            if ($promptWasAttempted
-                && $delivery->status === DeliveryStatus::Preparing) {
-                $delivery->status = DeliveryStatus::WaitingForAgent;
-                $delivery->save();
-            }
 
             return true;
         });

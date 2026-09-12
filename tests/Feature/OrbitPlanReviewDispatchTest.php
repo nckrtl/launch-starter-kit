@@ -866,7 +866,7 @@ it('keeps duplicate review-dispatch jobs idempotent', function () {
         ->and(AgentDispatch::where('agent_role', OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE)->count())->toBe(1);
 });
 
-it('preserves receipt and settlement races while the reviewer prompt returns', function () {
+it('preserves a receipt but ignores idle settlement while the reviewer prompt returns', function () {
     config()->set('herdr.orchestration.enabled', true);
     $this->herdr->beforePromptReturn = function (): void {
         $dispatch = $this->dispatch->fresh();
@@ -890,13 +890,13 @@ it('preserves receipt and settlement races while the reviewer prompt returns', f
 
     $dispatch = app(DispatchOrbitPlanReview::class)->handle($this->delivery->id);
 
-    expect($dispatch->status)->toBe(AgentDispatchStatus::Settled)
+    expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($dispatch->error_code)->toBeNull()
         ->and(Receipt::where('kind', 'orbit_plan_review')->count())->toBe(1)
-        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE)
-        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
-        ->and($this->review->fresh()->status)->toBe(PhaseRunStatus::Completed);
-    Queue::assertPushed(AdvanceDelivery::class, 2);
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->review->fresh()->status)->toBe(PhaseRunStatus::Running);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('rejects a changed source review receipt before routing', function (string $change) {

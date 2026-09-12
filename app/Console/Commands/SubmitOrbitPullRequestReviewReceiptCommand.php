@@ -59,7 +59,7 @@ final class SubmitOrbitPullRequestReviewReceiptCommand extends Command
         }
 
         $phaseRun = PhaseRun::query()
-            ->with(['delivery.projectOrchestration', 'agentDispatches'])
+            ->with(['delivery.projectOrchestration', 'agentDispatches', 'receipts'])
             ->find($phaseRunId);
         $dispatch = $phaseRun?->agentDispatches->firstWhere('id', $dispatchId);
         $latestReviewId = $phaseRun === null
@@ -70,23 +70,34 @@ final class SubmitOrbitPullRequestReviewReceiptCommand extends Command
                 ->latest('attempt')
                 ->value('id');
 
+        $active = $phaseRun !== null && $dispatch !== null
+            && ($phaseRun->delivery->status === DeliveryStatus::WaitingForAgent
+                || ($phaseRun->delivery->status === DeliveryStatus::Preparing
+                    && $dispatch->status === AgentDispatchStatus::Starting
+                    && $dispatch->error_code === 'herdr_prompt_attempted'))
+            && $phaseRun->status === PhaseRunStatus::Running
+            && (($dispatch->status === AgentDispatchStatus::Starting
+                && $dispatch->error_code === 'herdr_prompt_attempted')
+                || in_array($dispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true));
+        $recovering = $phaseRun !== null && $dispatch !== null
+            && $capture->canRecoverLateReceipt(
+                $phaseRun->delivery,
+                $phaseRun,
+                $dispatch,
+                $phaseRun->agentDispatches->count(),
+                $phaseRun->receipts->contains('kind', 'orbit_pr_review'),
+            );
+
         if ($phaseRun === null || $dispatch === null || $phaseRun->agentDispatches->count() !== 1
             || $latestReviewId !== $phaseRun->id
             || $phaseRun->delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
             || $phaseRun->delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $phaseRun->delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
             || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
-            || ($phaseRun->delivery->status !== DeliveryStatus::WaitingForAgent
-                && ! ($phaseRun->delivery->status === DeliveryStatus::Preparing
-                    && $dispatch->status === AgentDispatchStatus::Starting
-                    && $dispatch->error_code === 'herdr_prompt_attempted'))
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
             || ! in_array($phaseRun->attempt, [1, 2], true)
-            || $phaseRun->status !== PhaseRunStatus::Running
             || $dispatch->agent_role !== OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
-            || (! ($dispatch->status === AgentDispatchStatus::Starting
-                && $dispatch->error_code === 'herdr_prompt_attempted')
-                && ! in_array($dispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true))) {
+            || (! $active && ! $recovering)) {
             $this->error('The pull request review phase run and dispatch do not match an active reviewer.');
 
             return self::FAILURE;
