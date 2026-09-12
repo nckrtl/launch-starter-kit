@@ -5,12 +5,20 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPlanning;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
+use App\Delivery\Data\HerdrAgentOutput;
+use App\Delivery\Data\HerdrForegroundProcess;
+use App\Delivery\Data\HerdrPaneProcessInfo;
+use App\Delivery\Data\HerdrSessionSnapshot;
+use App\Delivery\Data\HerdrSnapshotAgent;
+use App\Delivery\Data\HerdrSnapshotPane;
+use App\Delivery\Data\HerdrSnapshotWorkspace;
 use App\Delivery\Data\OpenedHerdrWorktree;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
@@ -28,8 +36,10 @@ use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPlanningDispatchFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Herdr\RequestFailed;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\DispatchOrbitPlanning as DispatchOrbitPlanningJob;
+use App\Jobs\ReconcileDeliveries;
 use App\Models\AgentDispatch;
 use App\Models\ExternalEvent;
 use App\Models\PhaseRun;
@@ -206,6 +216,20 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
 
     public ?HerdrAgentIdentifiers $observedAgent = null;
 
+    /** @var list<string> */
+    public array $startFailureCodes = [];
+
+    /** @var list<string> */
+    public array $getFailureCodes = [];
+
+    public int $startCalls = 0;
+
+    public int $getCalls = 0;
+
+    public ?string $workingDirectory = null;
+
+    public string $agentStatus = 'idle';
+
     public ?string $startedAgentId = 'codex-session-1';
 
     public ?string $promptedAgentId = 'codex-session-1';
@@ -248,7 +272,14 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
     ): HerdrAgentIdentifiers {
         $this->launch = $launch;
         $this->startedName = $name;
+        $this->startCalls++;
         $this->call('herdr.start');
+
+        if ($this->startFailureCodes !== []) {
+            $code = array_shift($this->startFailureCodes);
+
+            throw new RequestFailed("agent.start failed ({$code})", $code);
+        }
 
         return $this->identifiers($name, 40, $this->startedAgentId);
     }
@@ -271,7 +302,14 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
 
     public function getAgent(string $name): HerdrAgentIdentifiers
     {
+        $this->getCalls++;
         $this->call('herdr.get');
+
+        if ($this->getFailureCodes !== []) {
+            $code = array_shift($this->getFailureCodes);
+
+            throw new RequestFailed("agent.get failed ({$code})", $code);
+        }
 
         return $this->observedAgent ?? $this->identifiers($name, 40, $this->startedAgentId);
     }
@@ -302,7 +340,76 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
             $agentId,
             $name,
             $sequence,
+            $this->workingDirectory,
+            $this->agentStatus,
         );
+    }
+}
+
+final class PlanningDispatchWorkspaceRuntime implements HerdrWorkspaceRuntime
+{
+    public HerdrSessionSnapshot $snapshot;
+
+    public HerdrPaneProcessInfo $process;
+
+    public int $snapshotCalls = 0;
+
+    public int $processCalls = 0;
+
+    public function __construct(string $worktree)
+    {
+        $this->snapshot = new HerdrSessionSnapshot(
+            version: '0.8.2',
+            protocol: 20,
+            workspaces: [
+                new HerdrSnapshotWorkspace('workspace-1', '/home/nckrtl/orbit', $worktree, true),
+            ],
+            panes: [
+                new HerdrSnapshotPane(
+                    'workspace-1',
+                    'tab-1',
+                    'worker-pane',
+                    'worker-terminal',
+                    $worktree,
+                ),
+            ],
+            agents: [],
+        );
+        $this->process = new HerdrPaneProcessInfo(
+            paneId: 'worker-pane',
+            shellProcessId: 123,
+            foregroundProcessGroupId: 123,
+            foregroundProcesses: [new HerdrForegroundProcess(123, 'zsh')],
+        );
+    }
+
+    public function snapshot(): HerdrSessionSnapshot
+    {
+        $this->snapshotCalls++;
+
+        return $this->snapshot;
+    }
+
+    public function readAgent(string $name): HerdrAgentOutput
+    {
+        throw new LogicException('Unexpected Herdr agent read request.');
+    }
+
+    public function sendAgentKeys(string $name, array $keys): void
+    {
+        throw new LogicException('Unexpected Herdr agent key request.');
+    }
+
+    public function inspectPaneProcess(string $paneId): HerdrPaneProcessInfo
+    {
+        $this->processCalls++;
+
+        return $this->process;
+    }
+
+    public function closeWorkspace(string $workspaceId, int $protocol): void
+    {
+        throw new LogicException('Unexpected Herdr workspace close request.');
     }
 }
 
@@ -340,13 +447,19 @@ beforeEach(function () {
     );
     $this->log = new PlanningDispatchLog;
     $this->repository = new PlanningDispatchRepository($this->log);
-    $this->issues = new PlanningDispatchIssueProvider([$this->todo, $this->inProgress], $this->log);
+    $this->issues = new PlanningDispatchIssueProvider(
+        [$this->todo, $this->inProgress, $this->inProgress],
+        $this->log,
+    );
     $this->transitioner = new PlanningDispatchTransitioner($this->inProgress, $this->log);
     $this->herdr = new PlanningDispatchHerdrRuntime($this->log, $this->repository);
+    $this->herdr->workingDirectory = $this->worktree;
+    $this->herdrWorkspace = new PlanningDispatchWorkspaceRuntime($this->worktree);
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitIssueProvider::class, $this->issues);
     app()->instance(OrbitIssueTransitioner::class, $this->transitioner);
     app()->instance(HerdrRuntime::class, $this->herdr);
+    app()->instance(HerdrWorkspaceRuntime::class, $this->herdrWorkspace);
     Queue::fake();
 });
 
@@ -368,6 +481,30 @@ function planningDispatchSnapshot(string $state, string $contractHash): OrbitIss
     ];
 
     return new OrbitIssueSnapshot($payload['id'], $payload['identifier'], $payload, $contractHash);
+}
+
+function blockAmbiguousPlanningStart(object $test): AgentDispatch
+{
+    $test->herdr->startFailureCodes = ['agent_pane_busy'];
+    $test->herdr->getFailureCodes = ['agent_not_found'];
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->handle($test->delivery->id))
+        ->toThrow(OrbitPlanningDispatchFailed::class, 'agent-start outcome is unresolved');
+
+    $dispatch = AgentDispatch::sole();
+
+    expect($test->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($test->delivery->fresh()->failure_details)->toBe([
+            'code' => 'herdr_start_ambiguous',
+            'dispatch_id' => $dispatch->id,
+            'message' => 'agent.start failed (agent_pane_busy)',
+        ])
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Ambiguous)
+        ->and($dispatch->herdr_agent_id)->toBeNull()
+        ->and($dispatch->state_change_seq)->toBeNull()
+        ->and($dispatch->dispatched_at)->toBeNull();
+
+    return $dispatch;
 }
 
 it('dispatches one verified planner while retaining the controller reservation through prompt submission', function () {
@@ -576,6 +713,213 @@ it('reconciles an ambiguous deterministic agent start without starting a replace
         ->and($this->log->events)->toContain('herdr.start', 'herdr.get', 'herdr.prompt')
         ->and(collect($this->log->events)->filter(fn (string $event): bool => $event === 'herdr.start'))->toHaveCount(1)
         ->and(AgentDispatch::count())->toBe(1);
+});
+
+it('recovers one exact pre-agent busy planning start without replacing retained state', function () {
+    $dispatch = blockAmbiguousPlanningStart($this);
+    $phase = PhaseRun::sole();
+    $retained = $dispatch->only([
+        'id',
+        'phase_run_id',
+        'herdr_workspace_id',
+        'herdr_tab_id',
+        'herdr_pane_id',
+        'herdr_terminal_id',
+        'herdr_agent_name',
+        'prompt_hash',
+    ]);
+    $this->herdr->getFailureCodes = ['agent_not_found'];
+    $job = new DispatchOrbitPlanningJob($this->delivery->id, $phase->id);
+
+    $job->handle(app(DispatchOrbitPlanning::class));
+    $job->handle(app(DispatchOrbitPlanning::class));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and(PhaseRun::count())->toBe(1)
+        ->and(AgentDispatch::count())->toBe(1)
+        ->and(AgentDispatch::sole()->only(array_keys($retained)))->toBe($retained)
+        ->and(AgentDispatch::sole()->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and(AgentDispatch::sole()->herdr_agent_id)->toBe('codex-session-1')
+        ->and(AgentDispatch::sole()->dispatched_at)->not->toBeNull()
+        ->and($this->herdr->startCalls)->toBe(2)
+        ->and($this->herdr->prompts)->toHaveCount(1)
+        ->and($this->herdrWorkspace->snapshotCalls)->toBe(1)
+        ->and($this->herdrWorkspace->processCalls)->toBe(1)
+        ->and(collect($this->log->events)->filter(fn (string $event): bool => $event === 'herdr.open'))->toHaveCount(1)
+        ->and(collect($this->log->events)->filter(fn (string $event): bool => $event === 'herdr.split'))->toHaveCount(1);
+    Queue::assertNothingPushed();
+});
+
+it('adopts an exact planner that appeared after the busy response without starting it again', function () {
+    $dispatch = blockAmbiguousPlanningStart($this);
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $dispatch->herdr_workspace_id,
+        tabId: (string) $dispatch->herdr_tab_id,
+        paneId: (string) $dispatch->herdr_pane_id,
+        terminalId: (string) $dispatch->herdr_terminal_id,
+        agentId: 'appeared-session',
+        agentName: (string) $dispatch->herdr_agent_name,
+        stateChangeSeq: 51,
+        workingDirectory: $this->worktree,
+        agentStatus: 'idle',
+    );
+    $this->herdr->promptedAgentId = 'appeared-session';
+
+    app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    );
+
+    expect($this->herdr->startCalls)->toBe(1)
+        ->and($this->herdrWorkspace->snapshotCalls)->toBe(0)
+        ->and($this->herdr->prompts)->toHaveCount(1)
+        ->and(AgentDispatch::sole()->herdr_agent_id)->toBe('appeared-session')
+        ->and(AgentDispatch::sole()->status)->toBe(AgentDispatchStatus::Waiting);
+});
+
+it('rejects retained workspace or pane identity drift before retrying a planner start', function (string $drift) {
+    blockAmbiguousPlanningStart($this);
+    $this->herdr->getFailureCodes = ['agent_not_found'];
+
+    if ($drift === 'workspace') {
+        $this->herdrWorkspace->snapshot = new HerdrSessionSnapshot(
+            version: '0.8.2',
+            protocol: 20,
+            workspaces: [
+                new HerdrSnapshotWorkspace(
+                    'workspace-1',
+                    '/home/nckrtl/orbit',
+                    '/fast/worktrees/orbit/orb-999',
+                    true,
+                ),
+            ],
+            panes: $this->herdrWorkspace->snapshot->panes,
+            agents: [],
+        );
+    } else {
+        $this->herdrWorkspace->snapshot = new HerdrSessionSnapshot(
+            version: '0.8.2',
+            protocol: 20,
+            workspaces: $this->herdrWorkspace->snapshot->workspaces,
+            panes: [
+                new HerdrSnapshotPane(
+                    'workspace-1',
+                    'tab-1',
+                    'worker-pane',
+                    'different-terminal',
+                    $this->worktree,
+                ),
+            ],
+            agents: [],
+        );
+    }
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    ))->toThrow(OrbitPlanningDispatchFailed::class, 'not safe to restart');
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->herdr->startCalls)->toBe(1)
+        ->and($this->herdr->prompts)->toBe([])
+        ->and(PhaseRun::count())->toBe(1)
+        ->and(AgentDispatch::count())->toBe(1);
+})->with(['workspace', 'terminal']);
+
+it('rejects an occupied retained planning pane before retrying the start', function () {
+    blockAmbiguousPlanningStart($this);
+    $this->herdr->getFailureCodes = ['agent_not_found'];
+    $snapshot = $this->herdrWorkspace->snapshot;
+    $this->herdrWorkspace->snapshot = new HerdrSessionSnapshot(
+        version: $snapshot->version,
+        protocol: $snapshot->protocol,
+        workspaces: $snapshot->workspaces,
+        panes: $snapshot->panes,
+        agents: [
+            new HerdrSnapshotAgent(
+                'workspace-1',
+                'tab-1',
+                'worker-pane',
+                'worker-terminal',
+                'codex',
+                'unrelated-agent',
+                'unknown',
+                $this->worktree,
+            ),
+        ],
+    );
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    ))->toThrow(OrbitPlanningDispatchFailed::class, 'not safe to restart');
+
+    expect($this->herdr->startCalls)->toBe(1)
+        ->and($this->herdr->prompts)->toBe([]);
+});
+
+it('rejects a retained planning pane with an unknown foreground process', function () {
+    blockAmbiguousPlanningStart($this);
+    $this->herdr->getFailureCodes = ['agent_not_found'];
+    $this->herdrWorkspace->process = new HerdrPaneProcessInfo(
+        paneId: 'worker-pane',
+        shellProcessId: 123,
+        foregroundProcessGroupId: 456,
+        foregroundProcesses: [new HerdrForegroundProcess(456, 'python')],
+    );
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    ))->toThrow(OrbitPlanningDispatchFailed::class, 'unknown foreground process');
+
+    expect($this->herdr->startCalls)->toBe(1)
+        ->and($this->herdr->prompts)->toBe([]);
+});
+
+it('never prompts an existing planner whose pre-prompt state is not proven', function (string $status) {
+    $dispatch = blockAmbiguousPlanningStart($this);
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $dispatch->herdr_workspace_id,
+        tabId: (string) $dispatch->herdr_tab_id,
+        paneId: (string) $dispatch->herdr_pane_id,
+        terminalId: (string) $dispatch->herdr_terminal_id,
+        agentId: 'unproven-session',
+        agentName: (string) $dispatch->herdr_agent_name,
+        stateChangeSeq: 51,
+        workingDirectory: $this->worktree,
+        agentStatus: $status,
+    );
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    ))->toThrow(OrbitPlanningDispatchFailed::class, 'does not match the retained start intent');
+
+    expect($this->herdr->startCalls)->toBe(1)
+        ->and($this->herdr->prompts)->toBe([])
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked);
+})->with(['working', 'blocked', 'unknown']);
+
+it('schedules only the exact retained ambiguous planning start', function () {
+    $dispatch = blockAmbiguousPlanningStart($this);
+    $phase = PhaseRun::sole();
+    Queue::fake();
+
+    app()->call([new ReconcileDeliveries, 'handle']);
+
+    Queue::assertPushed(
+        DispatchOrbitPlanningJob::class,
+        fn (DispatchOrbitPlanningJob $job): bool => $job->deliveryId === $this->delivery->id
+            && $job->phaseRunId === $phase->id,
+    );
+
+    $dispatch->forceFill(['prompt_hash' => str_repeat('f', 64)])->save();
+    Queue::fake();
+    app()->call([new ReconcileDeliveries, 'handle']);
+
+    Queue::assertNotPushed(DispatchOrbitPlanningJob::class);
 });
 
 it('does not repeat external mutation after a concurrent caller resolves the dispatch', function () {

@@ -37,8 +37,10 @@ final class DispatchOrbitPlanning implements ShouldQueue, ShouldQueueAfterCommit
 
     private CarbonImmutable $retryDeadline;
 
-    public function __construct(public readonly int $deliveryId)
-    {
+    public function __construct(
+        public readonly int $deliveryId,
+        public readonly ?int $phaseRunId = null,
+    ) {
         $this->retryDeadline = now()->addMinutes(10)->toImmutable();
     }
 
@@ -58,7 +60,17 @@ final class DispatchOrbitPlanning implements ShouldQueue, ShouldQueueAfterCommit
         }
 
         try {
-            $dispatch->handle($this->deliveryId);
+            $delivery = Delivery::query()->find($this->deliveryId);
+            $failure = $delivery?->failure_details;
+
+            if ($delivery?->status === DeliveryStatus::Blocked
+                && $this->phaseRunId !== null
+                && is_array($failure)
+                && ($failure['code'] ?? null) === 'herdr_start_ambiguous') {
+                $dispatch->recoverAmbiguousStart($this->deliveryId, $this->phaseRunId);
+            } else {
+                $dispatch->handle($this->deliveryId);
+            }
         } catch (OrbitPlanningDispatchFailed $exception) {
             $delivery = Delivery::query()->find($this->deliveryId);
 

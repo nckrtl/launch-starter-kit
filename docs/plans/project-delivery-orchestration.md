@@ -203,6 +203,14 @@ completes only the known partial ownership transition, rearms the retained
 review dispatch, and lets the existing dispatch job continue. It never creates
 a replacement phase or dispatch, and an unconfirmed state stays blocked.
 
+An initial planning start rejected with the exact pre-agent `agent_pane_busy`
+failure is also recovered through its retained phase and dispatch. Before any
+retry, Commander proves the original Herdr workspace, pane, terminal, worktree,
+and idle shell still exist and that no agent occupies the pane or retained name.
+If the exact planner appeared meanwhile, Commander adopts it without starting a
+second agent. Any identity, process, repository, issue, or prompt drift preserves
+the block, and no prompt is replayed when its prior outcome may be ambiguous.
+
 Live canaries use the `controller:commander` Linear label as an explicit
 ownership handoff. Commander requires a complete, valid label page before
 preparation, rejects a concurrent `maintenance:monorepo` label, and checks the

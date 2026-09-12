@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
+use App\Delivery\Actions\DispatchOrbitPlanning as DispatchOrbitPlanningAction;
 use App\Delivery\Actions\DispatchOrbitPullRequestReview as DispatchOrbitPullRequestReviewAction;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
@@ -69,11 +70,13 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         ?RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries = null,
         ?RecoverInitialOrbitPlanningBlocker $initialPlanningBlockers = null,
         ?OrbitPlanningResolutionCatalog $planningResolutionCatalog = null,
+        ?DispatchOrbitPlanningAction $planningDispatches = null,
     ): void {
         $reviewDispatches ??= app(DispatchOrbitPullRequestReviewAction::class);
         $reviewTransitionRecoveries ??= app(RecoverOrbitPullRequestReviewTransition::class);
         $initialPlanningBlockers ??= app(RecoverInitialOrbitPlanningBlocker::class);
         $planningResolutionCatalog ??= app(OrbitPlanningResolutionCatalog::class);
+        $planningDispatches ??= app(DispatchOrbitPlanningAction::class);
 
         Delivery::query()
             ->select([
@@ -104,6 +107,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $query->where('status', DeliveryStatus::Blocked)
                             ->where('current_phase', OrbitFeatureWorkflow::INITIAL_PHASE)
                             ->where('failure_details->code', 'planning_blocked');
+                    })
+                    ->orWhere(function (Builder $query): void {
+                        $query->where('status', DeliveryStatus::Blocked)
+                            ->where('current_phase', OrbitFeatureWorkflow::INITIAL_PHASE)
+                            ->where('failure_details->code', 'herdr_start_ambiguous');
                     })
                     ->orWhere(function (Builder $query): void {
                         $query->where('status', DeliveryStatus::Blocked)
@@ -146,6 +154,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 $reviewTransitionRecoveries,
                 $initialPlanningBlockers,
                 $planningResolutionCatalog,
+                $planningDispatches,
             ): void {
                 foreach ($deliveries as $delivery) {
                     $this->dispatchRecovery(
@@ -157,6 +166,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $reviewTransitionRecoveries,
                         $initialPlanningBlockers,
                         $planningResolutionCatalog,
+                        $planningDispatches,
                     );
                 }
             }, 'deliveries.id', 'id');
@@ -171,6 +181,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries,
         RecoverInitialOrbitPlanningBlocker $initialPlanningBlockers,
         OrbitPlanningResolutionCatalog $planningResolutionCatalog,
+        DispatchOrbitPlanningAction $planningDispatches,
     ): void {
         if ($delivery->status === DeliveryStatus::Failed) {
             if ($planningCorrections->handle($delivery->id)
@@ -189,6 +200,17 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 && $failureCode === 'planning_blocked') {
                 if ($initialPlanningBlockers->handle($delivery->id)) {
                     AdvanceDelivery::dispatch($delivery->id);
+                }
+
+                return;
+            }
+
+            if ($delivery->current_phase === OrbitFeatureWorkflow::INITIAL_PHASE
+                && $failureCode === 'herdr_start_ambiguous') {
+                $phaseRunId = $planningDispatches->bindAmbiguousStartRecovery($delivery->id);
+
+                if (is_int($phaseRunId)) {
+                    DispatchOrbitPlanning::dispatch($delivery->id, $phaseRunId);
                 }
 
                 return;

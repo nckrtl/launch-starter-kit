@@ -6,6 +6,7 @@ namespace App\Delivery\Actions;
 
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitRepository;
@@ -24,15 +25,21 @@ use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPlanningDispatchFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Herdr\RequestFailed;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
 use Exception;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Sleep;
 use InvalidArgumentException;
 
 final readonly class DispatchOrbitPlanning
 {
+    private const int START_RECOVERY_ATTEMPTS = 9;
+
+    private const int START_RECOVERY_DELAY_MICROSECONDS = 250_000;
+
     public function __construct(
         private ProjectConfigRegistry $configs,
         private ResolveOrbitDeliveryPreparation $preparations,
@@ -40,6 +47,7 @@ final readonly class DispatchOrbitPlanning
         private OrbitIssueProvider $issues,
         private OrbitIssueTransitioner $transitioner,
         private HerdrRuntime $herdr,
+        private HerdrWorkspaceRuntime $herdrWorkspace,
         private CaptureHerdrEvent $events,
         private OrbitFeatureWorkflow $workflow,
     ) {}
@@ -109,6 +117,103 @@ final readonly class DispatchOrbitPlanning
             return $this->startAndPrompt($delivery, $dispatch, $prompt, $config, $preparation, $transitioned);
         } finally {
             $reservation->release();
+        }
+    }
+
+    public function recoverAmbiguousStart(int $deliveryId, int $expectedPhaseId): AgentDispatch
+    {
+        $delivery = Delivery::query()->with('projectOrchestration')->find($deliveryId);
+
+        if ($delivery === null) {
+            throw new OrbitPlanningDispatchFailed('The Orbit delivery does not exist.');
+        }
+
+        $config = $this->configs->hydrate($delivery->projectOrchestration->config);
+
+        if (! $config instanceof OrbitProjectConfig || $config->herdrSession !== config('herdr.session')) {
+            throw new OrbitPlanningDispatchFailed(
+                'The blocked delivery does not use Commander\'s active Orbit configuration.',
+            );
+        }
+
+        $preparation = $this->preparations->handle($delivery);
+        [$phase, $dispatch, $prompt] = $this->prepareAmbiguousStartRecovery(
+            $delivery->id,
+            $expectedPhaseId,
+            $config,
+        );
+        $reservation = $this->repository->reserveDelivery($config, $preparation->snapshot->issueKey);
+
+        try {
+            $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($delivery->id);
+            $this->assertAmbiguousStartRecoveryLedger(
+                $delivery,
+                $phase->id,
+                $dispatch->id,
+                $config,
+            );
+            $current = $this->verifyCurrentPlanningState($config, $preparation);
+            $this->assertFinalIssue($current, $current, $preparation->snapshot->contractHash);
+            $pane = new HerdrAgentIdentifiers(
+                workspaceId: (string) $dispatch->herdr_workspace_id,
+                tabId: (string) $dispatch->herdr_tab_id,
+                paneId: (string) $dispatch->herdr_pane_id,
+                terminalId: (string) $dispatch->herdr_terminal_id,
+                agentId: null,
+                agentName: (string) $dispatch->herdr_agent_name,
+            );
+            $started = $this->recoverPreAgentStart($delivery, $dispatch, $pane, $config);
+            $this->persistRecoveredStart(
+                $delivery->id,
+                $phase->id,
+                $dispatch->id,
+                $config,
+                $started,
+            );
+
+            return $this->verifyAndPromptStarted(
+                $delivery,
+                $dispatch->refresh(),
+                $started,
+                $prompt,
+                $config,
+                $preparation,
+                $current,
+            );
+        } finally {
+            $reservation->release();
+        }
+    }
+
+    public function bindAmbiguousStartRecovery(int $deliveryId): ?int
+    {
+        try {
+            $delivery = Delivery::query()->with('projectOrchestration')->find($deliveryId);
+
+            if ($delivery === null) {
+                return null;
+            }
+
+            $config = $this->configs->hydrate($delivery->projectOrchestration->config);
+
+            if (! $config instanceof OrbitProjectConfig || $config->herdrSession !== config('herdr.session')) {
+                return null;
+            }
+
+            $phase = $delivery->phaseRuns()
+                ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+                ->latest('attempt')
+                ->first();
+
+            if ($phase === null) {
+                return null;
+            }
+
+            [$bound] = $this->prepareAmbiguousStartRecovery($delivery->id, $phase->id, $config);
+
+            return $bound->id;
+        } catch (Exception) {
+            return null;
         }
     }
 
@@ -368,32 +473,6 @@ final readonly class DispatchOrbitPlanning
                 OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
             )->value;
             $expectedName = strtolower((string) $locked->external_issue_key).'-loop-builder';
-            $retiredValue = $phaseRun->input['retired_stale_worktree'] ?? null;
-
-            try {
-                $retiredWorktree = is_array($retiredValue)
-                    ? RetiredOrbitStaleWorktree::fromArray($retiredValue)
-                    : null;
-            } catch (InvalidArgumentException $exception) {
-                throw new OrbitPlanningDispatchFailed(
-                    'The retained stale Orbit worktree evidence is invalid.',
-                    previous: $exception,
-                );
-            }
-
-            if ($retiredValue !== null && $retiredWorktree === null) {
-                throw new OrbitPlanningDispatchFailed(
-                    'The retained stale Orbit worktree evidence is invalid.',
-                );
-            }
-
-            if ($retiredWorktree !== null
-                && $retiredWorktree->issueKey !== $locked->external_issue_key) {
-                throw new OrbitPlanningDispatchFailed(
-                    'The retained stale Orbit worktree evidence is inconsistent.',
-                );
-            }
-
             if ($phaseRun->agentDispatches()->count() !== 1
                 || $dispatch->idempotency_key !== $expectedKey
                 || $dispatch->herdr_agent_name !== $expectedName
@@ -406,15 +485,7 @@ final readonly class DispatchOrbitPlanning
                 throw new OrbitPlanningDispatchFailed('The retained Orbit planning dispatch metadata is inconsistent.');
             }
 
-            $prompt = $this->workflow->planningPrompt(
-                (string) $locked->external_issue_key,
-                (string) $locked->worktree_path,
-                $locked->id,
-                $phaseRun->id,
-                $dispatch->id,
-                $this->receiptCommand($phaseRun, $dispatch),
-                $retiredWorktree,
-            );
+            $prompt = $this->planningPrompt($locked, $phaseRun, $dispatch);
             $promptHash = hash('sha256', $prompt);
 
             if ($dispatch->status === AgentDispatchStatus::Pending) {
@@ -426,6 +497,172 @@ final readonly class DispatchOrbitPlanning
 
             return [$dispatch, $prompt];
         });
+    }
+
+    /** @return array{PhaseRun, AgentDispatch, string} */
+    private function prepareAmbiguousStartRecovery(
+        int $deliveryId,
+        int $expectedPhaseId,
+        OrbitProjectConfig $config,
+    ): array {
+        return DB::transaction(function () use ($deliveryId, $expectedPhaseId, $config): array {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+            $phases = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            AgentDispatch::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $phase = $phases
+                ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+                ->sortByDesc('attempt')
+                ->first();
+            $dispatch = $phase?->agentDispatches()->first();
+
+            if ($phase === null || $dispatch === null) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The ambiguous Orbit planning start ledger is incomplete.',
+                );
+            }
+
+            $this->assertAmbiguousStartRecoveryLedger(
+                $delivery,
+                $expectedPhaseId,
+                $dispatch->id,
+                $config,
+            );
+            $prompt = $this->planningPrompt($delivery, $phase, $dispatch);
+
+            if (! hash_equals($dispatch->prompt_hash, hash('sha256', $prompt))) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The ambiguous Orbit planning prompt no longer matches its ledger.',
+                );
+            }
+
+            return [$phase, $dispatch, $prompt];
+        });
+    }
+
+    private function assertAmbiguousStartRecoveryLedger(
+        Delivery $delivery,
+        int $phaseId,
+        ?int $dispatchId,
+        OrbitProjectConfig $config,
+    ): void {
+        $project = $delivery->projectOrchestration()->firstOrFail();
+        $phases = $delivery->phaseRuns()->orderBy('id')->get();
+        $phase = $phases
+            ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+            ->sortByDesc('attempt')
+            ->first();
+        $dispatches = $phase?->agentDispatches()
+            ->where('agent_role', OrbitFeatureWorkflow::PLANNING_AGENT_ROLE)
+            ->get();
+        $dispatch = $dispatches?->first();
+        $failure = $delivery->failure_details;
+        $expectedKey = IdempotencyKey::forDispatch(
+            $delivery->id,
+            OrbitFeatureWorkflow::INITIAL_PHASE,
+            1,
+            OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        )->value;
+        $expectedPromptHash = $phase !== null && $dispatch !== null
+            ? hash('sha256', $this->planningPrompt($delivery, $phase, $dispatch))
+            : null;
+
+        if ($delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+            || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
+            || $delivery->current_phase !== OrbitFeatureWorkflow::INITIAL_PHASE
+            || $delivery->status !== DeliveryStatus::Blocked
+            || ! is_array($failure)
+            || count($failure) !== 3
+            || ($failure['code'] ?? null) !== 'herdr_start_ambiguous'
+            || ($failure['dispatch_id'] ?? null) !== $dispatchId
+            || ($failure['message'] ?? null) !== $dispatch?->error_message
+            || $project->state !== ProjectOrchestrationState::Enabled
+            || $project->config !== $config->toArray()
+            || $phases->count() !== 1
+            || $phase === null
+            || $phase->id !== $phaseId
+            || $phase->attempt !== 1
+            || $phase->status !== PhaseRunStatus::Running
+            || $phase->finished_at !== null
+            || $phase->receipts()->exists()
+            || $phase->agentDispatches()->count() !== 1
+            || $dispatches?->count() !== 1
+            || $dispatch === null
+            || $dispatch->id !== $dispatchId
+            || $dispatch->idempotency_key !== $expectedKey
+            || $dispatch->status !== AgentDispatchStatus::Ambiguous
+            || $dispatch->error_code !== 'herdr_start_ambiguous'
+            || ! is_string($dispatch->error_message)
+            || ! str_ends_with($dispatch->error_message, ' (agent_pane_busy)')
+            || $dispatch->herdr_session !== $config->herdrSession
+            || $dispatch->herdr_workspace_id === null
+            || $dispatch->herdr_tab_id === null
+            || $dispatch->herdr_pane_id === null
+            || $dispatch->herdr_terminal_id === null
+            || $dispatch->herdr_agent_id !== null
+            || $dispatch->state_change_seq !== null
+            || $dispatch->herdr_agent_name !== strtolower((string) $delivery->external_issue_key).'-loop-builder'
+            || $dispatch->prompt_name !== 'orbit_planning'
+            || $dispatch->prompt_version !== OrbitFeatureWorkflow::PLANNING_PROMPT_VERSION
+            || preg_match('/^[a-f0-9]{64}$/', $dispatch->prompt_hash) !== 1
+            || $expectedPromptHash === null
+            || ! hash_equals($dispatch->prompt_hash, $expectedPromptHash)
+            || $dispatch->dispatched_at !== null
+            || $dispatch->settled_at !== null) {
+            throw new OrbitPlanningDispatchFailed(
+                'The ambiguous Orbit planning start is not safe to recover.',
+            );
+        }
+    }
+
+    private function planningPrompt(
+        Delivery $delivery,
+        PhaseRun $phaseRun,
+        AgentDispatch $dispatch,
+    ): string {
+        $retiredValue = $phaseRun->input['retired_stale_worktree'] ?? null;
+
+        try {
+            $retiredWorktree = is_array($retiredValue)
+                ? RetiredOrbitStaleWorktree::fromArray($retiredValue)
+                : null;
+        } catch (InvalidArgumentException $exception) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained stale Orbit worktree evidence is invalid.',
+                previous: $exception,
+            );
+        }
+
+        if ($retiredValue !== null && $retiredWorktree === null) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained stale Orbit worktree evidence is invalid.',
+            );
+        }
+
+        if ($retiredWorktree !== null
+            && $retiredWorktree->issueKey !== $delivery->external_issue_key) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained stale Orbit worktree evidence is inconsistent.',
+            );
+        }
+
+        return $this->workflow->planningPrompt(
+            (string) $delivery->external_issue_key,
+            (string) $delivery->worktree_path,
+            $delivery->id,
+            $phaseRun->id,
+            $dispatch->id,
+            $this->receiptCommand($phaseRun, $dispatch),
+            $retiredWorktree,
+        );
     }
 
     private function recheckBeforeMutation(
@@ -547,6 +784,27 @@ final readonly class DispatchOrbitPlanning
         $started = $this->startAgent($delivery, $dispatch, $pane, $this->planningLaunch());
         $this->persistStartedAgent($dispatch, $started);
 
+        return $this->verifyAndPromptStarted(
+            $delivery,
+            $dispatch,
+            $started,
+            $prompt,
+            $config,
+            $preparation,
+            $transitioned,
+        );
+    }
+
+    private function verifyAndPromptStarted(
+        Delivery $delivery,
+        AgentDispatch $dispatch,
+        HerdrAgentIdentifiers $started,
+        string $prompt,
+        OrbitProjectConfig $config,
+        OrbitDeliveryPreparation $preparation,
+        OrbitIssueSnapshot $transitioned,
+    ): AgentDispatch {
+
         try {
             $this->repository->verifyPlanningHandoff(
                 $config,
@@ -617,6 +875,193 @@ final readonly class DispatchOrbitPlanning
         });
 
         return $dispatch->refresh();
+    }
+
+    private function recoverPreAgentStart(
+        Delivery $delivery,
+        AgentDispatch $dispatch,
+        HerdrAgentIdentifiers $pane,
+        OrbitProjectConfig $config,
+    ): HerdrAgentIdentifiers {
+        $failure = new RequestFailed((string) $dispatch->error_message, 'agent_pane_busy');
+        $mayStart = true;
+
+        for ($attempt = 0; $attempt < self::START_RECOVERY_ATTEMPTS; $attempt++) {
+            try {
+                $started = $this->herdr->getAgent((string) $dispatch->herdr_agent_name);
+
+                if (! $this->samePaneAndName($started, $pane, (string) $dispatch->herdr_agent_name)
+                    || $started->workingDirectory !== $delivery->worktree_path
+                    || ! in_array($started->agentStatus, ['idle', 'done'], true)) {
+                    throw new OrbitPlanningDispatchFailed(
+                        'The recovered Herdr planner does not match the retained start intent.',
+                    );
+                }
+
+                return $started;
+            } catch (RequestFailed $readFailure) {
+                if ($readFailure->errorCode !== 'agent_not_found') {
+                    throw new OrbitPlanningDispatchFailed(
+                        'Commander could not determine whether the retained planner exists.',
+                        0,
+                        $readFailure,
+                    );
+                }
+            }
+
+            if ($mayStart) {
+                $this->assertRetainedPreAgentPane($delivery, $dispatch, $config);
+
+                try {
+                    $started = $this->herdr->startAgent(
+                        $pane->paneId,
+                        (string) $dispatch->herdr_agent_name,
+                        $this->planningLaunch(),
+                    );
+
+                    if (! $this->samePaneAndName($started, $pane, (string) $dispatch->herdr_agent_name)
+                        || $started->workingDirectory !== $delivery->worktree_path
+                        || ! in_array($started->agentStatus, ['idle', 'done'], true)) {
+                        throw new OrbitPlanningDispatchFailed(
+                            'The recovered Herdr planner does not match the retained start intent.',
+                        );
+                    }
+
+                    return $started;
+                } catch (OrbitPlanningDispatchFailed $exception) {
+                    throw $exception;
+                } catch (Exception $startFailure) {
+                    $failure = $startFailure;
+                    $mayStart = $startFailure instanceof RequestFailed
+                        && $startFailure->errorCode === 'agent_pane_busy';
+                }
+            }
+
+            if ($attempt < self::START_RECOVERY_ATTEMPTS - 1) {
+                Sleep::usleep(self::START_RECOVERY_DELAY_MICROSECONDS);
+            }
+        }
+
+        throw new OrbitPlanningDispatchFailed(
+            'The retained Herdr planner did not become recoverable within the bounded start window.',
+            0,
+            $failure,
+        );
+    }
+
+    private function assertRetainedPreAgentPane(
+        Delivery $delivery,
+        AgentDispatch $dispatch,
+        OrbitProjectConfig $config,
+    ): void {
+        $snapshot = $this->herdrWorkspace->snapshot();
+        $workspaces = array_values(array_filter(
+            $snapshot->workspaces,
+            static fn ($workspace): bool => $workspace->workspaceId === $dispatch->herdr_workspace_id,
+        ));
+        $panes = array_values(array_filter(
+            $snapshot->panes,
+            static fn ($pane): bool => $pane->paneId === $dispatch->herdr_pane_id,
+        ));
+        $agents = array_values(array_filter(
+            $snapshot->agents,
+            static fn ($agent): bool => $agent->paneId === $dispatch->herdr_pane_id
+                || $agent->terminalId === $dispatch->herdr_terminal_id
+                || $agent->name === $dispatch->herdr_agent_name,
+        ));
+        if (count($workspaces) !== 1 || count($panes) !== 1 || $agents !== []) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained Herdr planning pane is not safe to restart.',
+            );
+        }
+
+        $workspace = $workspaces[0];
+        $pane = $panes[0];
+
+        if ($workspace->repositoryRoot !== $config->repository
+            || $workspace->checkoutPath !== $delivery->worktree_path
+            || $workspace->linkedWorktree !== true
+            || $pane->workspaceId !== $dispatch->herdr_workspace_id
+            || $pane->tabId !== $dispatch->herdr_tab_id
+            || $pane->terminalId !== $dispatch->herdr_terminal_id
+            || $pane->workingDirectory !== $delivery->worktree_path) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained Herdr planning pane is not safe to restart.',
+            );
+        }
+
+        $process = $this->herdrWorkspace->inspectPaneProcess((string) $dispatch->herdr_pane_id);
+        $foreground = $process->foregroundProcesses;
+
+        if ($process->paneId !== $dispatch->herdr_pane_id
+            || $process->shellProcessId === null
+            || $process->foregroundProcessGroupId !== $process->shellProcessId
+            || count($foreground) !== 1
+            || $foreground[0]->processId !== $process->shellProcessId
+            || ! in_array($foreground[0]->name, ['zsh', 'bash', 'sh', 'fish'], true)) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained Herdr planning pane has an unknown foreground process.',
+            );
+        }
+    }
+
+    private function persistRecoveredStart(
+        int $deliveryId,
+        int $phaseId,
+        int $dispatchId,
+        OrbitProjectConfig $config,
+        HerdrAgentIdentifiers $started,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $phaseId, $dispatchId, $config, $started): void {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+            $phases = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            AgentDispatch::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $this->assertAmbiguousStartRecoveryLedger(
+                $delivery,
+                $phaseId,
+                $dispatchId,
+                $config,
+            );
+            $dispatch = AgentDispatch::query()->whereKey($dispatchId)->firstOrFail();
+            $pane = new HerdrAgentIdentifiers(
+                workspaceId: (string) $dispatch->herdr_workspace_id,
+                tabId: (string) $dispatch->herdr_tab_id,
+                paneId: (string) $dispatch->herdr_pane_id,
+                terminalId: (string) $dispatch->herdr_terminal_id,
+                agentId: null,
+                agentName: (string) $dispatch->herdr_agent_name,
+            );
+
+            if (! $this->samePaneAndName($started, $pane, (string) $dispatch->herdr_agent_name)
+                || $started->workingDirectory !== $delivery->worktree_path
+                || ! in_array($started->agentStatus, ['idle', 'done'], true)) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The recovered Herdr planner changed before it was retained.',
+                );
+            }
+
+            $dispatch->forceFill([
+                'status' => AgentDispatchStatus::Starting,
+                'herdr_agent_id' => $started->agentId,
+                'state_change_seq' => $started->stateChangeSeq,
+                'dispatched_at' => now(),
+                'error_code' => 'planning_final_verification',
+                'error_message' => null,
+            ])->save();
+            $delivery->forceFill([
+                'status' => DeliveryStatus::Preparing,
+                'failure_details' => null,
+            ])->save();
+        });
     }
 
     private function startAgent(
