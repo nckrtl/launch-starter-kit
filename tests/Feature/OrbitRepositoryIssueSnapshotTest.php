@@ -84,6 +84,42 @@ it('rejects existing legacy controller journals', function (string $journal) {
     'orphan worker marker' => 'worker.json',
 ]);
 
+it('acquires the legacy lock for an inactive needs-attention handoff', function () {
+    $directory = $this->repositoryPath.'/.git/orbit-delivery/v1/orb-234';
+    File::makeDirectory($directory, 0700, true);
+    File::put($directory.'/state.json', json_encode([
+        'schema' => 1,
+        'issue' => 'ORB-234',
+        'status' => 'needs_attention',
+    ], JSON_THROW_ON_ERROR));
+    File::put($directory.'/worker.json', json_encode([
+        'pid' => 999_999_999,
+        'started_at' => 1_789_178_931.0,
+    ], JSON_THROW_ON_ERROR));
+
+    $reservation = app(ProcessOrbitRepository::class)->reserveDelivery($this->config, 'ORB-234');
+
+    expect($reservation->path)->toBe($directory.'/controller.lock');
+    $reservation->release();
+});
+
+it('refuses a needs-attention handoff while its legacy worker is alive', function () {
+    $directory = $this->repositoryPath.'/.git/orbit-delivery/v1/orb-234';
+    File::makeDirectory($directory, 0700, true);
+    File::put($directory.'/state.json', json_encode([
+        'schema' => 1,
+        'issue' => 'ORB-234',
+        'status' => 'needs_attention',
+    ], JSON_THROW_ON_ERROR));
+    File::put($directory.'/worker.json', json_encode([
+        'pid' => getmypid(),
+        'started_at' => 1_789_178_931.0,
+    ], JSON_THROW_ON_ERROR));
+
+    expect(fn () => app(ProcessOrbitRepository::class)->reserveDelivery($this->config, 'ORB-234'))
+        ->toThrow(OrbitRepositoryFailed::class, 'legacy Orbit controller journal');
+});
+
 it('rejects a symlinked legacy controller directory', function () {
     $outside = $this->base.'/outside-controller';
     File::makeDirectory($outside, 0700);

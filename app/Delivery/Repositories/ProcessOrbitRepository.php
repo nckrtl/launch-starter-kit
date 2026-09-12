@@ -2589,15 +2589,12 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
             throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
         }
 
-        foreach (['state.json', 'worker.json'] as $journal) {
-            $path = $directory.'/'.$journal;
+        if ($this->hasLegacyControllerJournal($directory)
+            && ! $this->legacyControllerReadyForHandoff($directory, $issueKey)) {
+            flock($handle, LOCK_UN);
+            fclose($handle);
 
-            if (file_exists($path) || is_link($path)) {
-                flock($handle, LOCK_UN);
-                fclose($handle);
-
-                throw new OrbitRepositoryFailed('This issue already has a legacy Orbit controller journal.');
-            }
+            throw new OrbitRepositoryFailed('This issue already has a legacy Orbit controller journal.');
         }
 
         if (! $this->isOpenedReservationLock($handle, $lockPath)
@@ -2609,6 +2606,65 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
         }
 
         return new OrbitDeliveryReservation($handle, $lockPath);
+    }
+
+    private function hasLegacyControllerJournal(string $directory): bool
+    {
+        foreach (['state.json', 'worker.json'] as $journal) {
+            if (file_exists($directory.'/'.$journal) || is_link($directory.'/'.$journal)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function legacyControllerReadyForHandoff(string $directory, string $issueKey): bool
+    {
+        $statePath = $directory.'/state.json';
+
+        if (is_link($statePath) || ! is_file($statePath) || realpath($statePath) !== $statePath) {
+            return false;
+        }
+
+        try {
+            $stateContents = file_get_contents($statePath);
+            $state = $stateContents === false
+                ? null
+                : json_decode($stateContents, true, flags: JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            return false;
+        }
+
+        if (! is_array($state) || array_is_list($state)
+            || ($state['schema'] ?? null) !== 1
+            || ($state['issue'] ?? null) !== $issueKey
+            || ($state['status'] ?? null) !== 'needs_attention') {
+            return false;
+        }
+
+        $workerPath = $directory.'/worker.json';
+
+        if (! file_exists($workerPath) && ! is_link($workerPath)) {
+            return true;
+        }
+
+        if (is_link($workerPath) || ! is_file($workerPath) || realpath($workerPath) !== $workerPath) {
+            return false;
+        }
+
+        try {
+            $workerContents = file_get_contents($workerPath);
+            $worker = $workerContents === false
+                ? null
+                : json_decode($workerContents, true, flags: JSON_THROW_ON_ERROR);
+        } catch (Throwable) {
+            return false;
+        }
+
+        $pid = is_array($worker) && ! array_is_list($worker) ? ($worker['pid'] ?? null) : null;
+
+        return is_int($pid) && $pid > 0 && ! is_dir('/proc/'.$pid);
     }
 
     private function ensureReservationDirectory(string $path): void
