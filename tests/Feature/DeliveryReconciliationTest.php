@@ -240,6 +240,41 @@ it('recovers one missed terminal Herdr event from the exact later agent state', 
     Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
+it('recovers a missed terminal Herdr event without protocol agent ids', function (): void {
+    config()->set('herdr.session', 'orbit');
+    config()->set('herdr.orchestration.enabled', true);
+    [$delivery, $phase, $dispatch] = waitingReconciliationDelivery('done', 11);
+    $dispatch->update(['herdr_agent_id' => null]);
+    $herdr = app(HerdrRuntime::class);
+
+    if (! $herdr instanceof ReconciliationFakeHerdrRuntime) {
+        throw new LogicException('The reconciliation fake is not bound.');
+    }
+
+    $agent = $herdr->agent;
+    $herdr->agent = new HerdrAgentIdentifiers(
+        workspaceId: $agent->workspaceId,
+        tabId: $agent->tabId,
+        paneId: $agent->paneId,
+        terminalId: $agent->terminalId,
+        agentId: null,
+        agentName: $agent->agentName,
+        stateChangeSeq: $agent->stateChangeSeq,
+        workingDirectory: $agent->workingDirectory,
+        agentStatus: $agent->agentStatus,
+    );
+    Queue::fake([AdvanceDelivery::class]);
+
+    (new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id))->handle(
+        app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitPullRequestReviewWait::class),
+    );
+
+    expect($dispatch->fresh()->status)->toBe(AgentDispatchStatus::Settled)
+        ->and(ExternalEvent::sole()->agent_dispatch_id)->toBe($dispatch->id);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
+});
+
 it('keeps a current or non-terminal Herdr agent waiting', function (string $status, int $sequence): void {
     config()->set('herdr.session', 'orbit');
     config()->set('herdr.orchestration.enabled', true);

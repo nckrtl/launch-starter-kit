@@ -80,7 +80,6 @@ final readonly class ReconcileWaitingHerdrSettlement
             || $dispatch->herdr_tab_id === null
             || $dispatch->herdr_pane_id === null
             || $dispatch->herdr_terminal_id === null
-            || $dispatch->herdr_agent_id === null
             || $dispatch->herdr_agent_name === null
             || $dispatch->state_change_seq === null
             || $dispatch->dispatched_at === null) {
@@ -132,7 +131,9 @@ final readonly class ReconcileWaitingHerdrSettlement
             && $agent->tabId === $dispatch->herdr_tab_id
             && $agent->paneId === $dispatch->herdr_pane_id
             && $agent->terminalId === $dispatch->herdr_terminal_id
-            && $agent->agentId === $dispatch->herdr_agent_id
+            && ($agent->agentId === null
+                || $dispatch->herdr_agent_id === null
+                || $agent->agentId === $dispatch->herdr_agent_id)
             && $agent->agentName === $dispatch->herdr_agent_name
             && ($agent->workingDirectory === null
                 || $agent->workingDirectory === $delivery->worktree_path);
