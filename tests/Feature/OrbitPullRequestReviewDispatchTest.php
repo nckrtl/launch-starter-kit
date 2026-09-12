@@ -43,10 +43,12 @@ use App\Herdr\RequestFailed;
 use App\Jobs\DispatchOrbitImplementation as DispatchImplementationJob;
 use App\Jobs\DispatchOrbitPullRequestReview as DispatchPullRequestReviewJob;
 use App\Jobs\ReconcileDeliveries;
+use App\Jobs\RecoverAmbiguousOrbitPullRequestReviewTransition;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
@@ -818,6 +820,42 @@ function ambiguousPullRequestReviewerStart(object $test): void
         'status' => DeliveryStatus::Blocked,
         'failure_details' => [
             'code' => 'herdr_start_ambiguous',
+            'dispatch_id' => $test->dispatch->id,
+            'message' => $message,
+        ],
+    ])->save();
+}
+
+function ambiguousLinearPullRequestReviewTransition(object $test, bool $partial = false): void
+{
+    addKnownPullRequestAttachment($test);
+    $payload = $test->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+
+    if (! $partial) {
+        $payload['assignee'] = null;
+    }
+
+    $test->issues->snapshot = new OrbitIssueSnapshot(
+        $test->issues->snapshot->issueId,
+        $test->issues->snapshot->issueKey,
+        $payload,
+        $test->issues->snapshot->contractHash,
+    );
+    $test->review->forceFill([
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now(),
+    ])->save();
+    $message = 'The prior transition outcome was unresolved.';
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Ambiguous,
+        'error_code' => 'linear_pr_review_transition_ambiguous',
+        'error_message' => $message,
+    ])->save();
+    $test->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'linear_pr_review_transition_ambiguous',
             'dispatch_id' => $test->dispatch->id,
             'message' => $message,
         ],
@@ -1648,6 +1686,116 @@ it('queues the retained pull request review after verified recovery', function (
     );
     expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Preparing)
         ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Pending);
+});
+
+it('automatically recovers an exact ambiguous Linear transition once', function (bool $partial) {
+    Queue::fake([DispatchPullRequestReviewJob::class]);
+    ambiguousLinearPullRequestReviewTransition($this, $partial);
+    $job = new RecoverAmbiguousOrbitPullRequestReviewTransition(
+        $this->delivery->id,
+        $this->review->id,
+    );
+
+    $job->handle(app(RecoverOrbitPullRequestReviewTransition::class));
+    $job->handle(app(RecoverOrbitPullRequestReviewTransition::class));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Preparing)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Pending)
+        ->and($this->dispatch->fresh()->error_code)->toBeNull()
+        ->and($this->transitions->calls)->toBe($partial ? 1 : 0)
+        ->and($job)->toBeInstanceOf(ShouldBeUniqueUntilProcessing::class)
+        ->and($job->uniqueId())->toBe(
+            "delivery:pr-review-transition-recovery:{$this->delivery->id}:{$this->review->id}",
+        )
+        ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
+        ->and($job->tries)->toBe(0)
+        ->and($job->retryUntil() > now())->toBeTrue();
+    Queue::assertPushed(DispatchPullRequestReviewJob::class, 1);
+})->with([
+    'exact read-back' => false,
+    'partial transition completion' => true,
+]);
+
+it('releases a contended ambiguous Linear transition recovery lock', function () {
+    ambiguousLinearPullRequestReviewTransition($this);
+    $lock = Cache::lock(
+        "delivery:pr-review-dispatch:{$this->delivery->id}:{$this->review->id}",
+        RecoverAmbiguousOrbitPullRequestReviewTransition::LOCK_SECONDS,
+    );
+    $lock->get();
+
+    try {
+        $job = (new RecoverAmbiguousOrbitPullRequestReviewTransition(
+            $this->delivery->id,
+            $this->review->id,
+        ))->withFakeQueueInteractions();
+        $job->handle(app(RecoverOrbitPullRequestReviewTransition::class));
+        $job->assertReleased(1);
+    } finally {
+        $lock->release();
+    }
+});
+
+it('does not automatically recover a malformed or unconfirmed Linear transition', function (string $drift) {
+    Queue::fake();
+    ambiguousLinearPullRequestReviewTransition($this);
+
+    match ($drift) {
+        'message' => $this->dispatch->forceFill(['error_message' => 'Different failure.'])->save(),
+        'phase' => PhaseRun::query()->create([
+            'delivery_id' => $this->delivery->id,
+            'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+            'attempt' => 2,
+            'status' => PhaseRunStatus::Pending,
+        ]),
+        'linear' => $this->issues->snapshot = new OrbitIssueSnapshot(
+            $this->issues->snapshot->issueId,
+            $this->issues->snapshot->issueKey,
+            [
+                ...$this->issues->snapshot->payload,
+                'state' => ['id' => 'state-progress', 'name' => 'In Progress', 'type' => 'started'],
+            ],
+            $this->issues->snapshot->contractHash,
+        ),
+    };
+
+    $job = new RecoverAmbiguousOrbitPullRequestReviewTransition(
+        $this->delivery->id,
+        $this->review->id,
+    );
+    $job->handle(app(RecoverOrbitPullRequestReviewTransition::class));
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous);
+    Queue::assertNothingPushed();
+})->with(['message', 'phase', 'linear']);
+
+it('schedules only an exact ambiguous Linear pull request transition', function () {
+    Queue::fake();
+    ambiguousLinearPullRequestReviewTransition($this);
+    $job = new ReconcileDeliveries;
+
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    Queue::assertPushed(
+        RecoverAmbiguousOrbitPullRequestReviewTransition::class,
+        fn (RecoverAmbiguousOrbitPullRequestReviewTransition $queued): bool => $queued->deliveryId === $this->delivery->id
+            && $queued->phaseRunId === $this->review->id,
+    );
+
+    $this->dispatch->forceFill(['error_message' => 'Different failure.'])->save();
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    Queue::assertPushed(RecoverAmbiguousOrbitPullRequestReviewTransition::class, 1);
 });
 
 it('routes a newly conflicting pull request back to the retained Builder', function () {

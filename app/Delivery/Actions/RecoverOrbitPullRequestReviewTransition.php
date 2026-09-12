@@ -46,6 +46,13 @@ final readonly class RecoverOrbitPullRequestReviewTransition
             throw new OrbitPullRequestReviewDispatchFailed('The Orbit delivery does not exist.');
         }
 
+        if ($this->bindAmbiguousTransitionRecovery($deliveryId) === null
+            && ($delivery->failure_details['code'] ?? null) === 'linear_pr_review_transition_ambiguous') {
+            throw new OrbitPullRequestReviewDispatchFailed(
+                'The blocked Linear pull request review transition is not safe to recover.',
+            );
+        }
+
         $preparation = $this->preparations->startup($delivery);
         $issue = $this->issues->fetchActive(
             $preparation->snapshot->issueId,
@@ -128,6 +135,11 @@ final readonly class RecoverOrbitPullRequestReviewTransition
             $project = $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
             $phases = PhaseRun::query()
                 ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            Receipt::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
                 ->orderBy('id')
                 ->lockForUpdate()
                 ->get();
@@ -252,6 +264,81 @@ final readonly class RecoverOrbitPullRequestReviewTransition
             ])->save();
 
             return $correction;
+        });
+    }
+
+    public function bindAmbiguousTransitionRecovery(int $deliveryId): ?int
+    {
+        return DB::transaction(function () use ($deliveryId): ?int {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->first();
+
+            if ($delivery === null) {
+                return null;
+            }
+
+            $project = $delivery->projectOrchestration()->lockForUpdate()->first();
+            $phases = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $phase = $phases
+                ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+                ->sortByDesc('attempt')
+                ->first();
+
+            if ($phase === null) {
+                return null;
+            }
+
+            $dispatches = AgentDispatch::query()
+                ->where('phase_run_id', $phase->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $dispatch = $dispatches->first();
+            $failure = $delivery->failure_details;
+            $source = $this->sources->sourceReceipt($delivery, $phase);
+            $expectedKey = IdempotencyKey::forDispatch(
+                $delivery->id,
+                OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+                $phase->attempt,
+                OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+            )->value;
+
+            if ($delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+                || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
+                || $delivery->current_phase !== OrbitFeatureWorkflow::PR_REVIEW_PHASE
+                || $delivery->status !== DeliveryStatus::Blocked
+                || ! is_array($failure)
+                || ($failure['code'] ?? null) !== 'linear_pr_review_transition_ambiguous'
+                || $project?->state !== ProjectOrchestrationState::Enabled
+                || $phase->attempt < 1
+                || $phase->status !== PhaseRunStatus::Running
+                || $phase->receipts()->exists()
+                || $source === null
+                || $dispatches->count() !== 1
+                || $dispatch === null
+                || ($failure['dispatch_id'] ?? null) !== $dispatch->id
+                || ($failure['message'] ?? null) !== $dispatch->error_message
+                || $dispatch->agent_role !== OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
+                || $dispatch->idempotency_key !== $expectedKey
+                || $dispatch->status !== AgentDispatchStatus::Ambiguous
+                || $dispatch->error_code !== 'linear_pr_review_transition_ambiguous'
+                || $dispatch->herdr_session !== null
+                || $dispatch->herdr_workspace_id !== null
+                || $dispatch->herdr_tab_id !== null
+                || $dispatch->herdr_pane_id !== null
+                || $dispatch->herdr_terminal_id !== null
+                || $dispatch->herdr_agent_id !== null
+                || $dispatch->state_change_seq !== null
+                || preg_match('/^[a-f0-9]{64}$/', $dispatch->prompt_hash) !== 1
+                || $dispatch->dispatched_at !== null
+                || $dispatch->settled_at !== null) {
+                return null;
+            }
+
+            return $phase->id;
         });
     }
 

@@ -173,6 +173,13 @@ A timed-out dispatch remains truthfully `waiting`; pre-merge cleanup accepts onl
 that exact failed review dispatch and still requires the real agent to be idle or
 done before shutting down its workspace.
 
+An ambiguous Linear transition into pull request review is recovered by its own
+bounded job under the same per-phase dispatch lock. The scheduler first binds
+the exact untouched local ledger. The job then reads Linear authoritatively,
+completes only the known partial ownership transition, rearms the retained
+review dispatch, and lets the existing dispatch job continue. It never creates
+a replacement phase or dispatch, and an unconfirmed state stays blocked.
+
 Live canaries use the `controller:commander` Linear label as an explicit
 ownership handoff. Commander requires a complete, valid label page before
 preparation, rejects a concurrent `maintenance:monorepo` label, and checks the

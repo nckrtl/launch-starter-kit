@@ -8,6 +8,7 @@ use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\DispatchOrbitPullRequestReview as DispatchOrbitPullRequestReviewAction;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
+use App\Delivery\Actions\RecoverOrbitPullRequestReviewTransition;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -62,8 +63,10 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         RecoverExhaustedOrbitPlanResolution $planResolutions,
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
         ?DispatchOrbitPullRequestReviewAction $reviewDispatches = null,
+        ?RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries = null,
     ): void {
         $reviewDispatches ??= app(DispatchOrbitPullRequestReviewAction::class);
+        $reviewTransitionRecoveries ??= app(RecoverOrbitPullRequestReviewTransition::class);
 
         Delivery::query()
             ->select([
@@ -109,6 +112,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $query->where('status', DeliveryStatus::Blocked)
                             ->where('current_phase', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
                             ->where('failure_details->code', 'herdr_start_ambiguous');
+                    })
+                    ->orWhere(function (Builder $query): void {
+                        $query->where('status', DeliveryStatus::Blocked)
+                            ->where('current_phase', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+                            ->where('failure_details->code', 'linear_pr_review_transition_ambiguous');
                     });
             })
             ->orderBy('deliveries.id')
@@ -117,6 +125,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 $planResolutions,
                 $reviewPublications,
                 $reviewDispatches,
+                $reviewTransitionRecoveries,
             ): void {
                 foreach ($deliveries as $delivery) {
                     $this->dispatchRecovery(
@@ -125,6 +134,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $planResolutions,
                         $reviewPublications,
                         $reviewDispatches,
+                        $reviewTransitionRecoveries,
                     );
                 }
             }, 'deliveries.id', 'id');
@@ -136,6 +146,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         RecoverExhaustedOrbitPlanResolution $planResolutions,
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
         DispatchOrbitPullRequestReviewAction $reviewDispatches,
+        RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries,
     ): void {
         if ($delivery->status === DeliveryStatus::Failed) {
             if ($planningCorrections->handle($delivery->id)
@@ -167,6 +178,18 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
 
                 if (is_int($phaseRunId)) {
                     DispatchOrbitPullRequestReview::dispatch($delivery->id, $phaseRunId);
+                }
+            }
+
+            if ($delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+                && $failureCode === 'linear_pr_review_transition_ambiguous') {
+                $phaseRunId = $reviewTransitionRecoveries->bindAmbiguousTransitionRecovery($delivery->id);
+
+                if (is_int($phaseRunId)) {
+                    RecoverAmbiguousOrbitPullRequestReviewTransition::dispatch(
+                        $delivery->id,
+                        $phaseRunId,
+                    );
                 }
             }
 
