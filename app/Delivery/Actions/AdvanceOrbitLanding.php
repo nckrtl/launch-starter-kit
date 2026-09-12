@@ -1939,7 +1939,7 @@ final readonly class AdvanceOrbitLanding
             'provider' => OrbitIssueSnapshot::PROVIDER,
             'issue_id' => $completed->issueId,
             'issue_key' => $completed->issueKey,
-            'contract_sha256' => $completed->contractHash,
+            'contract_sha256' => $expected->contractHash,
             'state' => $state,
             'assignee' => $completed->payload['assignee'],
             'delegate' => $completed->payload['delegate'],

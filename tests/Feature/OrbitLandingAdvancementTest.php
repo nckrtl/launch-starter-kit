@@ -55,6 +55,7 @@ use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitLandingAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPullRequestLandingFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceOrbitLanding as AdvanceLandingJob;
@@ -529,6 +530,11 @@ final class LandingIssues implements OrbitActiveIssueProvider, OrbitCloseoutIssu
 
     public bool $completeAfterCleanup = false;
 
+    /** @var array<string, mixed>|null */
+    public ?array $contractPayload = null;
+
+    public bool $attachPullRequestAtCloseout = false;
+
     public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         expect(DB::transactionLevel())->toBe($this->transactionLevel);
@@ -539,17 +545,25 @@ final class LandingIssues implements OrbitActiveIssueProvider, OrbitCloseoutIssu
             return $this->closeoutSnapshot($issueId, $issueKey);
         }
 
-        return new OrbitIssueSnapshot(
-            $issueId,
-            $issueKey,
-            [
+        $payload = $this->contractPayload === null
+            ? []
+            : $this->contractPayload;
+        $payload = [
+            ...$payload,
+            ...[
                 'id' => $issueId,
                 'identifier' => $issueKey,
                 'state' => ['id' => 'review', 'name' => $this->state, 'type' => 'started'],
                 'assignee' => $this->assignee,
                 'delegate' => ['id' => config('commander.hermes.tom_linear_viewer_id')],
             ],
-            str_repeat('d', 64),
+        ];
+
+        return new OrbitIssueSnapshot(
+            $issueId,
+            $issueKey,
+            $payload,
+            $this->contractHash($payload),
         );
     }
 
@@ -565,11 +579,20 @@ final class LandingIssues implements OrbitActiveIssueProvider, OrbitCloseoutIssu
     private function closeoutSnapshot(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         $completed = $this->closeoutState === 'Done';
+        $payload = $this->contractPayload === null
+            ? []
+            : $this->contractPayload;
 
-        return new OrbitIssueSnapshot(
-            $issueId,
-            $issueKey,
-            [
+        if ($this->attachPullRequestAtCloseout) {
+            $payload['attachments'] = ['nodes' => [[
+                'title' => $issueKey.': '.($payload['title'] ?? ''),
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+            ]]];
+        }
+
+        $payload = [
+            ...$payload,
+            ...[
                 'id' => $issueId,
                 'identifier' => $issueKey,
                 'state' => [
@@ -580,8 +603,22 @@ final class LandingIssues implements OrbitActiveIssueProvider, OrbitCloseoutIssu
                 'assignee' => $this->closeoutAssignee,
                 'delegate' => $this->closeoutDelegate,
             ],
-            str_repeat('d', 64),
+        ];
+
+        return new OrbitIssueSnapshot(
+            $issueId,
+            $issueKey,
+            $payload,
+            $this->contractHash($payload),
         );
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function contractHash(array $payload): string
+    {
+        return $this->contractPayload === null
+            ? str_repeat('d', 64)
+            : app(OrbitIssueSnapshotFactory::class)->contractHash($payload);
     }
 }
 
@@ -597,6 +634,10 @@ final class LandingIssueCompletion implements OrbitIssueCompletionTransitioner
 
     public bool $completed = false;
 
+    public ?string $completedContractHash = null;
+
+    public string $expectedContractHash = 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+
     public function transitionToDone(
         string $issueId,
         string $issueKey,
@@ -605,10 +646,11 @@ final class LandingIssueCompletion implements OrbitIssueCompletionTransitioner
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
             ->and($issueId)->toBe('11111111-2222-4333-8444-555555555555')
             ->and($issueKey)->toBe('ORB-234')
-            ->and($expectedContractHash)->toBe(str_repeat('d', 64))
+            ->and($expectedContractHash)->toBe($this->expectedContractHash)
             ->and(test()->repository->reservationIsHeld())->toBeTrue()
             ->and(test()->worktreeCleaner->calls)->toBeGreaterThanOrEqual(1);
         $this->calls++;
+        $this->completedContractHash = $expectedContractHash;
 
         if (! $this->completed) {
             $this->mutationCalls++;
@@ -1883,6 +1925,42 @@ it('records closeout when Linear already completed the merged issue', function (
         ->and($this->issues->closeoutCalls)->toBe(1)
         ->and($this->issueCompletion->calls)->toBe(1)
         ->and($this->issueCompletion->mutationCalls)->toBe(0)
+        ->and($this->gateway->releaseCalls)->toBe(1);
+});
+
+it('records the retained contract when Linear adds the merged pull request attachment', function () {
+    $payload = [
+        'id' => '11111111-2222-4333-8444-555555555555',
+        'identifier' => 'ORB-234',
+        'title' => 'Test issue',
+        'description' => 'Deliver the tested change.',
+        'labels' => ['nodes' => []],
+        'attachments' => ['nodes' => []],
+    ];
+    $contractHash = app(OrbitIssueSnapshotFactory::class)->contractHash($payload);
+    $planning = $this->delivery->phaseRuns()->oldest('id')->firstOrFail();
+    $input = $planning->input;
+    $input['issue_snapshot']['contract_sha256'] = $contractHash;
+    $planning->input = $input;
+    $planning->save();
+    $this->delivery->active_issue_key = $contractHash;
+    $this->delivery->save();
+    $this->issues->contractPayload = $payload;
+    $this->issues->attachPullRequestAtCloseout = true;
+    $attachedPayload = $payload;
+    $attachedPayload['attachments'] = ['nodes' => [[
+        'title' => 'ORB-234: Test issue',
+        'url' => 'https://github.com/nckrtl/orbit/pull/42',
+    ]]];
+    $this->issueCompletion->expectedContractHash = app(OrbitIssueSnapshotFactory::class)
+        ->contractHash($attachedPayload);
+
+    expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))
+        ->toBeNull();
+
+    expect($this->landing->fresh()->output['linear_closeout']['contract_sha256'])
+        ->toBe($contractHash)
+        ->not->toBe($this->issueCompletion->completedContractHash)
         ->and($this->gateway->releaseCalls)->toBe(1);
 });
 
