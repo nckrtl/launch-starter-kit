@@ -269,7 +269,12 @@ final class ImplementationDispatchHerdrRuntime implements HerdrRuntime
             ($this->beforePromptReturn)();
         }
 
-        return implementationDispatchAgent($this->agent->workingDirectory, 'working', 42);
+        return implementationDispatchAgent(
+            $this->agent->workingDirectory,
+            'working',
+            42,
+            agentId: $this->agent->agentId,
+        );
     }
 
     public function getAgent(string $name): HerdrAgentIdentifiers
@@ -289,13 +294,14 @@ function implementationDispatchAgent(
     string $status,
     int $sequence = 41,
     string $pane = 'builder-pane',
+    ?string $agentId = 'builder-agent-id',
 ): HerdrAgentIdentifiers {
     return new HerdrAgentIdentifiers(
         'workspace-1',
         'tab-1',
         $pane,
         'builder-terminal',
-        'builder-agent-id',
+        $agentId,
         'orb-234-loop-builder',
         $sequence,
         $cwd,
@@ -903,6 +909,30 @@ it('prompts the exact retained Builder with the immutable passing review', funct
         ->and(AgentDispatch::where('herdr_pane_id', 'builder-pane')->count())->toBe(2);
 });
 
+it('prompts the retained Builder without protocol agent ids', function () {
+    $this->builder->forceFill(['herdr_agent_id' => null])->save();
+    $this->herdr->agent = implementationDispatchAgent($this->worktree, 'done', agentId: null);
+
+    $dispatch = app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
+
+    expect($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->herdr_agent_id)->toBeNull()
+        ->and($dispatch->herdr_pane_id)->toBe($this->builder->herdr_pane_id)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
+});
+
+it('adopts a newly available protocol agent id for the retained Builder', function () {
+    $this->builder->forceFill(['herdr_agent_id' => null])->save();
+
+    $dispatch = app(DispatchOrbitImplementation::class)->handle($this->delivery->id);
+
+    expect($this->herdr->calls)->toBe(['get', 'prompt'])
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->herdr_agent_id)->toBe('builder-agent-id')
+        ->and($dispatch->herdr_pane_id)->toBe($this->builder->herdr_pane_id);
+});
+
 it('prompts the exact retained Builder to correct verified merge conflicts', function () {
     promoteImplementationToMergeConflictCorrection($this);
 
@@ -966,6 +996,16 @@ it('rejects a correction whose implementation dispatch did not retain the exact 
     expect($this->herdr->calls)->toBe([]);
 });
 
+it('rejects a correction whose known Builder agent id changed', function () {
+    promoteImplementationToMergeConflictCorrection($this);
+    $this->dispatch->forceFill(['herdr_agent_id' => 'replacement-agent-id'])->save();
+
+    expect(fn () => app(DispatchOrbitImplementation::class)->handle($this->delivery->id))
+        ->toThrow(OrbitImplementationDispatchFailed::class, 'did not retain the exact implementation Builder');
+
+    expect($this->herdr->calls)->toBe([]);
+});
+
 it('rejects correction input changes after taking the controller reservation', function () {
     promoteImplementationToMergeConflictCorrection($this);
     $this->repository->afterReserve = function (): void {
@@ -1022,6 +1062,7 @@ it('blocks a retained Builder that is not exact and available', function (string
     $this->herdr->agent = match ($change) {
         'busy' => implementationDispatchAgent($this->worktree, 'working'),
         'worktree' => implementationDispatchAgent('/fast/worktrees/orbit/other', 'done'),
+        'agent' => implementationDispatchAgent($this->worktree, 'done', agentId: 'other-agent-id'),
         default => implementationDispatchAgent($this->worktree, 'done', pane: 'other-pane'),
     };
 
@@ -1033,7 +1074,7 @@ it('blocks a retained Builder that is not exact and available', function (string
         ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Failed)
         ->and($this->herdr->calls)->toBe(['get'])
         ->and($this->repository->reservationIsHeld())->toBeFalse();
-})->with(['busy', 'worktree', 'identity']);
+})->with(['busy', 'worktree', 'identity', 'agent']);
 
 it('rejects source review changes after taking the controller reservation', function () {
     $this->repository->afterReserve = function (): void {

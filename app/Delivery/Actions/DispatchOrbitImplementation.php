@@ -417,7 +417,9 @@ final readonly class DispatchOrbitImplementation
             && $agent->tabId === $builder->herdr_tab_id
             && $agent->paneId === $builder->herdr_pane_id
             && $agent->terminalId === $builder->herdr_terminal_id
-            && $agent->agentId === $builder->herdr_agent_id
+            && ($agent->agentId === null
+                || $builder->herdr_agent_id === null
+                || $agent->agentId === $builder->herdr_agent_id)
             && $agent->agentName === $builder->herdr_agent_name
             && $agent->workingDirectory === $preparation->worktree->path
             && in_array($agent->agentStatus, ['idle', 'done'], true);
@@ -841,8 +843,7 @@ final readonly class DispatchOrbitImplementation
             || $builder->herdr_workspace_id === null
             || $builder->herdr_tab_id === null
             || $builder->herdr_pane_id === null
-            || $builder->herdr_terminal_id === null
-            || $builder->herdr_agent_id === null) {
+            || $builder->herdr_terminal_id === null) {
             throw new OrbitImplementationDispatchFailed('The implementation has no exact retained Builder.');
         }
 
@@ -961,7 +962,9 @@ final readonly class DispatchOrbitImplementation
             && $left->herdr_tab_id === $right->herdr_tab_id
             && $left->herdr_pane_id === $right->herdr_pane_id
             && $left->herdr_terminal_id === $right->herdr_terminal_id
-            && $left->herdr_agent_id === $right->herdr_agent_id
+            && ($left->herdr_agent_id === null
+                || $right->herdr_agent_id === null
+                || $left->herdr_agent_id === $right->herdr_agent_id)
             && $left->herdr_agent_name === $right->herdr_agent_name;
     }
 
