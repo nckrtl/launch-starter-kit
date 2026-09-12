@@ -3,6 +3,7 @@
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPullRequestReview;
+use App\Delivery\Actions\RecoverOrbitPullRequestReviewTransition;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
@@ -1034,6 +1035,104 @@ it('blocks ambiguous Linear and Herdr mutation failures', function (string $fail
         ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous)
         ->and($this->repository->reservationIsHeld())->toBeFalse();
 })->with(['linear', 'open', 'split', 'start', 'prompt']);
+
+it('rearms the same pull request review dispatch after exact Linear read-back', function () {
+    $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Ambiguous,
+        'error_code' => 'linear_pr_review_transition_ambiguous',
+        'error_message' => 'The prior transition outcome was unresolved.',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'linear_pr_review_transition_ambiguous',
+            'dispatch_id' => $this->dispatch->id,
+            'message' => 'The prior transition outcome was unresolved.',
+        ],
+    ])->save();
+    $payload = $this->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+    $payload['assignee'] = null;
+    $this->issues->snapshot = new OrbitIssueSnapshot(
+        $this->issues->snapshot->issueId,
+        $this->issues->snapshot->issueKey,
+        $payload,
+        $this->issues->snapshot->contractHash,
+    );
+
+    $phase = app(RecoverOrbitPullRequestReviewTransition::class)->handle($this->delivery->id);
+
+    expect($phase->is($this->review))->toBeTrue()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Preparing)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Pending)
+        ->and($this->dispatch->fresh()->error_code)->toBeNull()
+        ->and(PhaseRun::query()->count())->toBe(4)
+        ->and(AgentDispatch::query()->count())->toBe(4)
+        ->and($this->transitions->calls)->toBe(0)
+        ->and($this->herdr->calls)->toBe([]);
+});
+
+it('keeps an ambiguous pull request review blocked until Linear is exact In Review', function () {
+    $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Ambiguous,
+        'error_code' => 'linear_pr_review_transition_ambiguous',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'linear_pr_review_transition_ambiguous',
+            'dispatch_id' => $this->dispatch->id,
+        ],
+    ])->save();
+
+    expect(fn () => app(RecoverOrbitPullRequestReviewTransition::class)->handle($this->delivery->id))
+        ->toThrow(
+            OrbitPullRequestReviewDispatchFailed::class,
+            'Linear does not confirm the exact In Review state and ownership for recovery.',
+        );
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous)
+        ->and($this->transitions->calls)->toBe(0)
+        ->and($this->herdr->calls)->toBe([]);
+});
+
+it('queues the retained pull request review after verified recovery', function () {
+    Queue::fake();
+    $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Ambiguous,
+        'error_code' => 'linear_pr_review_transition_ambiguous',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'linear_pr_review_transition_ambiguous',
+            'dispatch_id' => $this->dispatch->id,
+        ],
+    ])->save();
+    $payload = $this->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+    $payload['assignee'] = null;
+    $this->issues->snapshot = new OrbitIssueSnapshot(
+        $this->issues->snapshot->issueId,
+        $this->issues->snapshot->issueKey,
+        $payload,
+        $this->issues->snapshot->contractHash,
+    );
+
+    $this->artisan('delivery:recover-orbit-pr-review', [
+        'delivery' => (string) $this->delivery->id,
+    ])->assertSuccessful();
+
+    Queue::assertPushed(DispatchPullRequestReviewJob::class, fn (DispatchPullRequestReviewJob $job): bool => $job->deliveryId === $this->delivery->id && $job->phaseRunId === $this->review->id
+    );
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Preparing)
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Pending);
+});
 
 it('rejects reviewer identity reuse before agent start', function () {
     $this->herdr->reuseBuilder = true;
