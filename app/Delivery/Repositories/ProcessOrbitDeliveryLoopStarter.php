@@ -31,16 +31,18 @@ final readonly class ProcessOrbitDeliveryLoopStarter implements OrbitDeliveryLoo
             throw new OrbitDeliveryAdmissionFailed('The Orbit delivery admission config is invalid.', 0, $exception);
         }
 
-        $repository = $config instanceof OrbitProjectConfig ? realpath($config->repository) : false;
-        $loopPath = $repository === false ? '' : $repository.'/bin/loop';
-        $loop = $repository === false ? false : realpath($loopPath);
+        $commander = realpath(base_path());
+        $artisanPath = base_path('artisan');
+        $artisan = realpath($artisanPath);
+        $php = realpath(PHP_BINARY);
 
         if ($project === null || $project->state !== ProjectOrchestrationState::Enabled
             || ! $config instanceof OrbitProjectConfig || $config->defaultFlow !== 'discovery'
-            || $repository === false || $repository !== $config->repository
-            || $loop === false || $loop !== $loopPath || is_link($loopPath) || ! is_executable($loop)
+            || $commander === false || $commander !== base_path()
+            || $artisan === false || $artisan !== $artisanPath || is_link($artisanPath) || ! is_file($artisan)
+            || $php === false || ! is_executable($php)
             || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1) {
-            throw new OrbitDeliveryAdmissionFailed('The configured Orbit loop admission adapter is unavailable.');
+            throw new OrbitDeliveryAdmissionFailed('The Commander Orbit delivery admission adapter is unavailable.');
         }
 
         $unit = 'commander-orbit-admission-'.strtolower($issueKey).'.service';
@@ -54,18 +56,19 @@ final readonly class ProcessOrbitDeliveryLoopStarter implements OrbitDeliveryLoo
                 return;
             }
 
-            $started = Process::path($repository)->timeout(10)->run([
+            $started = Process::path($commander)->timeout(10)->run([
                 'systemd-run', '--user', '--collect', '--unit='.$unit,
-                '--property=WorkingDirectory='.$repository,
+                '--property=WorkingDirectory='.$commander,
                 '--property=UnsetEnvironment=SSH_AUTH_SOCK',
-                'env', '-u', 'SSH_AUTH_SOCK', $loop, $issueKey,
+                'env', '-u', 'SSH_AUTH_SOCK', $php, $artisan,
+                'delivery:start-orbit', $projectId, $issueKey, '--idempotent', '--force',
             ]);
         } catch (RuntimeException $exception) {
-            throw new OrbitDeliveryAdmissionFailed('The Orbit loop admission adapter could not run.', 0, $exception);
+            throw new OrbitDeliveryAdmissionFailed('The Commander Orbit delivery admission adapter could not run.', 0, $exception);
         }
 
         if ($started->failed()) {
-            throw new OrbitDeliveryAdmissionFailed('The Orbit loop admission adapter did not start.');
+            throw new OrbitDeliveryAdmissionFailed('The Commander Orbit delivery admission adapter did not start.');
         }
     }
 }

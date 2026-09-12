@@ -125,14 +125,17 @@ whether the candidate already has `controller:commander`. Selection does not yet
 mutate Linear.
 
 The separate, unique `AdmitNextOrbitDelivery` job composes that selector with an
-idempotent ownership handoff and the normal Orbit loop entry point. It is
+idempotent ownership handoff and Commander's normal Orbit delivery command. It is
 disabled by default through `COMMANDER_ORBIT_AUTO_ADMISSION`. When enabled, the
 job adds the configured existing `controller:commander` label ID without
 changing any other issue field, accepts an uncertain mutation only after exact
-Linear read-back, and launches `/home/nckrtl/orbit/bin/loop ISSUE` in one
-deterministically named transient user service. Retries reuse an active service
-instead of starting another process. The existing start command rechecks
-project capacity while it holds the issue controller reservation.
+Linear read-back, and launches Commander's `delivery:start-orbit --idempotent`
+command in one deterministically named transient user service. Retries reuse an
+active service instead of starting another process. This automatic path no
+longer crosses Orbit's `bin/loop` or Hermes' Python controller before returning
+to Commander. The existing start command rechecks project capacity while it
+holds the issue controller reservation. Manual `bin/loop` compatibility remains
+available during the incremental cutover.
 
 The read-only `delivery:shadow-parity` gate now compares each legacy debounced
 Herdr notification with one raw Commander event. A live run on 2026-09-11

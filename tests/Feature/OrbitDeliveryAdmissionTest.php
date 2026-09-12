@@ -147,11 +147,9 @@ beforeEach(function () {
     $this->repository = storage_path('framework/testing/admission-repository-'.bin2hex(random_bytes(4)));
     $this->worktrees = storage_path('framework/testing/admission-worktrees-'.bin2hex(random_bytes(4)));
     File::makeDirectory($this->projectsPath, 0755, true);
-    File::makeDirectory($this->repository.'/bin', 0755, true);
+    File::makeDirectory($this->repository, 0755, true);
     File::makeDirectory($this->repository.'/.git', 0755, true);
     File::makeDirectory($this->worktrees, 0755, true);
-    File::put($this->repository.'/bin/loop', "#!/usr/bin/env python3\n");
-    chmod($this->repository.'/bin/loop', 0755);
 
     config()->set('commander.projects_path', $this->projectsPath);
     config()->set('commander.hermes.ssh_target', 'tom@mini');
@@ -243,7 +241,7 @@ it('accepts a lost ownership mutation response only after exact read-back', func
         ->toBe('ORB-200');
 });
 
-it('starts the normal Orbit loop in one deterministic transient service', function () {
+it('starts Commander directly in one deterministic transient service', function () {
     Process::fake(function ($process) {
         return match ($process->command[0] ?? null) {
             'systemctl' => Process::result(exitCode: 1),
@@ -254,12 +252,16 @@ it('starts the normal Orbit loop in one deterministic transient service', functi
 
     app(ProcessOrbitDeliveryLoopStarter::class)->start('orbit', 'ORB-200');
 
+    $php = realpath(PHP_BINARY);
+
+    expect($php)->not->toBeFalse();
     Process::assertRan(fn ($process): bool => $process->command === [
         'systemd-run', '--user', '--collect', '--unit=commander-orbit-admission-orb-200.service',
-        '--property=WorkingDirectory='.$this->repository,
+        '--property=WorkingDirectory='.base_path(),
         '--property=UnsetEnvironment=SSH_AUTH_SOCK',
-        'env', '-u', 'SSH_AUTH_SOCK', $this->repository.'/bin/loop', 'ORB-200',
-    ] && $process->path === $this->repository);
+        'env', '-u', 'SSH_AUTH_SOCK', $php, base_path('artisan'),
+        'delivery:start-orbit', 'orbit', 'ORB-200', '--idempotent', '--force',
+    ] && $process->path === base_path());
 });
 
 it('uses one bounded unique admission job and stays disabled by default', function () {
