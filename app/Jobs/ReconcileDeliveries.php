@@ -7,6 +7,7 @@ namespace App\Jobs;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -53,11 +54,26 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
     public function handle(): void
     {
         Delivery::query()
-            ->select(['deliveries.id', 'deliveries.status', 'deliveries.current_phase'])
+            ->select([
+                'deliveries.id',
+                'deliveries.status',
+                'deliveries.current_phase',
+                'deliveries.failure_details',
+            ])
             ->whereHas('projectOrchestration', function (Builder $query): void {
                 $query->where('state', ProjectOrchestrationState::Enabled->value);
             })
-            ->whereIn('status', $this->reconcilableStatuses())
+            ->where(function (Builder $query): void {
+                $query->whereIn('status', $this->reconcilableStatuses())
+                    ->orWhere(function (Builder $query): void {
+                        $query->where('status', DeliveryStatus::Blocked)
+                            ->where('current_phase', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+                            ->where(
+                                'failure_details->code',
+                                'resolution_publication_reconciliation_required',
+                            );
+                    });
+            })
             ->orderBy('deliveries.id')
             ->chunkById(self::CHUNK_SIZE, function ($deliveries): void {
                 foreach ($deliveries as $delivery) {
@@ -68,6 +84,19 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
 
     private function dispatchRecovery(Delivery $delivery): void
     {
+        if ($delivery->status === DeliveryStatus::Blocked) {
+            $phaseRunId = $delivery->failure_details['phase_run_id'] ?? null;
+
+            if ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
+                && ($delivery->failure_details['code'] ?? null)
+                    === 'resolution_publication_reconciliation_required'
+                && is_int($phaseRunId)) {
+                AdvanceOrbitResolution::dispatch($delivery->id, $phaseRunId);
+            }
+
+            return;
+        }
+
         if ($delivery->status !== DeliveryStatus::WaitingForAgent) {
             AdvanceDelivery::dispatch($delivery->id);
 

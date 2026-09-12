@@ -40,11 +40,13 @@ use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPullRequestReviewAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPullRequestReviewPublicationFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPullRequestReviewReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitPullRequestReview as AdvancePullRequestReviewJob;
+use App\Jobs\AdvanceOrbitResolution as AdvanceResolutionJob;
 use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPullRequestResolution as DispatchResolutionJob;
 use App\Models\AgentDispatch;
@@ -266,6 +268,8 @@ final class PullRequestReviewAdvanceIssues implements OrbitActiveIssueProvider
 
     public mixed $assignee = null;
 
+    public ?Closure $afterFetch = null;
+
     public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
@@ -273,7 +277,7 @@ final class PullRequestReviewAdvanceIssues implements OrbitActiveIssueProvider
             ->and($issueKey)->toBe('ORB-234');
         $this->calls++;
 
-        return new OrbitIssueSnapshot(
+        $snapshot = new OrbitIssueSnapshot(
             $issueId,
             $issueKey,
             [
@@ -285,6 +289,12 @@ final class PullRequestReviewAdvanceIssues implements OrbitActiveIssueProvider
             ],
             str_repeat('d', 64),
         );
+
+        if ($this->afterFetch instanceof Closure) {
+            ($this->afterFetch)();
+        }
+
+        return $snapshot;
     }
 }
 
@@ -347,6 +357,8 @@ final class PullRequestResolutionPublisher implements OrbitResolutionPublisher
 
     public ?bool $lastAdopted = null;
 
+    public ?Closure $afterPublish = null;
+
     public function publish(
         OrbitIssueSnapshot $issue,
         int $dispatchId,
@@ -362,10 +374,21 @@ final class PullRequestResolutionPublisher implements OrbitResolutionPublisher
         $this->calls++;
         $this->lastAdopted = $adopted;
 
+        if ($this->afterPublish instanceof Closure) {
+            ($this->afterPublish)();
+        }
+
+        $marker = "ORBIT-LOOP-RESOLUTION:{$dispatchId}";
+        $body = implode("\n\n", [
+            $marker,
+            $handoff,
+            'Commander routing: Needs an explicit decision or recovery action.',
+        ]);
+
         return new PublishedOrbitResolution(
             commentId: '22222222-3333-4444-8555-666666666666',
-            marker: "ORBIT-LOOP-RESOLUTION:{$dispatchId}",
-            bodyHash: str_repeat('9', 64),
+            marker: $marker,
+            bodyHash: hash('sha256', $body),
         );
     }
 }
@@ -982,6 +1005,44 @@ function activatePullRequestResolution(object $test): array
     ])->save();
 
     return [$resolution->fresh(), $resolver->fresh()];
+}
+
+/** @return array{PhaseRun, AgentDispatch, Receipt} */
+function prepareResolutionProposalForPublication(object $test): array
+{
+    [$resolution, $resolver] = activatePullRequestResolution($test);
+    $handoff = 'Use the loaded worker configuration as the health authority.';
+    $proposal = [
+        'schema' => 1,
+        'resume_phase' => 'implementing',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => [],
+        'plan_changes' => [],
+    ];
+    File::put($test->worktreePath.'/.loop/runtime/resolution-handoff.md', $handoff."\n");
+    File::put(
+        $test->worktreePath.'/.loop/runtime/resolution.json',
+        json_encode($proposal, JSON_THROW_ON_ERROR)."\n",
+    );
+    $test->artisan('delivery:submit-orbit-resolution-receipt', [
+        'phase-run' => (string) $resolution->id,
+        'dispatch' => (string) $resolver->id,
+        '--result' => 'proposal',
+        '--handoff' => '.loop/runtime/resolution-handoff.md',
+        '--resolution' => '.loop/runtime/resolution.json',
+    ])->assertSuccessful();
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    app(AdvanceDeliveryAction::class)->handle($test->delivery->id);
+
+    return [
+        $resolution->fresh(),
+        $resolver->fresh(),
+        $resolution->receipts()->where('kind', 'orbit_resolution')->sole(),
+    ];
 }
 
 function blockPullRequestReviewReceiptAsMissing(object $test): void
@@ -1876,7 +1937,11 @@ it('publishes and classifies one immutable structured resolution proposal', func
         ->and($resolution->fresh()->output['publication'])->toBe([
             'comment_id' => '22222222-3333-4444-8555-666666666666',
             'marker' => "ORBIT-LOOP-RESOLUTION:{$resolver->id}",
-            'body_sha256' => str_repeat('9', 64),
+            'body_sha256' => hash(
+                'sha256',
+                "ORBIT-LOOP-RESOLUTION:{$resolver->id}\n\n{$handoff}\n\n".
+                'Commander routing: Needs an explicit decision or recovery action.',
+            ),
         ])
         ->and($resolution->fresh()->output['adopted'])->toBeFalse()
         ->and($resolution->fresh()->output['automatic_adoption_eligible'])->toBeTrue()
@@ -1886,6 +1951,98 @@ it('publishes and classifies one immutable structured resolution proposal', func
         ->and($this->resolutionPublisher->lastAdopted)->toBeFalse();
 
     app(AdvanceOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
+
+    expect($this->resolutionPublisher->calls)->toBe(1);
+});
+
+it('recovers a resolution publication whose response was lost without creating a new intent', function () {
+    [$resolution, $resolver, $receipt] = prepareResolutionProposalForPublication($this);
+    $this->resolutionPublisher->afterPublish = static function (): void {
+        throw new RuntimeException('The publication response was lost.');
+    };
+    $job = new AdvanceResolutionJob($this->delivery->id, $resolution->id);
+
+    expect(fn () => $job->handle(app(AdvanceOrbitResolution::class)))
+        ->toThrow(RuntimeException::class, 'publication response was lost');
+
+    expect($resolution->fresh()->current_block)->toBe('resolution_publication')
+        ->and($this->delivery->fresh()->failure_details)->toBe([
+            'code' => 'resolution_proposal_ready',
+            'phase_run_id' => $resolution->id,
+            'dispatch_id' => $resolver->id,
+            'receipt_id' => $receipt->id,
+        ])
+        ->and($this->resolutionPublisher->calls)->toBe(1);
+
+    $job->failed(new RuntimeException('Resolution publication retries exhausted.'));
+
+    expect($this->delivery->fresh()->failure_details)->toBe([
+        'code' => 'resolution_publication_reconciliation_required',
+        'phase_run_id' => $resolution->id,
+        'dispatch_id' => $resolver->id,
+        'receipt_id' => $receipt->id,
+        'message' => 'Resolution publication retries exhausted.',
+    ]);
+
+    $this->resolutionPublisher->afterPublish = null;
+    $job->handle(app(AdvanceOrbitResolution::class));
+
+    expect($resolution->fresh()->current_block)->toBeNull()
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('resolution_adoption_ready')
+        ->and($this->resolutionPublisher->calls)->toBe(2);
+});
+
+it('revalidates the immutable resolution ledger immediately before publication', function () {
+    [$resolution, , $receipt] = prepareResolutionProposalForPublication($this);
+    $this->advanceIssues->calls = 0;
+    $this->advanceIssues->afterFetch = function () use ($receipt): void {
+        DB::table('receipts')->where('id', $receipt->id)->update([
+            'payload_hash' => str_repeat('0', 64),
+        ]);
+    };
+
+    expect(fn () => app(AdvanceOrbitResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    ))->toThrow(OrbitResolutionPublicationFailed::class, 'ledger changed before publication');
+
+    expect($resolution->fresh()->current_block)->toBe('resolution_publication')
+        ->and($this->resolutionPublisher->calls)->toBe(0);
+});
+
+it('revalidates exact resolution identities after external publication', function () {
+    [$resolution, $resolver] = prepareResolutionProposalForPublication($this);
+    $this->resolutionPublisher->afterPublish = function () use ($resolver): void {
+        $delivery = $this->delivery->fresh();
+        $failure = $delivery->failure_details;
+        $failure['dispatch_id'] = $resolver->id + 1;
+        DB::table('deliveries')->where('id', $delivery->id)->update([
+            'failure_details' => json_encode($failure, JSON_THROW_ON_ERROR),
+        ]);
+    };
+
+    expect(fn () => app(AdvanceOrbitResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    ))->toThrow(OrbitResolutionPublicationFailed::class, 'ledger changed during publication');
+
+    expect($resolution->fresh()->current_block)->toBe('resolution_publication')
+        ->and($this->resolutionPublisher->calls)->toBe(1);
+});
+
+it('rejects a corrupted committed resolution publication instead of publishing again', function () {
+    [$resolution] = prepareResolutionProposalForPublication($this);
+    app(AdvanceOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
+    $output = $resolution->fresh()->output;
+    $output['automatic_adoption_eligible'] = false;
+    DB::table('phase_runs')->where('id', $resolution->id)->update([
+        'output' => json_encode($output, JSON_THROW_ON_ERROR),
+    ]);
+
+    expect(fn () => app(AdvanceOrbitResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    ))->toThrow(OrbitResolutionPublicationFailed::class, 'retained resolution publication is inconsistent');
 
     expect($this->resolutionPublisher->calls)->toBe(1);
 });

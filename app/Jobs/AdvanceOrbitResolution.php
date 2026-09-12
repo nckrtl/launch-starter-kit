@@ -6,10 +6,12 @@ namespace App\Jobs;
 
 use App\Delivery\Actions\AdvanceOrbitResolution as AdvanceAction;
 use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Models\Delivery;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Contracts\Queue\ShouldQueueAfterCommit;
 use Illuminate\Foundation\Queue\Queueable;
@@ -17,7 +19,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Throwable;
 
-final class AdvanceOrbitResolution implements ShouldQueue, ShouldQueueAfterCommit
+final class AdvanceOrbitResolution implements ShouldBeUniqueUntilProcessing, ShouldQueue, ShouldQueueAfterCommit
 {
     use Queueable;
 
@@ -28,6 +30,8 @@ final class AdvanceOrbitResolution implements ShouldQueue, ShouldQueueAfterCommi
     public int $timeout = self::TIMEOUT_SECONDS;
 
     public int $tries = 0;
+
+    public int $uniqueFor = self::LOCK_SECONDS;
 
     /** @var list<int> */
     public array $backoff = [1, 5, 15, 30];
@@ -44,6 +48,11 @@ final class AdvanceOrbitResolution implements ShouldQueue, ShouldQueueAfterCommi
     public function retryUntil(): DateTimeInterface
     {
         return $this->retryDeadline;
+    }
+
+    public function uniqueId(): string
+    {
+        return "delivery:resolution-advance:{$this->deliveryId}:{$this->phaseRunId}";
     }
 
     public function handle(AdvanceAction $advance): void
@@ -76,9 +85,20 @@ final class AdvanceOrbitResolution implements ShouldQueue, ShouldQueueAfterCommi
                 return;
             }
 
+            $phase = $delivery->phaseRuns()
+                ->whereKey($this->phaseRunId)
+                ->lockForUpdate()
+                ->first();
+
             $failure = $delivery->failure_details;
 
-            if (! is_array($failure) || ($failure['phase_run_id'] ?? null) !== $this->phaseRunId
+            if ($phase === null
+                || $phase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
+                || $phase->status !== PhaseRunStatus::Completed
+                || $phase->current_block !== 'resolution_publication'
+                || ! is_array($failure) || ($failure['phase_run_id'] ?? null) !== $this->phaseRunId
+                || ! is_int($failure['dispatch_id'] ?? null)
+                || ! is_int($failure['receipt_id'] ?? null)
                 || ! in_array($failure['code'] ?? null, [
                     'resolution_proposal_ready',
                     'resolution_publication_reconciliation_required',
@@ -86,11 +106,9 @@ final class AdvanceOrbitResolution implements ShouldQueue, ShouldQueueAfterCommi
                 return;
             }
 
-            $delivery->failure_details = [
-                'code' => 'resolution_publication_reconciliation_required',
-                'phase_run_id' => $this->phaseRunId,
-                'message' => $exception?->getMessage(),
-            ];
+            $failure['code'] = 'resolution_publication_reconciliation_required';
+            $failure['message'] = $exception?->getMessage();
+            $delivery->failure_details = $failure;
             $delivery->save();
         });
     }

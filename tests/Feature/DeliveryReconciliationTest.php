@@ -13,7 +13,9 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\HerdrSettlementReconciliationFailed;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
+use App\Jobs\AdvanceOrbitResolution;
 use App\Jobs\ReconcileDeliveries;
 use App\Jobs\ReconcileDelivery;
 use App\Models\AgentDispatch;
@@ -129,7 +131,7 @@ function waitingReconciliationDelivery(string $status = 'working', int $sequence
 }
 
 it('queues per-delivery recovery only for enabled recoverable deliveries', function (): void {
-    Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
+    Queue::fake([AdvanceDelivery::class, AdvanceOrbitResolution::class, ReconcileDelivery::class]);
     $enabled = ProjectOrchestration::create([
         'manifest_project_id' => 'enabled-project',
         'config' => [],
@@ -173,6 +175,20 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
         static fn (DeliveryStatus $status): Delivery => $delivery($enabled, $status),
         $recoverableStatuses,
     );
+    $resolutionPublication = Delivery::create([
+        'project_orchestration_id' => $enabled->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'resolution-publication',
+        'external_issue_key' => 'ORB-314',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'failure_details' => [
+            'code' => 'resolution_publication_reconciliation_required',
+            'phase_run_id' => 314,
+        ],
+    ]);
     $excluded = [
         $delivery($enabled, DeliveryStatus::Paused),
         $delivery($enabled, DeliveryStatus::Blocked),
@@ -186,6 +202,11 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
     $job->handle();
 
     Queue::assertPushed(AdvanceDelivery::class, count($recoverable));
+    Queue::assertPushed(
+        AdvanceOrbitResolution::class,
+        fn (AdvanceOrbitResolution $queued): bool => $queued->deliveryId === $resolutionPublication->id
+            && $queued->phaseRunId === 314,
+    );
     Queue::assertNotPushed(ReconcileDelivery::class);
 
     foreach ($recoverable as $candidate) {

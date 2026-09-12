@@ -4,6 +4,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
 use App\Delivery\IssueProviders\SshOrbitResolutionPublisher;
 use App\Jobs\AdvanceOrbitResolution;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
 use Illuminate\Support\Facades\Process;
 
 beforeEach(function () {
@@ -168,5 +169,7 @@ it('bounds resolution publication below the queue retry window', function () {
 
     expect($job->timeout)->toBe(AdvanceOrbitResolution::TIMEOUT_SECONDS)
         ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
-        ->and(AdvanceOrbitResolution::LOCK_SECONDS)->toBeGreaterThan($job->timeout);
+        ->and(AdvanceOrbitResolution::LOCK_SECONDS)->toBeGreaterThan($job->timeout)
+        ->and($job)->toBeInstanceOf(ShouldBeUniqueUntilProcessing::class)
+        ->and($job->uniqueId())->toBe('delivery:resolution-advance:7:28');
 });
