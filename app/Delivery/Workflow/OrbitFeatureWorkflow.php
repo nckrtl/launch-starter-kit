@@ -50,6 +50,13 @@ final readonly class OrbitFeatureWorkflow
 
     public const int RESOLUTION_PROMPT_VERSION = 1;
 
+    public function planReviewAgentName(string $issueKey, int $attempt): string
+    {
+        $suffix = $attempt === 1 ? '' : "-{$attempt}";
+
+        return strtolower($issueKey).'-loop-plan-review'.$suffix;
+    }
+
     public function planningPrompt(
         string $issueKey,
         string $worktree,

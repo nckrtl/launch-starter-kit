@@ -146,7 +146,10 @@ final readonly class DispatchOrbitPlanReview
                 || $project->config !== $config->toArray()
                 || $phase->agentDispatches()->count() !== 1
                 || $dispatch->idempotency_key !== $expectedKey
-                || $dispatch->herdr_agent_name !== strtolower((string) $locked->external_issue_key).'-loop-plan-review'
+                || $dispatch->herdr_agent_name !== $this->workflow->planReviewAgentName(
+                    (string) $locked->external_issue_key,
+                    $phase->attempt,
+                )
                 || $dispatch->prompt_name !== 'orbit_plan_review'
                 || $dispatch->prompt_version !== OrbitFeatureWorkflow::PLAN_REVIEW_PROMPT_VERSION) {
                 throw new OrbitPlanReviewDispatchFailed('The retained Orbit plan-review intent is inconsistent.');

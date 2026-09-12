@@ -123,13 +123,19 @@ final class PlanReviewDispatchRepository implements OrbitRepository
 
         expect($startupWorktree->headSha)->toBe(str_repeat('a', 40))
             ->and($candidateSha)->toBe(str_repeat('b', 40))
-            ->and($artifactSha)->toBeIn([str_repeat('d', 40), null]);
+            ->and($artifactSha)->toBeIn([str_repeat('d', 40), str_repeat('7', 40), null]);
+
+        $planContentsHash = match ($artifactSha) {
+            null => null,
+            str_repeat('d', 40) => str_repeat('e', 64),
+            default => str_repeat('8', 64),
+        };
 
         return new VerifiedOrbitPlanningOutcome(
             $candidateSha,
             str_repeat('c', 40),
             $artifactSha,
-            $artifactSha === null ? null : str_repeat('e', 64),
+            $planContentsHash,
         );
     }
 
@@ -596,12 +602,11 @@ it('routes a repeated fixing review to resolution with complete correction prove
         'delivery_id' => $this->delivery->id,
         'phase_name' => OrbitFeatureWorkflow::PLAN_REVIEW_PHASE,
         'attempt' => 2,
-        'status' => PhaseRunStatus::Running,
+        'status' => PhaseRunStatus::Pending,
         'input' => [
             'planning_receipt_id' => $planningReceipt->id,
             'planning_receipt' => $planningPayload,
         ],
-        'started_at' => now(),
     ]);
     $reviewer = AgentDispatch::query()->create([
         'phase_run_id' => $review->id,
@@ -612,13 +617,26 @@ it('routes a repeated fixing review to resolution with complete correction prove
             2,
             OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE,
         )->value,
-        'herdr_agent_name' => 'orb-234-loop-plan-review',
+        'herdr_agent_name' => 'orb-234-loop-plan-review-2',
         'prompt_name' => 'orbit_plan_review',
         'prompt_version' => 1,
-        'prompt_hash' => str_repeat('9', 64),
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Pending,
+    ]);
+    $this->review = $review;
+    $this->dispatch = $reviewer;
+    $this->planningPayload = $planningPayload;
+    $this->planningReceipt = $planningReceipt;
+    $this->delivery->refresh()->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::PLAN_REVIEW_PHASE,
+        'status' => DeliveryStatus::Queued,
+    ])->save();
+
+    $reviewer = app(DispatchOrbitPlanReview::class)->handle($this->delivery->id);
+    $reviewer->forceFill([
         'status' => AgentDispatchStatus::Settled,
         'settled_at' => now(),
-    ]);
+    ])->save();
     $reviewPayload = [
         ...planReviewReceiptPayload($this),
         'dispatch_id' => $reviewer->id,
@@ -638,11 +656,6 @@ it('routes a repeated fixing review to resolution with complete correction prove
         'captured_at' => now(),
         'validated_at' => now(),
     ]);
-    $this->delivery->refresh()->forceFill([
-        'current_phase' => OrbitFeatureWorkflow::PLAN_REVIEW_PHASE,
-        'status' => DeliveryStatus::WaitingForAgent,
-    ])->save();
-
     app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
 
     expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE);
@@ -651,6 +664,11 @@ it('routes a repeated fixing review to resolution with complete correction prove
         ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
         ->sole();
     expect($review->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($reviewer->herdr_agent_name)->toBe('orb-234-loop-plan-review-2')
+        ->and($this->herdr->calls)->toBe([
+            'open', 'split', 'start', 'prompt',
+            'open', 'split', 'start', 'prompt',
+        ])
         ->and($resolution->input['plan_review_receipt']['result'])->toBe('fix')
         ->and($planning->input)->toBe([
             'plan_review_receipt_id' => $firstReviewReceipt->id,

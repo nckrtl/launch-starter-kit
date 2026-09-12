@@ -37,6 +37,7 @@ final readonly class AdvanceOrbitPlanning
         private OrbitIssueProvider $issues,
         private OrbitPlanningReceiptValidator $planningReceipts,
         private OrbitPlanReviewReceiptValidator $reviewReceipts,
+        private OrbitFeatureWorkflow $workflow,
     ) {}
 
     public function handle(int $deliveryId): bool
@@ -263,7 +264,10 @@ final readonly class AdvanceOrbitPlanning
             $review->attempt,
             OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE,
         )->value;
-        $expectedName = strtolower((string) $delivery->external_issue_key).'-loop-plan-review';
+        $expectedName = $this->workflow->planReviewAgentName(
+            (string) $delivery->external_issue_key,
+            $review->attempt,
+        );
 
         if ($result !== 'ready'
             || $planning->status !== PhaseRunStatus::Completed
@@ -449,9 +453,12 @@ final readonly class AdvanceOrbitPlanning
             $nextRole = $isResolution
                 ? OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
                 : OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE;
-            $nextAgent = strtolower((string) $delivery->external_issue_key).'-loop-'.($isResolution
-                ? 'resolution-1'
-                : 'plan-review');
+            $nextAgent = $isResolution
+                ? strtolower((string) $delivery->external_issue_key).'-loop-resolution-1'
+                : $this->workflow->planReviewAgentName(
+                    (string) $delivery->external_issue_key,
+                    $nextAttempt,
+                );
             $nextPrompt = $isResolution ? 'orbit_resolution' : 'orbit_plan_review';
             $nextInput = $isResolution
                 ? $this->correctionResolutionInput($phase, $receipt)

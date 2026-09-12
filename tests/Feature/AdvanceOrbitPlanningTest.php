@@ -458,7 +458,7 @@ it('routes a ready planning correction to plan review attempt two', function () 
             'planning_receipt' => $receipt->payload,
         ])
         ->and($reviewer->agent_role)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE)
-        ->and($reviewer->herdr_agent_name)->toBe('orb-234-loop-plan-review')
+        ->and($reviewer->herdr_agent_name)->toBe('orb-234-loop-plan-review-2')
         ->and($reviewer->status)->toBe(AgentDispatchStatus::Pending)
         ->and(PhaseRun::count())->toBe(4)
         ->and(AgentDispatch::count())->toBe(4)
