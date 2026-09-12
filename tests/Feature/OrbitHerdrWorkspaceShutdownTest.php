@@ -197,6 +197,66 @@ it('exits owned agents, verifies idle shells, and closes only the recorded works
         ->and($this->herdr->closedWorkspaces)->toHaveCount(1);
 });
 
+it('ignores a recovered pre-start mergeability failure without a runtime identity', function () {
+    $failedReview = PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Failed,
+        'failure_code' => 'pr_review_mergeability_changed',
+        'failure_message' => 'The published pull request became unmergeable before independent review.',
+        'started_at' => now(),
+        'finished_at' => now(),
+    ]);
+    AgentDispatch::query()->create([
+        'phase_run_id' => $failedReview->id,
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'idempotency_key' => 'workspace-shutdown-failed-review',
+        'herdr_agent_name' => 'orb-234-loop-pr-review-1',
+        'prompt_name' => 'orbit_pr_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('c', 64),
+        'status' => AgentDispatchStatus::Failed,
+        'error_code' => 'pr_review_mergeability_changed',
+        'error_message' => 'The published pull request became unmergeable before independent review.',
+    ]);
+    $open = shutdownSnapshot($this->repository, $this->worktree);
+    $closed = shutdownSnapshot($this->repository, $this->worktree, includeTarget: false);
+    $this->herdr->snapshots = [$open, $open, $closed];
+
+    expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeTrue()
+        ->and($this->herdr->closedWorkspaces)->toBe(['issue-workspace']);
+});
+
+it('rejects another failed dispatch without a runtime identity', function () {
+    $failedReview = PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Failed,
+        'failure_code' => 'other_failure',
+        'failure_message' => 'Another failure.',
+        'started_at' => now(),
+        'finished_at' => now(),
+    ]);
+    AgentDispatch::query()->create([
+        'phase_run_id' => $failedReview->id,
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'idempotency_key' => 'workspace-shutdown-other-failure',
+        'herdr_agent_name' => 'orb-234-loop-pr-review-1',
+        'prompt_name' => 'orbit_pr_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('c', 64),
+        'status' => AgentDispatchStatus::Failed,
+        'error_code' => 'other_failure',
+        'error_message' => 'Another failure.',
+    ]);
+    $this->herdr->snapshots = [shutdownSnapshot($this->repository, $this->worktree)];
+
+    expect(fn () => $this->action->handle($this->config, $this->delivery->id, $this->phase->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'incomplete Herdr dispatch identity');
+});
+
 it('waits without replaying exit input while an owned agent remains', function () {
     $snapshot = shutdownSnapshot($this->repository, $this->worktree, agentStatus: 'idle');
     $this->herdr->snapshots = [$snapshot];

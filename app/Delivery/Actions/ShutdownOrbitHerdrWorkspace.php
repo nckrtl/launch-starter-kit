@@ -192,6 +192,10 @@ final readonly class ShutdownOrbitHerdrWorkspace
         $terminalIds = [];
 
         foreach ($dispatches as $dispatch) {
+            if ($this->isUnstartedMergeabilityFailure($delivery, $dispatch)) {
+                continue;
+            }
+
             $retainedWaitingReviewer = $this->isRetainedWaitingReviewer(
                 $delivery,
                 $phase,
@@ -254,6 +258,42 @@ final readonly class ShutdownOrbitHerdrWorkspace
             'pane_ids' => $paneIds,
             'terminal_ids' => $terminalIds,
         ]];
+    }
+
+    private function isUnstartedMergeabilityFailure(
+        Delivery $delivery,
+        AgentDispatch $dispatch,
+    ): bool {
+        if ($dispatch->status !== AgentDispatchStatus::Failed
+            || $dispatch->agent_role !== OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE
+            || $dispatch->error_code !== 'pr_review_mergeability_changed'
+            || $dispatch->error_message !== 'The published pull request became unmergeable before independent review.'
+            || $dispatch->herdr_session !== null
+            || $dispatch->herdr_workspace_id !== null
+            || $dispatch->herdr_tab_id !== null
+            || $dispatch->herdr_pane_id !== null
+            || $dispatch->herdr_terminal_id !== null
+            || $dispatch->herdr_agent_id !== null
+            || $dispatch->dispatched_at !== null
+            || $dispatch->settled_at !== null) {
+            return false;
+        }
+
+        $phase = PhaseRun::query()->find($dispatch->phase_run_id);
+
+        return $phase !== null
+            && $phase->delivery_id === $delivery->id
+            && $phase->phase_name === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            && $phase->attempt === 1
+            && $phase->status === PhaseRunStatus::Failed
+            && $phase->current_block === null
+            && $phase->output === null
+            && $phase->failure_code === 'pr_review_mergeability_changed'
+            && $phase->failure_message === 'The published pull request became unmergeable before independent review.'
+            && $phase->failure_details === null
+            && $phase->started_at !== null
+            && $phase->finished_at !== null
+            && $phase->receipts()->doesntExist();
     }
 
     private function isRetainedWaitingReviewer(
