@@ -1274,6 +1274,7 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
         array $worktrees,
         string $worktree,
         string $branch,
+        string $issueKey,
     ): array {
         return array_map(
             static fn (array $item): array => [
@@ -1281,7 +1282,10 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
                 'branch' => $item['branch'],
                 'prunable' => $item['prunable'],
             ],
-            $this->unrelatedWorktrees($worktrees, $worktree, $branch),
+            array_values(array_filter(
+                $this->unrelatedWorktrees($worktrees, $worktree, $branch),
+                static fn (array $item): bool => $item['branch'] !== 'refs/heads/'.Str::lower($issueKey),
+            )),
         );
     }
 
@@ -1289,9 +1293,16 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
      * @param  array<string, string>  $branches
      * @return list<string>
      */
-    private function unrelatedStaleBranchTopology(array $branches, string $branch): array
-    {
+    private function unrelatedStaleBranchTopology(
+        array $branches,
+        string $branch,
+        string $issueKey,
+    ): array {
         $refs = array_keys($this->unrelatedBranches($branches, $branch));
+        $refs = array_values(array_filter(
+            $refs,
+            static fn (string $ref): bool => $ref !== 'refs/heads/'.Str::lower($issueKey),
+        ));
         sort($refs);
 
         return $refs;
@@ -1557,10 +1568,12 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
                     $state['worktrees'],
                     $worktree->worktree,
                     $worktree->branch,
+                    $worktree->issueKey,
                 ),
                 'protected_branches' => $this->unrelatedStaleBranchTopology(
                     $state['branches'],
                     $worktree->branch,
+                    $worktree->issueKey,
                 ),
                 'prepared_at' => gmdate('Y-m-d\TH:i:s\Z'),
                 'retired_at' => null,
@@ -2475,8 +2488,13 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
             $worktrees,
             $journal['worktree'],
             $journal['branch'],
+            $journal['issue_key'],
         );
-        $protectedBranches = $this->unrelatedStaleBranchTopology($branches, $journal['branch']);
+        $protectedBranches = $this->unrelatedStaleBranchTopology(
+            $branches,
+            $journal['branch'],
+            $journal['issue_key'],
+        );
 
         if (count($targets) !== (count($exact) === 1 ? 1 : 0)
             || array_key_exists($branchRef, $branches) !== $branchPresent

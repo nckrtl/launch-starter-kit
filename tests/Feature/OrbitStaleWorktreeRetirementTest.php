@@ -170,6 +170,8 @@ function fakeStaleRetirement(object $test, array $overrides = []): object
 
         public bool $removeThrown = false;
 
+        public bool $freshPresent = false;
+
         public int $captures = 0;
 
         public string $otherSha = '';
@@ -197,6 +199,14 @@ function fakeStaleRetirement(object $test, array $overrides = []): object
             ];
         }
 
+        if ($state->freshPresent) {
+            $worktrees[] = [
+                'worktree' => $test->worktreeRoot.'/orb-234',
+                'head' => $test->mainSha,
+                'branch' => 'refs/heads/orb-234',
+            ];
+        }
+
         $worktrees[] = [
             'worktree' => $test->base.'/other',
             'head' => $state->otherSha,
@@ -206,6 +216,7 @@ function fakeStaleRetirement(object $test, array $overrides = []): object
         $branches = [
             'refs/heads/main' => $test->mainSha,
             ...($state->branchPresent ? ['refs/heads/'.$test->branch => $test->headSha] : []),
+            ...($state->freshPresent ? ['refs/heads/orb-234' => $test->mainSha] : []),
             ...($overrides['extra_branches'] ?? []),
             'refs/heads/orb-999' => $state->otherSha,
         ];
@@ -378,6 +389,7 @@ it('returns retained evidence idempotently after retirement completed', function
     $repository = app(ProcessOrbitRepository::class);
     $stale = $repository->inspectStaleWorktree($this->config, 'ORB-234');
     $repository->retireStaleWorktree($this->config, $stale);
+    $state->freshPresent = true;
     $retained = $repository->inspectStaleWorktree($this->config, 'ORB-234');
     $retired = $repository->retireStaleWorktree($this->config, $retained);
 
