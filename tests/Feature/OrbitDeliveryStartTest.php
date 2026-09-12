@@ -5,6 +5,7 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\CandidateCheck;
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
@@ -103,6 +104,33 @@ it('records a live Orbit delivery before routing its planning dispatch through t
         DispatchOrbitPlanningJob::class,
         fn (DispatchOrbitPlanningJob $job): bool => $job->deliveryId === $delivery->id,
     );
+});
+
+it('retains stale-worktree recovery evidence in the initial phase ledger', function () {
+    $retired = new RetiredOrbitStaleWorktree(
+        repository: '/home/nckrtl/orbit',
+        worktree: '/home/nckrtl/orbit/.worktrees/orb-234-old-title',
+        issueKey: 'ORB-234',
+        branch: 'orb-234-old-title',
+        headSha: str_repeat('c', 40),
+        treeSha: str_repeat('d', 40),
+        retainedRef: 'refs/orbit-delivery/retired-worktrees/orb-234/'.str_repeat('c', 40),
+        archive: '/home/nckrtl/orbit/.git/orbit-delivery/v1/orb-234/retired-worktrees/'
+            .str_repeat('c', 40).'/'.str_repeat('e', 64),
+        archiveDigest: str_repeat('e', 64),
+        disposition: 'retired',
+        retiredAt: '2026-09-12T02:00:00Z',
+    );
+    $delivery = app(StartOrbitDelivery::class)->handle(
+        $this->project,
+        $this->issue,
+        $this->worktree,
+        $this->candidate,
+        $retired,
+    );
+
+    expect($delivery->phaseRuns()->sole()->input['retired_stale_worktree'])
+        ->toBe($retired->toArray());
 });
 
 it('rejects inconsistent live Orbit preparation before writing the ledger', function (string $case) {

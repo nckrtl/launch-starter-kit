@@ -8,6 +8,7 @@ use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
 use App\Delivery\Data\VerifiedIssueSnapshot;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -29,6 +30,7 @@ final readonly class StartOrbitDelivery
         VerifiedIssueSnapshot $verifiedIssue,
         string $worktreePath,
         CandidateCheck $candidateCheck,
+        ?RetiredOrbitStaleWorktree $retiredWorktree = null,
     ): Delivery {
         $issueSnapshot = $verifiedIssue->snapshot;
 
@@ -61,11 +63,20 @@ final readonly class StartOrbitDelivery
             || ! is_string($expectedReceiptDirectory)
             || ! str_starts_with($candidateCheck->receiptPath, $expectedReceiptDirectory)
             || preg_match('/^[a-f0-9]{40}$/', $candidateCheck->candidateSha) !== 1
-            || preg_match('/^[a-f0-9]{40}$/', $candidateCheck->treeSha) !== 1) {
+            || preg_match('/^[a-f0-9]{40}$/', $candidateCheck->treeSha) !== 1
+            || ($retiredWorktree !== null
+                && ($retiredWorktree->repository !== $config->repository
+                    || $retiredWorktree->issueKey !== $issueSnapshot->issueKey
+                    || $retiredWorktree->worktree === $worktreePath
+                    || ! str_starts_with(
+                        $retiredWorktree->archive,
+                        $config->repository.'/.git/orbit-delivery/v1/'
+                            .strtolower($issueSnapshot->issueKey).'/retired-worktrees/',
+                    )))) {
             throw new InvalidArgumentException('The prepared Orbit delivery inputs are inconsistent.');
         }
 
-        return DB::transaction(function () use ($project, $verifiedIssue, $issueSnapshot, $worktreePath, $candidateCheck, $config): Delivery {
+        return DB::transaction(function () use ($project, $verifiedIssue, $issueSnapshot, $worktreePath, $candidateCheck, $config, $retiredWorktree): Delivery {
             $delivery = Delivery::query()->create([
                 'project_orchestration_id' => $project->getKey(),
                 'external_issue_provider' => $issueSnapshot->provider,
@@ -103,6 +114,9 @@ final readonly class StartOrbitDelivery
                         'candidate_sha' => $candidateCheck->candidateSha,
                         'tree_sha' => $candidateCheck->treeSha,
                     ],
+                    ...($retiredWorktree === null
+                        ? []
+                        : ['retired_stale_worktree' => $retiredWorktree->toArray()]),
                 ],
             ]);
 

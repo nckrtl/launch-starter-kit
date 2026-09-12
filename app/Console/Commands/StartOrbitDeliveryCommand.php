@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Console\Commands;
 
+use App\Delivery\Actions\RetireStaleOrbitWorktree;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Actions\VerifyOrbitIssueSnapshot;
 use App\Delivery\Config\ProjectConfigRegistry;
@@ -45,6 +46,7 @@ final class StartOrbitDeliveryCommand extends Command
         OrbitIssueProvider $issues,
         OrbitRepository $repository,
         VerifyOrbitIssueSnapshot $verifyIssue,
+        RetireStaleOrbitWorktree $retireStaleWorktree,
         StartOrbitDelivery $start,
     ): int {
         if (! config('herdr.orchestration.enabled', false)) {
@@ -126,6 +128,7 @@ final class StartOrbitDeliveryCommand extends Command
                 return self::FAILURE;
             }
 
+            $retiredWorktree = $retireStaleWorktree->handle($config, $issue);
             $worktree = $repository->prepareWorktree($config, $input['issue_key']);
             $candidateCheck = $repository->checkCandidate($config, $worktree);
             $issueSnapshot = $repository->writeIssueSnapshot($config, $worktree, $issue);
@@ -138,7 +141,13 @@ final class StartOrbitDeliveryCommand extends Command
             }
 
             $verifiedIssue = $verifyIssue->handle($config, $worktree, $issueSnapshot, $currentIssue);
-            $delivery = $start->handle($project, $verifiedIssue, $worktree->path, $candidateCheck);
+            $delivery = $start->handle(
+                $project,
+                $verifiedIssue,
+                $worktree->path,
+                $candidateCheck,
+                $retiredWorktree,
+            );
         } catch (InvalidArgumentException|OrbitIssueContractChanged|OrbitIssueProviderFailed|OrbitRepositoryFailed $exception) {
             $this->error($exception->getMessage());
 

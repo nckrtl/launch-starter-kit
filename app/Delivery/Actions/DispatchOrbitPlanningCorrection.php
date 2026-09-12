@@ -625,7 +625,7 @@ final readonly class DispatchOrbitPlanningCorrection
             || $dispatch->idempotency_key !== $expectedKey
             || $dispatch->herdr_agent_name !== $expectedName
             || $dispatch->prompt_name !== 'orbit_planning_correction'
-            || $dispatch->prompt_version !== OrbitFeatureWorkflow::PLANNING_PROMPT_VERSION) {
+            || $dispatch->prompt_version !== OrbitFeatureWorkflow::PLANNING_CORRECTION_PROMPT_VERSION) {
             throw new OrbitPlanningDispatchFailed('The retained planning-correction intent is inconsistent.');
         }
     }

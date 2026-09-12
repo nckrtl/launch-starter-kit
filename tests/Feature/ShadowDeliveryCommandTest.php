@@ -4,11 +4,16 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueResolver;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitStaleWorktreeRetirer;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
+use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\OrbitStaleWorktree;
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
+use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Models\Delivery;
@@ -68,6 +73,32 @@ final class ShadowCommandIssueProvider implements OrbitIssueProvider, OrbitIssue
     }
 }
 
+final class ShadowCommandStaleWorktreeRetirer implements OrbitStaleWorktreeRetirer
+{
+    /** @var list<string> */
+    public array $inspections = [];
+
+    public ?OrbitRepositoryFailed $failure = null;
+
+    public function inspectStaleWorktree(OrbitProjectConfig $config, string $issueKey): ?OrbitStaleWorktree
+    {
+        $this->inspections[] = $issueKey;
+
+        if ($this->failure !== null) {
+            throw $this->failure;
+        }
+
+        return null;
+    }
+
+    public function retireStaleWorktree(
+        OrbitProjectConfig $config,
+        OrbitStaleWorktree $worktree,
+    ): RetiredOrbitStaleWorktree {
+        throw new LogicException('No stale worktree was configured.');
+    }
+}
+
 beforeEach(function () {
     Carbon::setTestNow('2026-09-11 10:00:00 UTC');
     $this->projectsPath = storage_path('framework/testing/shadow-command-projects-'.bin2hex(random_bytes(4)));
@@ -101,6 +132,7 @@ beforeEach(function () {
             'id' => shadowIssueId(),
             'identifier' => 'ORB-234',
             'title' => 'Test issue',
+            'state' => ['name' => 'Todo', 'type' => 'unstarted'],
             'labels' => [
                 'nodes' => [['name' => 'controller:commander'], ['name' => 'docs']],
                 'pageInfo' => ['hasNextPage' => false],
@@ -110,6 +142,8 @@ beforeEach(function () {
     ));
     app()->instance(OrbitIssueProvider::class, $this->issueProvider);
     app()->instance(OrbitIssueResolver::class, $this->issueProvider);
+    $this->staleRetirer = new ShadowCommandStaleWorktreeRetirer;
+    app()->instance(OrbitStaleWorktreeRetirer::class, $this->staleRetirer);
 
     Queue::fake();
     Process::fake(['*' => Process::sequence()
@@ -340,6 +374,20 @@ it('does not start a live Orbit delivery when key resolution fails', function ()
         ->and($this->issueProvider->requests)->toBe([]);
     Queue::assertNothingPushed();
     Process::assertNothingRan();
+});
+
+it('stops before worktree preparation when stale retirement fails and releases the issue reservation', function () {
+    $this->staleRetirer->failure = new OrbitRepositoryFailed('The stale checkout archive failed.');
+
+    $this->artisan('delivery:start-orbit', runOrbitCommand('orbit', 'ORB-234'))
+        ->expectsOutput('The stale checkout archive failed.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(0)
+        ->and($this->staleRetirer->inspections)->toBe(['ORB-234']);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
 });
 
 it('does not start a live Orbit delivery without explicit Commander ownership', function () {

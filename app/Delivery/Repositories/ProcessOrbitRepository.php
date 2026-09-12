@@ -12,6 +12,7 @@ use App\Delivery\Contracts\OrbitMergeLineageVerifier;
 use App\Delivery\Contracts\OrbitPrimaryCheckoutReconciler;
 use App\Delivery\Contracts\OrbitProofTopologyCloser;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitStaleWorktreeRetirer;
 use App\Delivery\Contracts\OrbitWorktreeCleaner;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\CleanedOrbitAbandonedWorktree;
@@ -20,6 +21,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitMainCorrectness;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\OrbitProofCloseout;
+use App\Delivery\Data\OrbitStaleWorktree;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedOrbitAbandonedWorktreeCleanup;
 use App\Delivery\Data\PreparedOrbitWorktreeRemoval;
@@ -27,18 +29,45 @@ use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\ReconciledOrbitPrimaryCheckout;
 use App\Delivery\Data\RemovedOrbitWorktree;
 use App\Delivery\Data\RequestedOrbitMainCacheRefresh;
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitMergeLineage;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use FilesystemIterator;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Str;
+use InvalidArgumentException;
 use JsonException;
+use RecursiveDirectoryIterator;
+use RecursiveIteratorIterator;
 use RuntimeException;
+use SplFileInfo;
+use Throwable;
 
-final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCleaner, OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository, OrbitWorktreeCleaner
+/**
+ * @phpstan-type StaleProtectedWorktree array{worktree: string, branch: ?string, prunable: bool}
+ * @phpstan-type StaleWorktreeJournal array{
+ *     schema: 1,
+ *     state: 'prepared'|'retired',
+ *     repository: string,
+ *     worktree: string,
+ *     issue_key: string,
+ *     branch: string,
+ *     head_sha: string,
+ *     tree_sha: string,
+ *     retained_ref: string,
+ *     archive: string,
+ *     archive_digest: string,
+ *     protected_worktrees: list<StaleProtectedWorktree>,
+ *     protected_branches: list<string>,
+ *     prepared_at: string,
+ *     retired_at: ?string
+ * }
+ */
+final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCleaner, OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository, OrbitStaleWorktreeRetirer, OrbitWorktreeCleaner
 {
     private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
 
@@ -384,7 +413,7 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
                 error: $evidence['error'],
                 recordedAt: $evidence['recorded_at'],
             );
-        } catch (\InvalidArgumentException $exception) {
+        } catch (InvalidArgumentException $exception) {
             throw new OrbitRepositoryFailed(
                 'The Orbit proof closeout adapter returned invalid evidence.',
                 previous: $exception,
@@ -1237,6 +1266,37 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
         return $branches;
     }
 
+    /**
+     * @param  list<array{worktree: string, head: string, branch: ?string, prunable: bool}>  $worktrees
+     * @return list<array{worktree: string, branch: ?string, prunable: bool}>
+     */
+    private function unrelatedStaleWorktreeTopology(
+        array $worktrees,
+        string $worktree,
+        string $branch,
+    ): array {
+        return array_map(
+            static fn (array $item): array => [
+                'worktree' => $item['worktree'],
+                'branch' => $item['branch'],
+                'prunable' => $item['prunable'],
+            ],
+            $this->unrelatedWorktrees($worktrees, $worktree, $branch),
+        );
+    }
+
+    /**
+     * @param  array<string, string>  $branches
+     * @return list<string>
+     */
+    private function unrelatedStaleBranchTopology(array $branches, string $branch): array
+    {
+        $refs = array_keys($this->unrelatedBranches($branches, $branch));
+        sort($refs);
+
+        return $refs;
+    }
+
     /** @return array<string, string> */
     private function parseBranchInventory(string $output): array
     {
@@ -1412,6 +1472,1077 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
         }
 
         return new OrbitMainCorrectness($mainSha, $normalizedFailures);
+    }
+
+    public function inspectStaleWorktree(
+        OrbitProjectConfig $config,
+        string $issueKey,
+    ): ?OrbitStaleWorktree {
+        $context = $this->staleWorktreeContext($config, $issueKey);
+        $journal = $this->readStaleWorktreeJournal($context, $issueKey);
+
+        if ($journal !== null) {
+            $this->verifyStaleWorktreeArchive($journal);
+
+            return $this->staleWorktreeFromJournal($journal);
+        }
+
+        $state = $this->inspectStaleWorktreeGitState(
+            $context['repository'],
+            $issueKey,
+        );
+
+        if ($state['target'] === null) {
+            return null;
+        }
+
+        $target = $state['target'];
+        $this->assertStaleWorktreePath($context['common'], $target['worktree']);
+        $treeSha = $this->staleWorktreeTree($target['worktree']);
+
+        return new OrbitStaleWorktree(
+            repository: $context['repository'],
+            worktree: $target['worktree'],
+            issueKey: $issueKey,
+            branch: Str::after($target['branch'], 'refs/heads/'),
+            headSha: $target['head'],
+            treeSha: $treeSha,
+        );
+    }
+
+    public function retireStaleWorktree(
+        OrbitProjectConfig $config,
+        OrbitStaleWorktree $worktree,
+    ): RetiredOrbitStaleWorktree {
+        $context = $this->staleWorktreeContext($config, $worktree->issueKey);
+        $journal = $this->readStaleWorktreeJournal($context, $worktree->issueKey);
+
+        if ($journal === null) {
+            $current = $this->inspectStaleWorktree($config, $worktree->issueKey);
+
+            if ($current === null || $current != $worktree) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree changed before retirement.');
+            }
+
+            $state = $this->inspectStaleWorktreeGitState(
+                $context['repository'],
+                $worktree->issueKey,
+            );
+            $capture = $this->captureStaleWorktree($worktree);
+            $archiveDigest = hash('sha256', $this->canonicalJson($capture['metadata']));
+            $archive = $context['directory'].'/retired-worktrees/'.$worktree->headSha.'/'.$archiveDigest;
+            $retainedRef = 'refs/orbit-delivery/retired-worktrees/'
+                .Str::lower($worktree->issueKey).'/'.$worktree->headSha;
+
+            $this->retainStaleWorktreeHead(
+                $context['repository'],
+                $retainedRef,
+                $worktree->headSha,
+            );
+            $this->publishStaleWorktreeArchive($archive, $capture);
+
+            $journal = [
+                'schema' => 1,
+                'state' => 'prepared',
+                'repository' => $context['repository'],
+                'worktree' => $worktree->worktree,
+                'issue_key' => $worktree->issueKey,
+                'branch' => $worktree->branch,
+                'head_sha' => $worktree->headSha,
+                'tree_sha' => $worktree->treeSha,
+                'retained_ref' => $retainedRef,
+                'archive' => $archive,
+                'archive_digest' => $archiveDigest,
+                'protected_worktrees' => $this->unrelatedStaleWorktreeTopology(
+                    $state['worktrees'],
+                    $worktree->worktree,
+                    $worktree->branch,
+                ),
+                'protected_branches' => $this->unrelatedStaleBranchTopology(
+                    $state['branches'],
+                    $worktree->branch,
+                ),
+                'prepared_at' => gmdate('Y-m-d\TH:i:s\Z'),
+                'retired_at' => null,
+            ];
+            $this->writeStaleWorktreeJournal($context['journal'], $journal);
+        } else {
+            $retained = $this->staleWorktreeFromJournal($journal);
+
+            if ($retained != $worktree) {
+                throw new OrbitRepositoryFailed('The retained stale Orbit worktree retirement is inconsistent.');
+            }
+        }
+
+        $this->verifyStaleWorktreeArchive($journal);
+        $this->verifyRetainedStaleWorktreeHead($journal);
+        $mutated = false;
+        $state = $this->inspectStaleRetirementState($journal);
+
+        if ($state['target_prunable']) {
+            $this->removeStaleWorktreeRegistration($journal);
+            $mutated = true;
+            $state = $this->inspectStaleRetirementState($journal);
+        }
+
+        if ($state['target_present']) {
+            $this->assertStaleWorktreePath($context['common'], $worktree->worktree);
+            $capture = $this->captureStaleWorktree($worktree);
+
+            if (! hash_equals(
+                $journal['archive_digest'],
+                hash('sha256', $this->canonicalJson($capture['metadata'])),
+            )) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree changed after it was archived.');
+            }
+
+            $this->removeStaleWorktree($journal);
+            $mutated = true;
+            $state = $this->inspectStaleRetirementState($journal);
+        }
+
+        if ($state['branch_present']) {
+            $this->removeStaleWorktreeBranch($journal);
+            $mutated = true;
+            $state = $this->inspectStaleRetirementState($journal);
+        }
+
+        if ($state['target_present'] || $state['target_prunable'] || $state['branch_present']
+            || file_exists($worktree->worktree) || is_link($worktree->worktree)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree remains after retirement.');
+        }
+
+        $this->verifyStaleWorktreeArchive($journal);
+        $this->verifyRetainedStaleWorktreeHead($journal);
+
+        $wasRetired = $journal['state'] === 'retired';
+        $retiredAt = $journal['retired_at'];
+
+        if (! $wasRetired) {
+            $journal['state'] = 'retired';
+            $retiredAt = gmdate('Y-m-d\TH:i:s\Z');
+            $journal['retired_at'] = $retiredAt;
+            $this->writeStaleWorktreeJournal($context['journal'], $journal);
+        }
+
+        if ($retiredAt === null) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is inconsistent.');
+        }
+
+        return new RetiredOrbitStaleWorktree(
+            repository: $journal['repository'],
+            worktree: $journal['worktree'],
+            issueKey: $journal['issue_key'],
+            branch: $journal['branch'],
+            headSha: $journal['head_sha'],
+            treeSha: $journal['tree_sha'],
+            retainedRef: $journal['retained_ref'],
+            archive: $journal['archive'],
+            archiveDigest: $journal['archive_digest'],
+            disposition: $wasRetired && ! $mutated ? 'already_retired' : 'retired',
+            retiredAt: $retiredAt,
+        );
+    }
+
+    /** @return array{repository: string, common: string, directory: string, journal: string} */
+    private function staleWorktreeContext(OrbitProjectConfig $config, string $issueKey): array
+    {
+        $repository = realpath($config->repository);
+        $root = realpath($config->worktreeRoot);
+        $commonPath = $repository === false ? '' : $repository.'/.git';
+        $common = $repository === false ? false : realpath($commonPath);
+        $directory = $common === false ? '' : $common.'/orbit-delivery/v1/'.Str::lower($issueKey);
+
+        if ($repository === false || $repository !== $config->repository
+            || $root === false || $root !== $config->worktreeRoot
+            || $common === false || $common !== $commonPath || ! is_dir($common)
+            || is_link($commonPath)
+            || preg_match('/^ORB-[0-9]+$/', $issueKey) !== 1
+            || ! is_dir($directory) || is_link($directory) || realpath($directory) !== $directory) {
+            throw new OrbitRepositoryFailed('The configured stale Orbit worktree retirement is unavailable.');
+        }
+
+        return [
+            'repository' => $repository,
+            'common' => $common,
+            'directory' => $directory,
+            'journal' => $directory.'/stale-worktree-retirement.json',
+        ];
+    }
+
+    /**
+     * @return array{
+     *     worktrees: list<array{worktree: string, head: string, branch: ?string, prunable: bool}>,
+     *     branches: array<string, string>,
+     *     target: array{worktree: string, head: string, branch: string, prunable: bool}|null
+     * }
+     */
+    private function inspectStaleWorktreeGitState(string $repository, string $issueKey): array
+    {
+        [$worktrees, $branches] = $this->staleWorktreeInventories($repository);
+        $canonical = 'refs/heads/'.Str::lower($issueKey);
+        $prefix = $canonical.'-';
+        $matchingWorktrees = array_values(array_filter(
+            $worktrees,
+            static fn (array $item): bool => is_string($item['branch'])
+                && ($item['branch'] === $canonical || str_starts_with($item['branch'], $prefix)),
+        ));
+        $matchingBranches = array_filter(
+            $branches,
+            static fn (string $sha, string $ref): bool => $ref === $canonical
+                || str_starts_with($ref, $prefix),
+            ARRAY_FILTER_USE_BOTH,
+        );
+        $primary = $worktrees[0]['worktree'] ?? null;
+
+        foreach ($worktrees as $item) {
+            if ($item['prunable']) {
+                throw new OrbitRepositoryFailed('A prunable Orbit worktree makes stale retirement unsafe.');
+            }
+        }
+
+        if ($primary !== $repository
+            || count($matchingWorktrees) > 1
+            || count($matchingBranches) > 1
+            || count($matchingWorktrees) !== count($matchingBranches)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree inventory is ambiguous.');
+        }
+
+        if ($matchingWorktrees === []) {
+            return ['worktrees' => $worktrees, 'branches' => $branches, 'target' => null];
+        }
+
+        $target = $matchingWorktrees[0];
+        $branch = $target['branch'];
+
+        if ($branch === $canonical
+            || ! array_key_exists($branch, $matchingBranches)
+            || $matchingBranches[$branch] !== $target['head']) {
+            return ['worktrees' => $worktrees, 'branches' => $branches, 'target' => null];
+        }
+
+        /** @var array{worktree: string, head: string, branch: string, prunable: bool} $target */
+        return ['worktrees' => $worktrees, 'branches' => $branches, 'target' => $target];
+    }
+
+    /**
+     * @return array{
+     *     0: list<array{worktree: string, head: string, branch: ?string, prunable: bool}>,
+     *     1: array<string, string>
+     * }
+     */
+    private function staleWorktreeInventories(string $repository): array
+    {
+        try {
+            $inventory = Process::path($repository)->timeout(10)->run([
+                'git', 'worktree', 'list', '--porcelain', '-z',
+            ]);
+            $branches = Process::path($repository)->timeout(10)->run([
+                'git', 'for-each-ref', '--format=%(objectname) %(refname)', 'refs/heads/',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The stale Orbit worktree state could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        if ($inventory->failed() || $branches->failed()) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree state could not be inspected.');
+        }
+
+        return [
+            $this->parseWorktreeInventory($inventory->output()),
+            $this->parseBranchInventory($branches->output()),
+        ];
+    }
+
+    private function assertStaleWorktreePath(string $common, string $worktree): void
+    {
+        $resolved = realpath($worktree);
+
+        if ($resolved === false || $resolved !== $worktree || ! is_dir($resolved)
+            || is_link($worktree) || ! is_file($worktree.'/.git') || is_link($worktree.'/.git')) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree path is unsafe.');
+        }
+
+        try {
+            $result = Process::path($worktree)->timeout(10)->run([
+                'git', 'rev-parse', '--path-format=absolute', '--git-common-dir',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The stale Orbit worktree common directory could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        $resolvedCommon = $result->failed() ? false : realpath(trim($result->output()));
+
+        if ($resolvedCommon === false || $resolvedCommon !== $common) {
+            throw new OrbitRepositoryFailed(
+                'The stale Orbit worktree does not belong to the configured repository.',
+            );
+        }
+    }
+
+    private function staleWorktreeTree(string $worktree): string
+    {
+        try {
+            $result = Process::path($worktree)->timeout(10)->run([
+                'git', 'rev-parse', 'HEAD^{tree}',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The stale Orbit worktree tree could not be inspected.',
+                previous: $exception,
+            );
+        }
+
+        $tree = trim($result->output());
+
+        if ($result->failed() || preg_match('/^[a-f0-9]{40}$/', $tree) !== 1) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree tree is invalid.');
+        }
+
+        return $tree;
+    }
+
+    /**
+     * @return array{
+     *     metadata: array<string, mixed>,
+     *     patch: string,
+     *     untracked: array<string, string>,
+     *     loop: array<string, string>
+     * }
+     */
+    private function captureStaleWorktree(OrbitStaleWorktree $worktree): array
+    {
+        try {
+            $head = Process::path($worktree->worktree)->timeout(10)->run(['git', 'rev-parse', 'HEAD']);
+            $tree = Process::path($worktree->worktree)->timeout(10)->run(['git', 'rev-parse', 'HEAD^{tree}']);
+            $status = Process::path($worktree->worktree)->timeout(30)->run([
+                'git', 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=no',
+            ]);
+            $patch = Process::path($worktree->worktree)->timeout(60)->run([
+                'git', 'diff', '--binary', '--no-ext-diff', 'HEAD', '--', '.',
+            ]);
+            $untracked = Process::path($worktree->worktree)->timeout(30)->run([
+                'git', 'ls-files', '--others', '--exclude-standard', '-z',
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed(
+                'The stale Orbit worktree could not be captured.',
+                previous: $exception,
+            );
+        }
+
+        if ($head->failed() || trim($head->output()) !== $worktree->headSha
+            || $tree->failed() || trim($tree->output()) !== $worktree->treeSha
+            || $status->failed() || $patch->failed() || $untracked->failed()) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree could not be captured.');
+        }
+
+        $untrackedFiles = [];
+        $untrackedManifest = [];
+        $untrackedOutput = $untracked->output();
+
+        if (str_ends_with($untrackedOutput, "\0\n")) {
+            $untrackedOutput = substr($untrackedOutput, 0, -1);
+        }
+
+        $paths = trim($untrackedOutput, "\0") === ''
+            ? []
+            : explode("\0", trim($untrackedOutput, "\0"));
+
+        foreach ($paths as $relative) {
+            $entry = $this->captureStaleFile($worktree->worktree, $relative);
+
+            if (array_key_exists($relative, $untrackedFiles)) {
+                throw new OrbitRepositoryFailed('The stale Orbit untracked-file inventory is ambiguous.');
+            }
+
+            $untrackedFiles[$relative] = $entry['contents'];
+            $untrackedManifest[] = $entry['manifest'];
+        }
+
+        [$loopPresent, $loopManifest, $loopFiles] = $this->captureStaleLoop($worktree->worktree.'/.loop');
+        $metadata = [
+            'schema' => 1,
+            'issue_key' => $worktree->issueKey,
+            'worktree' => $worktree->worktree,
+            'branch' => $worktree->branch,
+            'head_sha' => $worktree->headSha,
+            'tree_sha' => $worktree->treeSha,
+            'status_sha256' => hash('sha256', $status->output()),
+            'patch_sha256' => hash('sha256', $patch->output()),
+            'untracked_manifest' => $untrackedManifest,
+            'loop_present' => $loopPresent,
+            'loop_manifest' => $loopManifest,
+        ];
+
+        return [
+            'metadata' => $metadata,
+            'patch' => $patch->output(),
+            'untracked' => $untrackedFiles,
+            'loop' => $loopFiles,
+        ];
+    }
+
+    /** @return array{manifest: array{path: string, mode: int, size: int, sha256: string}, contents: string} */
+    private function captureStaleFile(string $root, string $relative): array
+    {
+        if (! $this->safeStaleRelativePath($relative)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree contains an unsafe file path.');
+        }
+
+        $path = $root.'/'.$relative;
+        $resolved = realpath($path);
+
+        if ($resolved === false || $resolved !== $path || is_link($path) || ! is_file($path)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree contains an unsafe file.');
+        }
+
+        try {
+            $permissions = fileperms($path);
+            $contents = file_get_contents($path);
+        } catch (Throwable $exception) {
+            throw new OrbitRepositoryFailed(
+                'The stale Orbit worktree contains an unsafe file.',
+                previous: $exception,
+            );
+        }
+
+        if ($permissions === false || $contents === false) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree contains an unsafe file.');
+        }
+
+        return [
+            'manifest' => [
+                'path' => $relative,
+                'mode' => $permissions & 07777,
+                'size' => strlen($contents),
+                'sha256' => hash('sha256', $contents),
+            ],
+            'contents' => $contents,
+        ];
+    }
+
+    /**
+     * @return array{
+     *     0: bool,
+     *     1: list<array{path: string, type: string, mode: int, size?: int, sha256?: string}>,
+     *     2: array<string, string>
+     * }
+     */
+    private function captureStaleLoop(string $loop): array
+    {
+        if (! file_exists($loop) && ! is_link($loop)) {
+            return [false, [], []];
+        }
+
+        if (is_link($loop) || ! is_dir($loop) || realpath($loop) !== $loop) {
+            throw new OrbitRepositoryFailed('The stale Orbit .loop archive is unsafe.');
+        }
+
+        $manifest = [];
+        $files = [];
+
+        try {
+            $iterator = new RecursiveIteratorIterator(
+                new RecursiveDirectoryIterator($loop, FilesystemIterator::SKIP_DOTS),
+                RecursiveIteratorIterator::SELF_FIRST,
+            );
+
+            foreach ($iterator as $item) {
+                if (! $item instanceof SplFileInfo) {
+                    throw new OrbitRepositoryFailed('The stale Orbit .loop archive is unsafe.');
+                }
+
+                $path = $item->getPathname();
+                $relative = Str::after($path, $loop.'/');
+
+                if (! $this->safeStaleRelativePath($relative) || $item->isLink()) {
+                    throw new OrbitRepositoryFailed('The stale Orbit .loop archive is unsafe.');
+                }
+
+                $permissions = $item->getPerms() & 07777;
+
+                if ($item->isDir()) {
+                    $manifest[] = ['path' => $relative, 'type' => 'directory', 'mode' => $permissions];
+
+                    continue;
+                }
+
+                if (! $item->isFile() || realpath($path) !== $path) {
+                    throw new OrbitRepositoryFailed('The stale Orbit .loop archive is unsafe.');
+                }
+
+                $contents = file_get_contents($path);
+
+                if ($contents === false) {
+                    throw new OrbitRepositoryFailed('The stale Orbit .loop archive could not be read.');
+                }
+
+                $files[$relative] = $contents;
+                $manifest[] = [
+                    'path' => $relative,
+                    'type' => 'file',
+                    'mode' => $permissions,
+                    'size' => strlen($contents),
+                    'sha256' => hash('sha256', $contents),
+                ];
+            }
+        } catch (OrbitRepositoryFailed $exception) {
+            throw $exception;
+        } catch (Throwable $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit .loop archive could not be inspected.', previous: $exception);
+        }
+
+        return [true, $manifest, $files];
+    }
+
+    private function safeStaleRelativePath(string $path): bool
+    {
+        return $path !== ''
+            && ! str_starts_with($path, '/')
+            && ! str_contains($path, "\0")
+            && ! str_contains($path, '\\')
+            && preg_match('#(?:^|/)\.\.(?:/|$)#', $path) !== 1;
+    }
+
+    /**
+     * @param array{
+     *     metadata: array<string, mixed>,
+     *     patch: string,
+     *     untracked: array<string, string>,
+     *     loop: array<string, string>
+     * } $capture
+     */
+    private function publishStaleWorktreeArchive(string $archive, array $capture): void
+    {
+        if (is_dir($archive)) {
+            $this->verifyStaleWorktreeArchiveDirectory(
+                $archive,
+                hash('sha256', $this->canonicalJson($capture['metadata'])),
+            );
+
+            return;
+        }
+
+        if (file_exists($archive) || is_link($archive)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive path is unsafe.');
+        }
+
+        $parent = dirname($archive);
+        $headDirectory = dirname($parent);
+        $retiredDirectory = dirname($headDirectory);
+        $this->ensurePrivateDirectory($retiredDirectory);
+        $this->ensurePrivateDirectory($headDirectory);
+        $this->ensurePrivateDirectory($parent);
+        $staging = $parent.'/.archive-'.bin2hex(random_bytes(8));
+
+        if (! mkdir($staging, 0700)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive could not be staged.');
+        }
+
+        try {
+            $metadata = json_encode(
+                $capture['metadata'],
+                JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+            )."\n";
+            $this->writePrivateArchiveFile($staging.'/metadata.json', $metadata);
+            $this->writePrivateArchiveFile($staging.'/changes.patch', $capture['patch']);
+
+            foreach ($capture['untracked'] as $relative => $contents) {
+                $this->writePrivateArchiveFile($staging.'/untracked/'.$relative, $contents);
+            }
+
+            foreach ($capture['loop'] as $relative => $contents) {
+                $this->writePrivateArchiveFile($staging.'/loop/'.$relative, $contents);
+            }
+
+            if (! rename($staging, $archive)) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree archive could not be published.');
+            }
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive metadata is invalid.', previous: $exception);
+        } finally {
+            if (is_dir($staging)) {
+                $this->deleteStagedArchive($staging);
+            }
+        }
+
+        $this->verifyStaleWorktreeArchiveDirectory(
+            $archive,
+            hash('sha256', $this->canonicalJson($capture['metadata'])),
+        );
+    }
+
+    private function ensurePrivateDirectory(string $directory): void
+    {
+        if (! file_exists($directory) && ! is_link($directory) && ! mkdir($directory, 0700)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive directory could not be created.');
+        }
+
+        if (is_link($directory) || ! is_dir($directory) || realpath($directory) !== $directory) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive directory is unsafe.');
+        }
+    }
+
+    private function writePrivateArchiveFile(string $path, string $contents): void
+    {
+        $parent = dirname($path);
+
+        if (! is_dir($parent) && ! mkdir($parent, 0700, true)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive file could not be staged.');
+        }
+
+        if (file_put_contents($path, $contents, LOCK_EX) !== strlen($contents) || ! chmod($path, 0600)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive file could not be staged.');
+        }
+    }
+
+    private function deleteStagedArchive(string $directory): void
+    {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($directory, FilesystemIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::CHILD_FIRST,
+        );
+
+        foreach ($iterator as $item) {
+            if (! $item instanceof SplFileInfo) {
+                throw new OrbitRepositoryFailed('The staged stale Orbit worktree archive is invalid.');
+            }
+
+            $item->isDir() ? rmdir($item->getPathname()) : unlink($item->getPathname());
+        }
+
+        rmdir($directory);
+    }
+
+    /** @param StaleWorktreeJournal $journal */
+    private function verifyStaleWorktreeArchive(array $journal): void
+    {
+        $this->verifyStaleWorktreeArchiveDirectory(
+            $journal['archive'],
+            $journal['archive_digest'],
+        );
+    }
+
+    private function verifyStaleWorktreeArchiveDirectory(string $archive, string $digest): void
+    {
+        $metadataPath = $archive.'/metadata.json';
+
+        if (is_link($archive) || realpath($archive) !== $archive
+            || ! is_file($metadataPath) || is_link($metadataPath)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive is unavailable.');
+        }
+
+        try {
+            $metadata = json_decode((string) file_get_contents($metadataPath), true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive metadata is invalid.', previous: $exception);
+        }
+
+        if (! is_array($metadata) || array_is_list($metadata)
+            || ! hash_equals($digest, hash('sha256', $this->canonicalJson($metadata)))) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive metadata changed.');
+        }
+
+        $patchDigest = $metadata['patch_sha256'] ?? null;
+        $patch = file_get_contents($archive.'/changes.patch');
+
+        if (! is_string($patchDigest) || preg_match('/^[a-f0-9]{64}$/', $patchDigest) !== 1
+            || $patch === false || ! hash_equals($patchDigest, hash('sha256', $patch))) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive patch changed.');
+        }
+
+        $this->verifyStaleArchiveFiles($archive.'/untracked', $metadata['untracked_manifest'] ?? null, false);
+        $this->verifyStaleArchiveFiles($archive.'/loop', $metadata['loop_manifest'] ?? null, true);
+    }
+
+    private function verifyStaleArchiveFiles(string $root, mixed $manifest, bool $directories): void
+    {
+        if (! is_array($manifest) || ! array_is_list($manifest)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree archive manifest is invalid.');
+        }
+
+        foreach ($manifest as $entry) {
+            if (! is_array($entry) || ! is_string($entry['path'] ?? null)
+                || ! $this->safeStaleRelativePath($entry['path'])) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree archive manifest is invalid.');
+            }
+
+            $type = $directories ? ($entry['type'] ?? null) : 'file';
+            $path = $root.'/'.$entry['path'];
+
+            if ($type === 'directory') {
+                if (! is_dir($path) || is_link($path) || realpath($path) !== $path) {
+                    throw new OrbitRepositoryFailed('The stale Orbit worktree archive directory changed.');
+                }
+
+                continue;
+            }
+
+            $contents = file_get_contents($path);
+
+            if ($type !== 'file' || $contents === false || is_link($path) || ! is_file($path)
+                || ($entry['size'] ?? null) !== strlen($contents)
+                || ! is_string($entry['sha256'] ?? null)
+                || ! hash_equals($entry['sha256'], hash('sha256', $contents))) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree archive file changed.');
+            }
+        }
+    }
+
+    private function retainStaleWorktreeHead(string $repository, string $ref, string $head): void
+    {
+        try {
+            $existing = Process::path($repository)->timeout(10)->run([
+                'git', 'show-ref', '--verify', '--hash', $ref,
+            ]);
+
+            if ($existing->successful()) {
+                if (trim($existing->output()) !== $head) {
+                    throw new OrbitRepositoryFailed('The stale Orbit retained head ref changed.');
+                }
+
+                return;
+            }
+
+            $created = Process::path($repository)->timeout(10)->run([
+                'git', 'update-ref', $ref, $head, str_repeat('0', 40),
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit head could not be retained.', previous: $exception);
+        }
+
+        if ($created->failed()) {
+            throw new OrbitRepositoryFailed('The stale Orbit head could not be retained.');
+        }
+    }
+
+    /** @param StaleWorktreeJournal $journal */
+    private function verifyRetainedStaleWorktreeHead(array $journal): void
+    {
+        try {
+            $result = Process::path($journal['repository'])->timeout(10)->run([
+                'git', 'show-ref', '--verify', '--hash', $journal['retained_ref'],
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit retained head could not be verified.', previous: $exception);
+        }
+
+        if ($result->failed() || trim($result->output()) !== $journal['head_sha']) {
+            throw new OrbitRepositoryFailed('The stale Orbit retained head changed.');
+        }
+    }
+
+    /**
+     * @param  array{repository: string, common: string, directory: string, journal: string}  $context
+     * @return StaleWorktreeJournal|null
+     */
+    private function readStaleWorktreeJournal(array $context, string $issueKey): ?array
+    {
+        $path = $context['journal'];
+
+        if (! file_exists($path) && ! is_link($path)) {
+            return null;
+        }
+
+        $permissions = fileperms($path);
+
+        if (is_link($path) || ! is_file($path) || realpath($path) !== $path
+            || $permissions === false || ($permissions & 0777) !== 0600) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is unsafe.');
+        }
+
+        try {
+            $journal = json_decode((string) file_get_contents($path), true, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.', previous: $exception);
+        }
+
+        $expectedKeys = [
+            'schema', 'state', 'repository', 'worktree', 'issue_key', 'branch', 'head_sha',
+            'tree_sha', 'retained_ref', 'archive', 'archive_digest', 'protected_worktrees',
+            'protected_branches', 'prepared_at', 'retired_at',
+        ];
+
+        if (! is_array($journal) || array_is_list($journal) || array_keys($journal) !== $expectedKeys) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.');
+        }
+
+        $schema = $journal['schema'];
+        $state = $journal['state'];
+        $repository = $journal['repository'];
+        $worktree = $journal['worktree'];
+        $journalIssueKey = $journal['issue_key'];
+        $branch = $journal['branch'];
+        $headSha = $journal['head_sha'];
+        $treeSha = $journal['tree_sha'];
+        $retainedRef = $journal['retained_ref'];
+        $archive = $journal['archive'];
+        $archiveDigest = $journal['archive_digest'];
+        $preparedAt = $journal['prepared_at'];
+        $retiredAt = $journal['retired_at'];
+
+        if ($schema !== 1
+            || ! is_string($state) || ! in_array($state, ['prepared', 'retired'], true)
+            || ! is_string($repository) || $repository !== $context['repository']
+            || ! is_string($journalIssueKey) || $journalIssueKey !== $issueKey
+            || ! is_string($worktree)
+            || ! is_string($branch)
+            || ! is_string($headSha)
+            || ! is_string($treeSha)
+            || ! is_string($retainedRef)
+            || ! is_string($archive)
+            || ! is_string($archiveDigest)
+            || ! is_string($preparedAt)
+            || ($retiredAt !== null && ! is_string($retiredAt))
+            || ($state === 'prepared' && $retiredAt !== null)
+            || ($state === 'retired' && $retiredAt === null)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.');
+        }
+
+        $protectedWorktrees = $this->parseStaleProtectedWorktrees($journal['protected_worktrees']);
+        $protectedBranches = $this->parseStaleProtectedBranches($journal['protected_branches']);
+        $journal = [
+            'schema' => 1,
+            'state' => $state,
+            'repository' => $repository,
+            'worktree' => $worktree,
+            'issue_key' => $journalIssueKey,
+            'branch' => $branch,
+            'head_sha' => $headSha,
+            'tree_sha' => $treeSha,
+            'retained_ref' => $retainedRef,
+            'archive' => $archive,
+            'archive_digest' => $archiveDigest,
+            'protected_worktrees' => $protectedWorktrees,
+            'protected_branches' => $protectedBranches,
+            'prepared_at' => $preparedAt,
+            'retired_at' => $retiredAt,
+        ];
+
+        try {
+            $stale = $this->staleWorktreeFromJournal($journal);
+        } catch (InvalidArgumentException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.', previous: $exception);
+        }
+
+        $expectedRef = 'refs/orbit-delivery/retired-worktrees/'
+            .Str::lower($issueKey).'/'.$stale->headSha;
+        $expectedArchive = $context['directory'].'/retired-worktrees/'
+            .$stale->headSha.'/'.$journal['archive_digest'];
+
+        if ($journal['retained_ref'] !== $expectedRef
+            || $journal['archive'] !== $expectedArchive
+            || preg_match('/^[a-f0-9]{64}$/', $journal['archive_digest']) !== 1
+            || preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $journal['prepared_at']) !== 1
+            || (is_string($journal['retired_at'])
+                && preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $journal['retired_at']) !== 1)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is inconsistent.');
+        }
+
+        return $journal;
+    }
+
+    /** @return list<StaleProtectedWorktree> */
+    private function parseStaleProtectedWorktrees(mixed $value): array
+    {
+        if (! is_array($value) || ! array_is_list($value)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.');
+        }
+
+        $worktrees = [];
+
+        foreach ($value as $item) {
+            if (! is_array($item) || array_keys($item) !== ['worktree', 'branch', 'prunable']) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.');
+            }
+
+            $worktree = $item['worktree'];
+            $branch = $item['branch'];
+            $prunable = $item['prunable'];
+
+            if (! is_string($worktree)
+                || ($branch !== null && ! is_string($branch))
+                || ! is_bool($prunable)) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.');
+            }
+
+            $worktrees[] = [
+                'worktree' => $worktree,
+                'branch' => $branch,
+                'prunable' => $prunable,
+            ];
+        }
+
+        return $worktrees;
+    }
+
+    /** @return list<string> */
+    private function parseStaleProtectedBranches(mixed $value): array
+    {
+        if (! is_array($value) || ! array_is_list($value)) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.');
+        }
+
+        $branches = [];
+
+        foreach ($value as $branch) {
+            if (! is_string($branch) || preg_match('#^refs/heads/[^\s]+$#', $branch) !== 1) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal is invalid.');
+            }
+
+            $branches[] = $branch;
+        }
+
+        return $branches;
+    }
+
+    /** @param StaleWorktreeJournal $journal */
+    private function staleWorktreeFromJournal(array $journal): OrbitStaleWorktree
+    {
+        return new OrbitStaleWorktree(
+            repository: $journal['repository'],
+            worktree: $journal['worktree'],
+            issueKey: $journal['issue_key'],
+            branch: $journal['branch'],
+            headSha: $journal['head_sha'],
+            treeSha: $journal['tree_sha'],
+        );
+    }
+
+    /** @param StaleWorktreeJournal $journal */
+    private function writeStaleWorktreeJournal(string $path, array $journal): void
+    {
+        try {
+            $contents = json_encode(
+                $journal,
+                JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+            )."\n";
+        } catch (JsonException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal could not be encoded.', previous: $exception);
+        }
+
+        $directory = dirname($path);
+        $temporary = tempnam($directory, '.stale-retirement-');
+
+        if ($temporary === false) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal could not be staged.');
+        }
+
+        try {
+            if (file_put_contents($temporary, $contents, LOCK_EX) !== strlen($contents)
+                || ! chmod($temporary, 0600)
+                || is_link($directory) || realpath($directory) !== $directory
+                || ! rename($temporary, $path)) {
+                throw new OrbitRepositoryFailed('The stale Orbit worktree retirement journal could not be published.');
+            }
+        } finally {
+            if (file_exists($temporary)) {
+                unlink($temporary);
+            }
+        }
+    }
+
+    /**
+     * @param  StaleWorktreeJournal  $journal
+     * @return array{target_present: bool, target_prunable: bool, branch_present: bool}
+     */
+    private function inspectStaleRetirementState(array $journal): array
+    {
+        [$worktrees, $branches] = $this->staleWorktreeInventories($journal['repository']);
+        $branchRef = 'refs/heads/'.$journal['branch'];
+        $targets = array_values(array_filter(
+            $worktrees,
+            static fn (array $item): bool => $item['worktree'] === $journal['worktree']
+                || $item['branch'] === $branchRef,
+        ));
+        $exact = array_values(array_filter(
+            $targets,
+            static fn (array $item): bool => $item['worktree'] === $journal['worktree']
+                && $item['branch'] === $branchRef
+                && $item['head'] === $journal['head_sha'],
+        ));
+        $targetPresent = count($exact) === 1 && ! $exact[0]['prunable'];
+        $targetPrunable = count($exact) === 1 && $exact[0]['prunable'];
+        $branchPresent = ($branches[$branchRef] ?? null) === $journal['head_sha'];
+        $protectedWorktrees = $this->unrelatedStaleWorktreeTopology(
+            $worktrees,
+            $journal['worktree'],
+            $journal['branch'],
+        );
+        $protectedBranches = $this->unrelatedStaleBranchTopology($branches, $journal['branch']);
+
+        if (count($targets) !== (count($exact) === 1 ? 1 : 0)
+            || array_key_exists($branchRef, $branches) !== $branchPresent
+            || $protectedWorktrees !== $journal['protected_worktrees']
+            || $protectedBranches !== $journal['protected_branches']
+            || (! $targetPresent && ! $targetPrunable
+                && (file_exists($journal['worktree']) || is_link($journal['worktree'])))) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree retirement state changed.');
+        }
+
+        return [
+            'target_present' => $targetPresent,
+            'target_prunable' => $targetPrunable,
+            'branch_present' => $branchPresent,
+        ];
+    }
+
+    /** @param StaleWorktreeJournal $journal */
+    private function removeStaleWorktreeRegistration(array $journal): void
+    {
+        try {
+            $result = Process::path($journal['repository'])->timeout(30)->run([
+                'git', 'worktree', 'remove', '--force', $journal['worktree'],
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree registration could not be removed.', previous: $exception);
+        }
+
+        if ($result->failed()) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree registration could not be removed.');
+        }
+    }
+
+    /** @param StaleWorktreeJournal $journal */
+    private function removeStaleWorktree(array $journal): void
+    {
+        try {
+            $result = Process::path($journal['repository'])->timeout(300)->run([
+                'git', 'worktree', 'remove', '--force', $journal['worktree'],
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit worktree could not be removed.', previous: $exception);
+        }
+
+        if ($result->failed()) {
+            $details = trim($result->errorOutput()) ?: trim($result->output());
+            $details = $details === '' ? 'unknown repository error' : Str::limit($details, 500);
+
+            throw new OrbitRepositoryFailed('Stale Orbit worktree removal failed: '.$details);
+        }
+    }
+
+    /** @param StaleWorktreeJournal $journal */
+    private function removeStaleWorktreeBranch(array $journal): void
+    {
+        try {
+            $result = Process::path($journal['repository'])->timeout(10)->run([
+                'git', 'update-ref', '-d', 'refs/heads/'.$journal['branch'], $journal['head_sha'],
+            ]);
+        } catch (RuntimeException $exception) {
+            throw new OrbitRepositoryFailed('The stale Orbit branch could not be removed.', previous: $exception);
+        }
+
+        if ($result->failed()) {
+            throw new OrbitRepositoryFailed('The stale Orbit branch could not be removed.');
+        }
     }
 
     public function reserveDelivery(OrbitProjectConfig $config, string $issueKey): OrbitDeliveryReservation

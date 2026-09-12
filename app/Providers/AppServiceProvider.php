@@ -23,6 +23,7 @@ use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
+use App\Delivery\Contracts\OrbitStaleWorktreeRetirer;
 use App\Delivery\Contracts\OrbitWorktreeCleaner;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
 use App\Delivery\IssueProviders\SshOrbitIssueTransitioner;
@@ -45,6 +46,7 @@ class AppServiceProvider extends ServiceProvider
     public function register(): void
     {
         $this->app->bind(OrbitRepository::class, ProcessOrbitRepository::class);
+        $this->app->bind(OrbitStaleWorktreeRetirer::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitAbandonedWorktreeCleaner::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitImplementationRepository::class, ProcessOrbitRepository::class);
         $this->app->bind(OrbitMainCacheRefreshRequester::class, ProcessOrbitRepository::class);

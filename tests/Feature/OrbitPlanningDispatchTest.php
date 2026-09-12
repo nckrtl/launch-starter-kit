@@ -17,6 +17,7 @@ use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
@@ -392,7 +393,7 @@ it('dispatches one verified planner while retaining the controller reservation t
         ->and($dispatch->herdr_agent_name)->toBe('orb-234-loop-builder')
         ->and($dispatch->state_change_seq)->toBe(42)
         ->and($dispatch->prompt_name)->toBe('orbit_planning')
-        ->and($dispatch->prompt_version)->toBe(1)
+        ->and($dispatch->prompt_version)->toBe(OrbitFeatureWorkflow::PLANNING_PROMPT_VERSION)
         ->and($dispatch->prompt_hash)->toBe(hash('sha256', $this->herdr->prompts[0]))
         ->and($this->herdr->opened)->toBe([
             'repository' => '/home/nckrtl/orbit',
@@ -422,6 +423,38 @@ it('dispatches one verified planner while retaining the controller reservation t
     expect($this->log->events)->toHaveCount(10)
         ->and(AgentDispatch::count())->toBe(1);
     Queue::assertNothingPushed();
+});
+
+it('includes retained stale-worktree recovery evidence in the initial planning prompt', function () {
+    $retired = new RetiredOrbitStaleWorktree(
+        repository: '/home/nckrtl/orbit',
+        worktree: '/home/nckrtl/orbit/.worktrees/orb-234-old-title',
+        issueKey: 'ORB-234',
+        branch: 'orb-234-old-title',
+        headSha: str_repeat('c', 40),
+        treeSha: str_repeat('d', 40),
+        retainedRef: 'refs/orbit-delivery/retired-worktrees/orb-234/'.str_repeat('c', 40),
+        archive: '/home/nckrtl/orbit/.git/orbit-delivery/v1/orb-234/retired-worktrees/'
+            .str_repeat('c', 40).'/'.str_repeat('e', 64),
+        archiveDigest: str_repeat('e', 64),
+        disposition: 'retired',
+        retiredAt: '2026-09-12T02:00:00Z',
+    );
+    $phase = PhaseRun::sole();
+    $phase->forceFill([
+        'input' => [
+            ...$phase->input,
+            'retired_stale_worktree' => $retired->toArray(),
+        ],
+    ])->save();
+
+    app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+
+    expect($this->herdr->prompts[0])->toContain(
+        $retired->retainedRef,
+        $retired->archive,
+        'historical recovery evidence only',
+    );
 });
 
 it('retains an agent session identity first reported by the successful prompt', function () {

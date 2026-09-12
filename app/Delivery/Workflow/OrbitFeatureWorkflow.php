@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace App\Delivery\Workflow;
 
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
+
 final readonly class OrbitFeatureWorkflow
 {
     public const string TYPE = 'orbit-feature';
@@ -34,7 +36,9 @@ final readonly class OrbitFeatureWorkflow
 
     public const string RESOLUTION_AGENT_ROLE = 'resolver';
 
-    public const int PLANNING_PROMPT_VERSION = 1;
+    public const int PLANNING_PROMPT_VERSION = 2;
+
+    public const int PLANNING_CORRECTION_PROMPT_VERSION = 1;
 
     public const int PLAN_REVIEW_PROMPT_VERSION = 1;
 
@@ -49,7 +53,19 @@ final readonly class OrbitFeatureWorkflow
         int $phaseRunId,
         int $dispatchId,
         string $receiptCommand,
+        ?RetiredOrbitStaleWorktree $retiredWorktree = null,
     ): string {
+        $retirementNotice = $retiredWorktree === null
+            ? ''
+            : <<<NOTICE
+
+A stale pre-Commander checkout was retired before this fresh plan. Its committed
+head remains at `{$retiredWorktree->retainedRef}`. Its tracked changes, untracked
+files, and local `.loop` evidence are archived at `{$retiredWorktree->archive}`.
+Treat this as historical recovery evidence only. Plan from the current issue
+contract and current main. Do not mutate the retained ref or archive.
+NOTICE;
+
         return <<<PROMPT
 Plan the implementation for {$issueKey}. Do not implement the feature.
 
@@ -66,6 +82,7 @@ Read that process and the assigned worktree guidance. Read the Linear snapshot i
 `.loop/issue.json`, including its description, labels, attachments, and relations.
 Discover HEAD locally. Dependencies and caches were prepared, and the recorded
 startup quality check passed.
+{$retirementNotice}
 
 Complete only planning. You may coordinate bounded native helpers within this
 process, but you must integrate their work and stop them before handoff. Do not

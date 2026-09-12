@@ -14,6 +14,7 @@ use App\Delivery\Data\HerdrAgentLaunch;
 use App\Delivery\Data\OrbitDeliveryPreparation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Data\OrbitProjectConfig;
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
@@ -28,6 +29,7 @@ use App\Models\Delivery;
 use App\Models\PhaseRun;
 use Exception;
 use Illuminate\Support\Facades\DB;
+use InvalidArgumentException;
 
 final readonly class DispatchOrbitPlanning
 {
@@ -182,6 +184,31 @@ final readonly class DispatchOrbitPlanning
                 OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
             )->value;
             $expectedName = strtolower((string) $locked->external_issue_key).'-loop-builder';
+            $retiredValue = $phaseRun->input['retired_stale_worktree'] ?? null;
+
+            try {
+                $retiredWorktree = is_array($retiredValue)
+                    ? RetiredOrbitStaleWorktree::fromArray($retiredValue)
+                    : null;
+            } catch (InvalidArgumentException $exception) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The retained stale Orbit worktree evidence is invalid.',
+                    previous: $exception,
+                );
+            }
+
+            if ($retiredValue !== null && $retiredWorktree === null) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The retained stale Orbit worktree evidence is invalid.',
+                );
+            }
+
+            if ($retiredWorktree !== null
+                && $retiredWorktree->issueKey !== $locked->external_issue_key) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The retained stale Orbit worktree evidence is inconsistent.',
+                );
+            }
 
             if ($phaseRun->agentDispatches()->count() !== 1
                 || $dispatch->idempotency_key !== $expectedKey
@@ -202,6 +229,7 @@ final readonly class DispatchOrbitPlanning
                 $phaseRun->id,
                 $dispatch->id,
                 $this->receiptCommand($phaseRun, $dispatch),
+                $retiredWorktree,
             );
             $promptHash = hash('sha256', $prompt);
 
