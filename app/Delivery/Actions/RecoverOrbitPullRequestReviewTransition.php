@@ -7,6 +7,7 @@ namespace App\Delivery\Actions;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
+use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\Data\OrbitDeliveryPreparation;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Enums\AgentDispatchStatus;
@@ -34,6 +35,7 @@ final readonly class RecoverOrbitPullRequestReviewTransition
         private OrbitIssueSnapshotFactory $snapshots,
         private OrbitPullRequestInspector $pullRequests,
         private OrbitIssueTransitioner $transitions,
+        private OrbitReviewIssueTransitioner $reviewTransitions,
     ) {}
 
     public function handle(int $deliveryId): PhaseRun
@@ -95,6 +97,21 @@ final readonly class RecoverOrbitPullRequestReviewTransition
                 'The blocked pull request review failure is not recoverable.',
             );
         } else {
+            if ($this->isPartialInReviewState($delivery, $preparation, $issue)) {
+                try {
+                    $issue = $this->reviewTransitions->transitionToInReview(
+                        $issue,
+                        $issue->contractHash,
+                    );
+                } catch (OrbitIssueTransitionFailed $exception) {
+                    throw new OrbitPullRequestReviewDispatchFailed(
+                        'The partial Linear In Review transition could not be completed.',
+                        0,
+                        $exception,
+                    );
+                }
+            }
+
             $this->assertExactActiveState($delivery, $preparation, $issue, 'In Review');
         }
         $expectedDispatchStatus = $failureCode === 'linear_pr_review_transition_ambiguous'
@@ -267,6 +284,35 @@ final readonly class RecoverOrbitPullRequestReviewTransition
                 "Linear does not confirm the exact {$expectedState} state and ownership for recovery.",
             );
         }
+    }
+
+    private function isPartialInReviewState(
+        Delivery $delivery,
+        OrbitDeliveryPreparation $preparation,
+        OrbitIssueSnapshot $issue,
+    ): bool {
+        $state = $issue->payload['state'] ?? null;
+        $delegate = $issue->payload['delegate'] ?? null;
+        $assignee = $issue->payload['assignee'] ?? null;
+        $viewerId = config('commander.hermes.tom_linear_viewer_id');
+        $nickId = config('commander.hermes.nick_linear_user_id');
+
+        return $issue->issueId === $preparation->snapshot->issueId
+            && $issue->issueKey === $preparation->snapshot->issueKey
+            && $this->snapshots->matchesExpectedContract(
+                $issue,
+                $preparation->snapshot->contractHash,
+                $delivery->pull_request_url,
+            )
+            && is_array($state)
+            && ($state['name'] ?? null) === 'In Review'
+            && ($state['type'] ?? null) === 'started'
+            && is_string($viewerId)
+            && is_string($nickId)
+            && is_array($delegate)
+            && ($delegate['id'] ?? null) === $viewerId
+            && is_array($assignee)
+            && ($assignee['id'] ?? null) === $nickId;
     }
 
     private function inspectPullRequest(Delivery $delivery, ?Receipt $source): bool

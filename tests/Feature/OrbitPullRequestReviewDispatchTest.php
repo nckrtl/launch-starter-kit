@@ -1369,6 +1369,42 @@ it('rearms the same pull request review dispatch after exact Linear read-back', 
         ->and($this->herdr->calls)->toBe([]);
 });
 
+it('completes a partial In Review transition before rearming the reviewer', function () {
+    $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
+    $this->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Ambiguous,
+        'error_code' => 'linear_pr_review_transition_ambiguous',
+        'error_message' => 'The prior transition outcome was unresolved.',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'linear_pr_review_transition_ambiguous',
+            'dispatch_id' => $this->dispatch->id,
+            'message' => 'The prior transition outcome was unresolved.',
+        ],
+    ])->save();
+    addKnownPullRequestAttachment($this);
+    $payload = $this->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+    $this->issues->snapshot = new OrbitIssueSnapshot(
+        $this->issues->snapshot->issueId,
+        $this->issues->snapshot->issueKey,
+        $payload,
+        $this->issues->snapshot->contractHash,
+    );
+
+    $phase = app(RecoverOrbitPullRequestReviewTransition::class)->handle($this->delivery->id);
+
+    expect($phase->is($this->review))->toBeTrue()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Preparing)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Pending)
+        ->and($this->dispatch->fresh()->error_code)->toBeNull()
+        ->and($this->transitions->calls)->toBe(1)
+        ->and($this->herdr->calls)->toBe([]);
+});
+
 it('keeps an ambiguous pull request review blocked until Linear is exact In Review', function () {
     $this->review->forceFill(['status' => PhaseRunStatus::Running, 'started_at' => now()])->save();
     $this->dispatch->forceFill([
