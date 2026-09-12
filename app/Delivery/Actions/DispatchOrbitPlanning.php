@@ -153,7 +153,7 @@ final readonly class DispatchOrbitPlanning
                 $config,
             );
             $current = $this->verifyCurrentPlanningState($config, $preparation);
-            $this->assertFinalIssue($current, $current, $preparation->snapshot->contractHash);
+            $this->assertRecoverableCurrentIssue($preparation, $current);
             $pane = new HerdrAgentIdentifiers(
                 workspaceId: (string) $dispatch->herdr_workspace_id,
                 tabId: (string) $dispatch->herdr_tab_id,
@@ -820,10 +820,13 @@ final readonly class DispatchOrbitPlanning
             throw new OrbitPlanningDispatchFailed('Final planning verification failed before prompting the retained agent.', 0, $exception);
         }
 
-        $dispatch->forceFill([
-            'error_code' => 'herdr_prompt_attempted',
-            'error_message' => null,
-        ])->save();
+        $this->markPromptAttempted(
+            $delivery->id,
+            $dispatch->phase_run_id,
+            $dispatch->id,
+            $config,
+            $started,
+        );
 
         try {
             $prompted = $this->herdr->promptAgent($started->agentName, $prompt);
@@ -898,6 +901,8 @@ final readonly class DispatchOrbitPlanning
                     );
                 }
 
+                $this->assertRetainedPreAgentPane($delivery, $dispatch, $config, $started);
+
                 return $started;
             } catch (RequestFailed $readFailure) {
                 if ($readFailure->errorCode !== 'agent_not_found') {
@@ -953,6 +958,7 @@ final readonly class DispatchOrbitPlanning
         Delivery $delivery,
         AgentDispatch $dispatch,
         OrbitProjectConfig $config,
+        ?HerdrAgentIdentifiers $allowedAgent = null,
     ): void {
         $snapshot = $this->herdrWorkspace->snapshot();
         $workspaces = array_values(array_filter(
@@ -969,7 +975,7 @@ final readonly class DispatchOrbitPlanning
                 || $agent->terminalId === $dispatch->herdr_terminal_id
                 || $agent->name === $dispatch->herdr_agent_name,
         ));
-        if (count($workspaces) !== 1 || count($panes) !== 1 || $agents !== []) {
+        if (count($workspaces) !== 1 || count($panes) !== 1) {
             throw new OrbitPlanningDispatchFailed(
                 'The retained Herdr planning pane is not safe to restart.',
             );
@@ -985,6 +991,36 @@ final readonly class DispatchOrbitPlanning
             || $pane->tabId !== $dispatch->herdr_tab_id
             || $pane->terminalId !== $dispatch->herdr_terminal_id
             || $pane->workingDirectory !== $delivery->worktree_path) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained Herdr planning pane is not safe to restart.',
+            );
+        }
+
+        if ($allowedAgent !== null) {
+            if (count($agents) !== 1) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The retained Herdr planning agent provenance is not safe to adopt.',
+                );
+            }
+
+            $agent = $agents[0];
+
+            if ($agent->workspaceId !== $allowedAgent->workspaceId
+                || $agent->tabId !== $allowedAgent->tabId
+                || $agent->paneId !== $allowedAgent->paneId
+                || $agent->terminalId !== $allowedAgent->terminalId
+                || $agent->name !== $allowedAgent->agentName
+                || $agent->status !== $allowedAgent->agentStatus
+                || $agent->workingDirectory !== $allowedAgent->workingDirectory) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The retained Herdr planning agent provenance is not safe to adopt.',
+                );
+            }
+
+            return;
+        }
+
+        if ($agents !== []) {
             throw new OrbitPlanningDispatchFailed(
                 'The retained Herdr planning pane is not safe to restart.',
             );
@@ -1132,6 +1168,116 @@ final readonly class DispatchOrbitPlanning
             || $finalIssue->payload['assignee'] !== ($transitioned->payload['assignee'] ?? null)) {
             throw new OrbitIssueContractChanged('The Orbit issue changed after the planner started and before prompting.');
         }
+    }
+
+    private function assertRecoverableCurrentIssue(
+        OrbitDeliveryPreparation $preparation,
+        OrbitIssueSnapshot $issue,
+    ): void {
+        $state = $issue->payload['state'] ?? null;
+        $assignee = $issue->payload['assignee'] ?? null;
+        $delegate = $issue->payload['delegate'] ?? null;
+        $team = $issue->payload['team'] ?? null;
+        $states = is_array($team) ? ($team['states'] ?? null) : null;
+        $nodes = is_array($states) ? ($states['nodes'] ?? null) : null;
+        $viewerId = config('commander.hermes.tom_linear_viewer_id');
+        $inProgressStates = is_array($nodes)
+            ? array_values(array_filter(
+                $nodes,
+                static fn (mixed $candidate): bool => is_array($candidate)
+                    && ($candidate['name'] ?? null) === 'In Progress',
+            ))
+            : [];
+
+        if ($issue->issueId !== $preparation->snapshot->issueId
+            || $issue->issueKey !== $preparation->snapshot->issueKey
+            || ! hash_equals($preparation->snapshot->contractHash, $issue->contractHash)
+            || ! is_string($viewerId)
+            || preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $viewerId) !== 1
+            || ! is_array($state)
+            || ($state['name'] ?? null) !== 'In Progress'
+            || ($state['type'] ?? null) !== 'started'
+            || count($inProgressStates) !== 1
+            || ($state['id'] ?? null) !== ($inProgressStates[0]['id'] ?? null)
+            || $assignee !== null
+            || ! is_array($delegate)
+            || ($delegate['id'] ?? null) !== $viewerId) {
+            throw new OrbitIssueContractChanged(
+                'The Orbit issue changed before ambiguous planning-start recovery.',
+            );
+        }
+    }
+
+    private function markPromptAttempted(
+        int $deliveryId,
+        int $phaseId,
+        int $dispatchId,
+        OrbitProjectConfig $config,
+        HerdrAgentIdentifiers $agent,
+    ): void {
+        DB::transaction(function () use ($deliveryId, $phaseId, $dispatchId, $config, $agent): void {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $project = $delivery->projectOrchestration()->lockForUpdate()->firstOrFail();
+            $phases = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            AgentDispatch::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $phase = $phases
+                ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+                ->sortByDesc('attempt')
+                ->first();
+            $dispatch = AgentDispatch::query()->whereKey($dispatchId)->firstOrFail();
+            $expectedKey = IdempotencyKey::forDispatch(
+                $delivery->id,
+                OrbitFeatureWorkflow::INITIAL_PHASE,
+                1,
+                OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+            )->value;
+
+            if ($delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+                || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
+                || $delivery->current_phase !== OrbitFeatureWorkflow::INITIAL_PHASE
+                || $delivery->status !== DeliveryStatus::Preparing
+                || $delivery->failure_details !== null
+                || $project->state !== ProjectOrchestrationState::Enabled
+                || $project->config !== $config->toArray()
+                || $phases->count() !== 1
+                || $phase === null
+                || $phase->id !== $phaseId
+                || $phase->attempt !== 1
+                || $phase->status !== PhaseRunStatus::Running
+                || $phase->finished_at !== null
+                || $phase->receipts()->exists()
+                || $phase->agentDispatches()->count() !== 1
+                || $dispatch->phase_run_id !== $phase->id
+                || $dispatch->agent_role !== OrbitFeatureWorkflow::PLANNING_AGENT_ROLE
+                || $dispatch->idempotency_key !== $expectedKey
+                || $dispatch->status !== AgentDispatchStatus::Starting
+                || $dispatch->error_code !== 'planning_final_verification'
+                || $dispatch->error_message !== null
+                || $dispatch->dispatched_at === null
+                || $dispatch->settled_at !== null
+                || ! $this->sameAgent($agent, $dispatch)
+                || $agent->workingDirectory !== $delivery->worktree_path
+                || ! in_array($agent->agentStatus, ['idle', 'done'], true)) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The planning dispatch changed before prompt submission.',
+                );
+            }
+
+            $dispatch->forceFill([
+                'herdr_agent_id' => $agent->agentId ?? $dispatch->herdr_agent_id,
+                'state_change_seq' => $agent->stateChangeSeq,
+                'error_code' => 'herdr_prompt_attempted',
+                'error_message' => null,
+            ])->save();
+        });
     }
 
     private function samePaneAndName(

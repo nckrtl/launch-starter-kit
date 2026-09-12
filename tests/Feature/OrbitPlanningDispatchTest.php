@@ -32,6 +32,7 @@ use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
+use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPlanningDispatchFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
@@ -48,6 +49,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Sleep;
 
 uses(RefreshDatabase::class);
 
@@ -66,6 +68,8 @@ final class PlanningDispatchRepository implements OrbitRepository
     public ?int $failVerificationAt = null;
 
     public ?Closure $afterReserve = null;
+
+    public ?Closure $afterVerification = null;
 
     public function __construct(private readonly PlanningDispatchLog $log) {}
 
@@ -108,6 +112,10 @@ final class PlanningDispatchRepository implements OrbitRepository
 
         if ($this->failVerificationAt === $this->verificationCount) {
             throw new OrbitRepositoryFailed('Planning repository changed.');
+        }
+
+        if ($this->afterVerification instanceof Closure) {
+            ($this->afterVerification)($this->verificationCount);
         }
 
         return new VerifiedOrbitPlanningRepository(
@@ -478,6 +486,14 @@ function planningDispatchSnapshot(string $state, string $contractHash): OrbitIss
             : ['id' => '55555555-6666-4777-8888-999999999999', 'name' => 'Todo', 'type' => 'unstarted'],
         'assignee' => null,
         'delegate' => ['id' => '4fa61558-9052-45f7-8a7c-49e0b891d4bf'],
+        'team' => [
+            'states' => [
+                'nodes' => [
+                    ['id' => '44444444-5555-4666-8777-888888888888', 'name' => 'In Progress'],
+                    ['id' => '55555555-6666-4777-8888-999999999999', 'name' => 'Todo'],
+                ],
+            ],
+        ],
     ];
 
     return new OrbitIssueSnapshot($payload['id'], $payload['identifier'], $payload, $contractHash);
@@ -765,6 +781,25 @@ it('adopts an exact planner that appeared after the busy response without starti
         agentStatus: 'idle',
     );
     $this->herdr->promptedAgentId = 'appeared-session';
+    $snapshot = $this->herdrWorkspace->snapshot;
+    $this->herdrWorkspace->snapshot = new HerdrSessionSnapshot(
+        version: $snapshot->version,
+        protocol: $snapshot->protocol,
+        workspaces: $snapshot->workspaces,
+        panes: $snapshot->panes,
+        agents: [
+            new HerdrSnapshotAgent(
+                'workspace-1',
+                'tab-1',
+                'worker-pane',
+                'worker-terminal',
+                'codex',
+                'orb-234-loop-builder',
+                'idle',
+                $this->worktree,
+            ),
+        ],
+    );
 
     app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
         $this->delivery->id,
@@ -772,10 +807,127 @@ it('adopts an exact planner that appeared after the busy response without starti
     );
 
     expect($this->herdr->startCalls)->toBe(1)
-        ->and($this->herdrWorkspace->snapshotCalls)->toBe(0)
+        ->and($this->herdrWorkspace->snapshotCalls)->toBe(1)
         ->and($this->herdr->prompts)->toHaveCount(1)
         ->and(AgentDispatch::sole()->herdr_agent_id)->toBe('appeared-session')
         ->and(AgentDispatch::sole()->status)->toBe(AgentDispatchStatus::Waiting);
+});
+
+it('rejects Linear ownership drift before recovering an ambiguous planning start', function () {
+    blockAmbiguousPlanningStart($this);
+    $payload = $this->inProgress->payload;
+    $payload['delegate'] = ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'];
+    $drifted = new OrbitIssueSnapshot(
+        $this->inProgress->issueId,
+        $this->inProgress->issueKey,
+        $payload,
+        $this->inProgress->contractHash,
+    );
+    $this->issues = new PlanningDispatchIssueProvider([$drifted], $this->log);
+    app()->instance(OrbitIssueProvider::class, $this->issues);
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    ))->toThrow(OrbitIssueContractChanged::class, 'changed before ambiguous planning-start recovery');
+
+    expect($this->herdr->startCalls)->toBe(1)
+        ->and($this->herdr->prompts)->toBe([])
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked);
+});
+
+it('rejects an appeared planner when its workspace provenance drifted', function () {
+    $dispatch = blockAmbiguousPlanningStart($this);
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $dispatch->herdr_workspace_id,
+        tabId: (string) $dispatch->herdr_tab_id,
+        paneId: (string) $dispatch->herdr_pane_id,
+        terminalId: (string) $dispatch->herdr_terminal_id,
+        agentId: 'appeared-session',
+        agentName: (string) $dispatch->herdr_agent_name,
+        stateChangeSeq: 51,
+        workingDirectory: $this->worktree,
+        agentStatus: 'idle',
+    );
+    $snapshot = $this->herdrWorkspace->snapshot;
+    $this->herdrWorkspace->snapshot = new HerdrSessionSnapshot(
+        version: $snapshot->version,
+        protocol: $snapshot->protocol,
+        workspaces: [
+            new HerdrSnapshotWorkspace(
+                'workspace-1',
+                '/home/nckrtl/orbit',
+                '/fast/worktrees/orbit/orb-999',
+                true,
+            ),
+        ],
+        panes: $snapshot->panes,
+        agents: [
+            new HerdrSnapshotAgent(
+                'workspace-1',
+                'tab-1',
+                'worker-pane',
+                'worker-terminal',
+                'codex',
+                'orb-234-loop-builder',
+                'idle',
+                $this->worktree,
+            ),
+        ],
+    );
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    ))->toThrow(OrbitPlanningDispatchFailed::class, 'not safe to restart');
+
+    expect($this->herdr->startCalls)->toBe(1)
+        ->and($this->herdr->prompts)->toBe([]);
+});
+
+it('switches to observation-only after a non-busy start failure', function () {
+    blockAmbiguousPlanningStart($this);
+    $this->herdr->getFailureCodes = array_fill(0, 9, 'agent_not_found');
+    $this->herdr->startFailureCodes = ['transport_failure'];
+    Sleep::fake();
+
+    try {
+        expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+            $this->delivery->id,
+            PhaseRun::sole()->id,
+        ))->toThrow(OrbitPlanningDispatchFailed::class, 'bounded start window');
+    } finally {
+        Sleep::fake(false);
+    }
+
+    expect($this->herdr->startCalls)->toBe(2)
+        ->and($this->herdr->getCalls)->toBe(10)
+        ->and($this->herdr->prompts)->toBe([])
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked);
+});
+
+it('rechecks the locked planning ledger immediately before prompting a recovered agent', function () {
+    blockAmbiguousPlanningStart($this);
+    $this->herdr->getFailureCodes = ['agent_not_found'];
+    $this->repository->afterVerification = function (int $verification): void {
+        if ($verification !== 3) {
+            return;
+        }
+
+        $this->delivery->forceFill([
+            'status' => DeliveryStatus::Blocked,
+            'failure_details' => ['code' => 'concurrent_planning_change'],
+        ])->save();
+    };
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        PhaseRun::sole()->id,
+    ))->toThrow(OrbitPlanningDispatchFailed::class, 'changed before prompt submission');
+
+    expect($this->herdr->startCalls)->toBe(2)
+        ->and($this->herdr->prompts)->toBe([])
+        ->and(AgentDispatch::sole()->error_code)->toBe('planning_final_verification');
 });
 
 it('rejects retained workspace or pane identity drift before retrying a planner start', function (string $drift) {

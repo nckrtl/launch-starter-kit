@@ -63,14 +63,17 @@ final class DispatchOrbitPlanning implements ShouldQueue, ShouldQueueAfterCommit
             $delivery = Delivery::query()->find($this->deliveryId);
             $failure = $delivery?->failure_details;
 
-            if ($delivery?->status === DeliveryStatus::Blocked
-                && $this->phaseRunId !== null
-                && is_array($failure)
-                && ($failure['code'] ?? null) === 'herdr_start_ambiguous') {
-                $dispatch->recoverAmbiguousStart($this->deliveryId, $this->phaseRunId);
-            } else {
-                $dispatch->handle($this->deliveryId);
+            if ($this->phaseRunId !== null) {
+                if ($delivery?->status === DeliveryStatus::Blocked
+                    && is_array($failure)
+                    && ($failure['code'] ?? null) === 'herdr_start_ambiguous') {
+                    $dispatch->recoverAmbiguousStart($this->deliveryId, $this->phaseRunId);
+                }
+
+                return;
             }
+
+            $dispatch->handle($this->deliveryId);
         } catch (OrbitPlanningDispatchFailed $exception) {
             $delivery = Delivery::query()->find($this->deliveryId);
 
