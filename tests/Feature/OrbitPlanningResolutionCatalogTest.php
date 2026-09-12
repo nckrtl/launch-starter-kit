@@ -16,12 +16,12 @@ it('loads the exact checked-in ORB-71 planning correction', function () {
     expect($catalog->has('ORB-71'))->toBeTrue()
         ->and($correction)->not->toBeNull()
         ->and($correction?->correctedContractHash)
-        ->toBe('aa0fb78990c4917cf86c82184bf0fae8d7bde8420fb57141cbdd24649b600752')
+        ->toBe('a1127c7817d366c786c766b2ce5798dc88b42280f70a0b981e19ef14f3625d51')
         ->and($correction?->correctedDescriptionHash)
-        ->toBe('af0467e2358d23c715f505dcafe3264089211c8275766e101dcb2602b2ec73ff')
+        ->toBe('2400b1c05e4e44b0d9d86fe47aa55cfa27c226b5fa42c34199d71b03bf388801')
         ->and($correction?->correctedDescription)
         ->toBe(rtrim(file_get_contents(
-            resource_path('delivery/orbit/planning-resolutions/orb-71.md'),
+            resource_path('delivery/orbit/planning-resolutions/orb-71.txt'),
         ), "\r\n"));
 });
 

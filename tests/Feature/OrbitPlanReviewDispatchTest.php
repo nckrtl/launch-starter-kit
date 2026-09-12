@@ -891,7 +891,7 @@ it('applies an exact planning resolution and queues cleanup for a fresh Todo adm
         ->toBe('resolution_decision_required')
         ->and($this->resolutionPublisher->calls)->toBe(1);
 
-    $descriptionPath = resource_path('delivery/orbit/planning-resolutions/orb-71.md');
+    $descriptionPath = resource_path('delivery/orbit/planning-resolutions/orb-71.txt');
     $correctedDescription = rtrim(File::get($descriptionPath), "\r\n");
     $correctedPayload = $this->issues->snapshot->payload;
     $correctedPayload['description'] = $correctedDescription;

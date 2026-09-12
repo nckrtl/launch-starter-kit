@@ -1,18 +1,18 @@
-An operator manages Schedules for a Node or an AppInstance from the CLI with `schedule:add`, `schedule:list`, `schedule:show`, `schedule:run`, `schedule:logs`, `schedule:remove`, and `schedule:activate`, each an HTTP-only call through the PHP SDK, and `orbit doctor` renders the `schedule` family. Completion remains an internal Node-authenticated API and SDK transport outside the operator CLI. The operations are in [ADR 0013](https://github.com/nckrtl/orbit/blob/main/docs/decisions/0013-native-systemd-schedule-management.md) and the completion boundary is refined by [ADR 0060](https://github.com/nckrtl/orbit/blob/main/docs/decisions/0060-record-the-latest-schedule-run-status.md).
+An operator manages Schedules for a Node or an AppInstance from the CLI with `schedule:add`, `schedule:list`, `schedule:show`, `schedule:run`, `schedule:logs`, `schedule:remove`, and `schedule:activate`, each an HTTP-only call through the PHP SDK, and `orbit doctor` renders the `schedule` family. Completion remains an internal Node-authenticated API and SDK transport outside the operator CLI. The operations are in [ADR 0013](<https://github.com/nckrtl/orbit/blob/main/docs/decisions/0013-native-systemd-schedule-management.md>) and the completion boundary is refined by [ADR 0060](<https://github.com/nckrtl/orbit/blob/main/docs/decisions/0060-record-the-latest-schedule-run-status.md>).
 
 ## Scope
 
-- In: `schedule:add`, `schedule:list`, `schedule:show`, `schedule:run`, `schedule:logs`, `schedule:remove`, and `schedule:activate` over the PHP SDK, with one Node or one AppInstance target selector
-- In: locally decidable option validation before HTTP, deterministic human and `--json` output, request IDs, safe shared errors, and bounded log rendering
-- In: interactive ambiguity resolution through one bounded choice
-- In: `schedule` as a `doctor --family` token
-- In: the CLI command inventory, guidance, README, and generated context
-- In: preserving the internal Node-authenticated completion API and SDK transport without exposing `CompleteScheduleRequest` through an operator command
-- Out: Workspace targets
-- Out: local SSH, systemd, `journalctl`, shell, curl, or Schedule execution on the operator machine
-- Out: prompts in `--json` or non-interactive mode
-- Out: target, placement, authorization, and policy decisions, which stay in the Gateway
-- Out: Gateway, PHP SDK, production deployment, and harness changes
+* In: `schedule:add`, `schedule:list`, `schedule:show`, `schedule:run`, `schedule:logs`, `schedule:remove`, and `schedule:activate` over the PHP SDK, with one Node or one AppInstance target selector
+* In: locally decidable option validation before HTTP, deterministic human and `--json` output, request IDs, safe shared errors, and bounded log rendering
+* In: interactive ambiguity resolution through one bounded choice
+* In: `schedule` as a `doctor --family` token
+* In: the CLI command inventory, guidance, README, and generated context
+* In: preserving the internal Node-authenticated completion API and SDK transport without exposing `CompleteScheduleRequest` through an operator command
+* Out: Workspace targets
+* Out: local SSH, systemd, `journalctl`, shell, curl, or Schedule execution on the operator machine
+* Out: prompts in `--json` or non-interactive mode
+* Out: target, placement, authorization, and policy decisions, which stay in the Gateway
+* Out: Gateway, PHP SDK, production deployment, and harness changes
 
 ## Acceptance
 
