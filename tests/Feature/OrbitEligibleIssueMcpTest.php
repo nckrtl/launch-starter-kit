@@ -200,6 +200,32 @@ it('does not read Linear when Commander project capacity is full', function () {
     Process::assertNothingRan();
 });
 
+it('releases capacity while retaining a delivery that awaits an explicit resolution decision', function () {
+    fakeEligibleResponse(eligibleResponse([eligibleIssue(200, -200)]));
+    $delivery = Delivery::query()->create([
+        'project_orchestration_id' => $this->project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        'external_issue_key' => 'ORB-42',
+        'workflow_type' => 'orbit-feature',
+        'workflow_version' => 1,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => 'resolution',
+        'failure_details' => ['code' => 'resolution_decision_required'],
+    ]);
+
+    CommanderServer::tool(GetNextEligibleIssue::class, ['id' => 'orbit'])
+        ->assertOk()
+        ->assertStructuredContent(fn ($json) => $json
+            ->where('capacity', ['active' => 0, 'limit' => 1, 'available' => true])
+            ->where('issue.key', 'ORB-200')
+            ->etc());
+
+    expect($delivery->fresh()->active_issue_key)->not->toBeNull()
+        ->and(Delivery::query()->active()->count())->toBe(1)
+        ->and(Delivery::query()->occupiesCapacity()->count())->toBe(0);
+});
+
 it('fails closed when the Linear queue response cannot be trusted', function (array $response) {
     fakeEligibleResponse($response);
 

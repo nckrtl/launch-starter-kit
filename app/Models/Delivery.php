@@ -74,6 +74,16 @@ final class Delivery extends Model
         $query->whereNotNull('active_issue_key');
     }
 
+    /** @param Builder<self> $query */
+    public function scopeOccupiesCapacity(Builder $query): void
+    {
+        $query->active()->where(function (Builder $query): void {
+            $query->where('status', '!=', DeliveryStatus::Blocked)
+                ->orWhereNull('failure_details->code')
+                ->orWhere('failure_details->code', '!=', 'resolution_decision_required');
+        });
+    }
+
     /** @return BelongsTo<ProjectOrchestration, $this> */
     public function projectOrchestration(): BelongsTo
     {

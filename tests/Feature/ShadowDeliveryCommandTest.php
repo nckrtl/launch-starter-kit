@@ -403,6 +403,31 @@ it('refuses a different issue when project delivery capacity is full', function 
     expectOrbitControllerReservationReleased($this->commonDirectory);
 });
 
+it('starts a different issue while a retained delivery awaits a resolution decision', function () {
+    $blocked = Delivery::query()->create([
+        'project_orchestration_id' => $this->project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        'external_issue_key' => 'ORB-199',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'failure_details' => ['code' => 'resolution_decision_required'],
+    ]);
+
+    $this->artisan('delivery:start-orbit', [
+        ...runOrbitCommand('orbit', 'ORB-234'),
+        '--idempotent' => true,
+    ])->assertSuccessful();
+
+    expect($blocked->fresh()->active_issue_key)->not->toBeNull()
+        ->and(Delivery::count())->toBe(2)
+        ->and(Delivery::query()->occupiesCapacity()->count())->toBe(1)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234']);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
+});
+
 it('reconciles an idempotent retry when the active delivery appears under the reservation', function () {
     $lockPath = $this->commonDirectory.'/orbit-delivery/v1/orb-234/controller.lock';
     File::makeDirectory(dirname($lockPath), 0755, true);

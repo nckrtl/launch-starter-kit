@@ -197,7 +197,7 @@ final class StartOrbitDeliveryCommand extends Command
     {
         return Delivery::query()
             ->whereBelongsTo($project)
-            ->active()
+            ->occupiesCapacity()
             ->count();
     }
 

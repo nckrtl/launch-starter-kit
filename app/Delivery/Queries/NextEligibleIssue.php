@@ -86,7 +86,7 @@ final readonly class NextEligibleIssue
 
         $active = Delivery::query()
             ->whereBelongsTo($project)
-            ->active()
+            ->occupiesCapacity()
             ->count();
 
         return [$config, $active];
