@@ -1955,21 +1955,28 @@ final readonly class AdvanceOrbitLanding
         OrbitIssueSnapshot $issue,
     ): void {
         $state = $issue->payload['state'] ?? null;
-        $alreadyCompleted = is_array($state)
+        $assignee = $issue->payload['assignee'] ?? null;
+        $delegate = $issue->payload['delegate'] ?? null;
+        $viewerId = config('commander.hermes.tom_linear_viewer_id');
+        $assigneeId = config('commander.hermes.nick_linear_user_id');
+        $completed = is_array($state)
             && ($state['name'] ?? null) === 'Done'
             && ($state['type'] ?? null) === 'completed'
             && array_key_exists('assignee', $issue->payload)
-            && $issue->payload['assignee'] === null
+            && ($assignee === null || (is_array($assignee)
+                && is_string($assigneeId) && ($assignee['id'] ?? null) === $assigneeId))
             && array_key_exists('delegate', $issue->payload)
-            && $issue->payload['delegate'] === null;
+            && ($delegate === null || (is_array($delegate)
+                && is_string($viewerId) && ($delegate['id'] ?? null) === $viewerId));
 
-        if (! $alreadyCompleted) {
+        if (! is_array($state) || ($state['name'] ?? null) !== 'Done') {
             $this->assertCurrentIssue($delivery, $preparation, $issue);
 
             return;
         }
 
-        if ($issue->issueId !== $preparation->snapshot->issueId
+        if (! $completed
+            || $issue->issueId !== $preparation->snapshot->issueId
             || $issue->issueKey !== $preparation->snapshot->issueKey
             || ! $this->snapshots->matchesExpectedContract(
                 $issue,
