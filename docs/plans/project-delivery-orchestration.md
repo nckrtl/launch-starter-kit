@@ -1,7 +1,7 @@
 # Project delivery orchestration
 
-Status: implementation in progress; label-scoped live routing is enabled while
-broad cutover remains disabled
+Status: implementation in progress; label-scoped live routing is enabled and
+automatic admission is available behind an explicit runtime flag
 
 Continuation thread: `codex://threads/01a08cc2-0105-74b1-aeb0-be013aa73267`
 
@@ -122,8 +122,17 @@ eligibility holds, and returns the first candidate without changing Linear or
 starting a delivery. An incomplete nested collection holds only that issue; an
 incomplete queue or malformed identity fails the read. The result reports
 whether the candidate already has `controller:commander`. Selection does not yet
-transfer ownership or call the loop entry point, so scheduled reconciliation
-still cannot admit a new issue by itself.
+mutate Linear.
+
+The separate, unique `AdmitNextOrbitDelivery` job composes that selector with an
+idempotent ownership handoff and the normal Orbit loop entry point. It is
+disabled by default through `COMMANDER_ORBIT_AUTO_ADMISSION`. When enabled, the
+job adds the configured existing `controller:commander` label ID without
+changing any other issue field, accepts an uncertain mutation only after exact
+Linear read-back, and launches `/home/nckrtl/orbit/bin/loop ISSUE` in one
+deterministically named transient user service. Retries reuse an active service
+instead of starting another process. The existing start command rechecks
+project capacity while it holds the issue controller reservation.
 
 The read-only `delivery:shadow-parity` gate now compares each legacy debounced
 Herdr notification with one raw Commander event. A live run on 2026-09-11

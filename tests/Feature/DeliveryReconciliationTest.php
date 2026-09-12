@@ -347,7 +347,9 @@ it('registers the reconciliation job on the one-minute schedule', function (): v
     expect(Artisan::call('schedule:list', ['--json' => true]))->toBe(0);
     $schedule = json_decode(Artisan::output(), true, flags: JSON_THROW_ON_ERROR);
 
-    expect($schedule)->toHaveCount(1)
+    expect($schedule)->toHaveCount(2)
         ->and($schedule[0]['expression'])->toBe('* * * * *')
-        ->and($schedule[0]['command'])->toBe('deliveries:reconcile');
+        ->and($schedule[0]['command'])->toBe('deliveries:reconcile')
+        ->and($schedule[1]['expression'])->toBe('* * * * *')
+        ->and($schedule[1]['command'])->toBe('deliveries:admit-orbit');
 });

@@ -6,6 +6,7 @@ namespace App\Delivery\Queries;
 
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitEligibleIssueProvider;
+use App\Delivery\Data\OrbitEligibleIssue;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Models\Delivery;
@@ -31,6 +32,39 @@ final readonly class NextEligibleIssue
      */
     public function get(string $projectId): array
     {
+        [$config, $active] = $this->context($projectId);
+        $available = $active < $config->concurrency;
+        $issue = $available ? $this->issues->next() : null;
+
+        return [
+            'project_id' => $projectId,
+            'capacity' => [
+                'active' => $active,
+                'limit' => $config->concurrency,
+                'available' => $available,
+            ],
+            'issue' => $issue === null ? null : [
+                'id' => $issue->snapshot->issueId,
+                'key' => $issue->snapshot->issueKey,
+                'title' => $issue->title,
+                'url' => $issue->url,
+                'labels' => $issue->labels,
+                'controller_owned' => in_array('controller:commander', $issue->labels, true),
+                'contract_sha256' => $issue->snapshot->contractHash,
+            ],
+        ];
+    }
+
+    public function candidate(string $projectId): ?OrbitEligibleIssue
+    {
+        [$config, $active] = $this->context($projectId);
+
+        return $active < $config->concurrency ? $this->issues->next() : null;
+    }
+
+    /** @return array{OrbitProjectConfig, int} */
+    private function context(string $projectId): array
+    {
         $this->projects->find($projectId);
         $project = ProjectOrchestration::query()
             ->where('manifest_project_id', $projectId)
@@ -54,25 +88,7 @@ final readonly class NextEligibleIssue
             ->whereBelongsTo($project)
             ->active()
             ->count();
-        $available = $active < $config->concurrency;
-        $issue = $available ? $this->issues->next() : null;
 
-        return [
-            'project_id' => $projectId,
-            'capacity' => [
-                'active' => $active,
-                'limit' => $config->concurrency,
-                'available' => $available,
-            ],
-            'issue' => $issue === null ? null : [
-                'id' => $issue->snapshot->issueId,
-                'key' => $issue->snapshot->issueKey,
-                'title' => $issue->title,
-                'url' => $issue->url,
-                'labels' => $issue->labels,
-                'controller_owned' => in_array('controller:commander', $issue->labels, true),
-                'contract_sha256' => $issue->snapshot->contractHash,
-            ],
-        ];
+        return [$config, $active];
     }
 }

@@ -12,6 +12,11 @@ return [
 
     'github_binary' => env('COMMANDER_GITHUB_BINARY', '/home/linuxbrew/.linuxbrew/bin/gh'),
 
+    'delivery' => [
+        'orbit_auto_admission' => (bool) env('COMMANDER_ORBIT_AUTO_ADMISSION', false),
+        'orbit_controller_label_id' => env('COMMANDER_ORBIT_CONTROLLER_LABEL_ID', '34651888-f68e-4bf2-b322-ec05c2a7fc64'),
+    ],
+
     'hermes' => [
         'ssh_target' => env('COMMANDER_HERMES_SSH_TARGET', 'nckrtl@10.44.0.9'),
         'binary' => env('COMMANDER_HERMES_BINARY', '/Users/nckrtl/.hermes/hermes-agent/venv/bin/hermes'),

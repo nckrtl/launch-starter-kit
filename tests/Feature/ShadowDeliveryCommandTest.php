@@ -378,6 +378,31 @@ it('reports an existing active delivery as success for an idempotent entry point
     Process::assertRanTimes(fn () => true, 5);
 });
 
+it('refuses a different issue when project delivery capacity is full', function () {
+    Delivery::query()->create([
+        'project_orchestration_id' => $this->project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+        'external_issue_key' => 'ORB-199',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Preparing,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+    ]);
+
+    $this->artisan('delivery:start-orbit', [
+        ...runOrbitCommand('orbit', 'ORB-234'),
+        '--idempotent' => true,
+    ])->expectsOutput('Project [orbit] has no available delivery capacity.')
+        ->assertFailed();
+
+    expect(Delivery::count())->toBe(1)
+        ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234']);
+    Queue::assertNothingPushed();
+    Process::assertNothingRan();
+    expectOrbitControllerReservationReleased($this->commonDirectory);
+});
+
 it('reconciles an idempotent retry when the active delivery appears under the reservation', function () {
     $lockPath = $this->commonDirectory.'/orbit-delivery/v1/orb-234/controller.lock';
     File::makeDirectory(dirname($lockPath), 0755, true);

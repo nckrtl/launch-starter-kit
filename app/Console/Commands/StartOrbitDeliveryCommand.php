@@ -130,6 +130,12 @@ final class StartOrbitDeliveryCommand extends Command
                 return $this->existingDelivery($active, $input['project'], $input['issue_key']);
             }
 
+            if ($this->activeDeliveryCount($project) >= $config->concurrency) {
+                $this->error("Project [{$input['project']}] has no available delivery capacity.");
+
+                return self::FAILURE;
+            }
+
             $retiredWorktree = $retireStaleWorktree->handle($config, $issue);
             $worktree = $repository->prepareWorktree($config, $input['issue_key']);
             $candidateCheck = $repository->checkCandidate($config, $worktree);
@@ -184,6 +190,15 @@ final class StartOrbitDeliveryCommand extends Command
             ->where('external_issue_id', $issueId)
             ->active()
             ->first();
+    }
+
+    /** @phpstan-impure */
+    private function activeDeliveryCount(ProjectOrchestration $project): int
+    {
+        return Delivery::query()
+            ->whereBelongsTo($project)
+            ->active()
+            ->count();
     }
 
     private function existingDelivery(Delivery $delivery, string $project, string $issueKey): int

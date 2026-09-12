@@ -1,5 +1,6 @@
 <?php
 
+use App\Jobs\AdmitNextOrbitDelivery;
 use App\Jobs\ReconcileDeliveries;
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
@@ -11,5 +12,10 @@ Artisan::command('inspire', function () {
 
 Schedule::job(new ReconcileDeliveries)
     ->name('deliveries:reconcile')
+    ->everyMinute()
+    ->withoutOverlapping(2);
+
+Schedule::job(new AdmitNextOrbitDelivery)
+    ->name('deliveries:admit-orbit')
     ->everyMinute()
     ->withoutOverlapping(2);
