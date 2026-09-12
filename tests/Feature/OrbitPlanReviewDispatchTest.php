@@ -40,6 +40,7 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
+use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPlanReviewAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
 use App\Delivery\Exceptions\OrbitResolutionDispatchFailed;
@@ -205,6 +206,10 @@ final class PlanReviewPlanningResolutionTransitioner implements OrbitPlanningRes
     /** @var list<OrbitPlanningResolutionCorrection> */
     public array $corrections = [];
 
+    public bool $failAfterBacklog = false;
+
+    public function __construct(private readonly PlanReviewIssueProvider $issues) {}
+
     public function applyPlanningResolution(
         OrbitIssueSnapshot $current,
         OrbitPlanningResolutionCorrection $correction,
@@ -213,6 +218,24 @@ final class PlanReviewPlanningResolutionTransitioner implements OrbitPlanningRes
         $payload = $current->payload;
         $payload['description'] = $correction->correctedDescription;
         $payload['updatedAt'] = '2026-09-12T18:00:00.000Z';
+
+        if ($this->failAfterBacklog) {
+            $this->failAfterBacklog = false;
+            $payload['state'] = [
+                'id' => '88888888-9999-4aaa-8bbb-cccccccccccc',
+                'name' => 'Backlog',
+                'type' => 'backlog',
+            ];
+            $this->issues->snapshot = new OrbitIssueSnapshot(
+                $current->issueId,
+                $current->issueKey,
+                $payload,
+                $correction->correctedContractHash,
+            );
+
+            throw new OrbitIssueTransitionFailed('The Backlog response was lost.', ambiguous: true);
+        }
+
         $payload['state'] = [
             'id' => '55555555-6666-4777-8888-999999999999',
             'name' => 'Todo',
@@ -507,7 +530,7 @@ beforeEach(function () {
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
     app()->instance(OrbitIssueProvider::class, $this->issues);
     app()->instance(OrbitPlanningResolutionIssueProvider::class, $this->issues);
-    $this->planningResolutionTransitions = new PlanReviewPlanningResolutionTransitioner;
+    $this->planningResolutionTransitions = new PlanReviewPlanningResolutionTransitioner($this->issues);
     app()->instance(
         OrbitPlanningResolutionTransitioner::class,
         $this->planningResolutionTransitions,
@@ -919,6 +942,14 @@ it('applies an exact planning resolution and queues cleanup for a fresh Todo adm
     );
 
     $apply = app(ApplyOrbitPlanningResolution::class);
+    $this->planningResolutionTransitions->failAfterBacklog = true;
+    expect(fn () => $apply->handle($this->delivery->id, $resolution->id))
+        ->toThrow(OrbitIssueTransitionFailed::class, 'Backlog response was lost');
+    expect($this->delivery->fresh()->failure_details['code'])
+        ->toBe('planning_resolution_reconciliation_required')
+        ->and($resolution->fresh()->current_block)->toBe('planning_resolution_correction')
+        ->and($this->issues->snapshot->payload['state']['name'])->toBe('Backlog');
+
     $apply->handle($this->delivery->id, $resolution->id);
     $apply->handle($this->delivery->id, $resolution->id);
 
@@ -944,7 +975,7 @@ it('applies an exact planning resolution and queues cleanup for a fresh Todo adm
         ->and($cleanup->input['source']['status'])->toBe(PhaseRunStatus::Completed->value)
         ->and($cleanup->input['source']['current_block'])->toBeNull()
         ->and($cleanup->input['source']['output'])->toBe($resolution->output)
-        ->and($this->planningResolutionTransitions->corrections)->toHaveCount(1);
+        ->and($this->planningResolutionTransitions->corrections)->toHaveCount(2);
 });
 
 it('resumes the exact retained idle resolver when dispatch stopped before its prompt', function () {

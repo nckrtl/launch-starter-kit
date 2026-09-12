@@ -104,6 +104,13 @@ final readonly class ApplyOrbitPlanningResolution
                 $phase,
                 $dispatches,
                 $receipts,
+            ) ?? $this->pendingCorrection(
+                $delivery,
+                $project,
+                $phase,
+                $dispatches,
+                $receipts,
+                true,
             );
 
             if ($state === null) {
@@ -111,21 +118,23 @@ final readonly class ApplyOrbitPlanningResolution
             }
 
             [$phase, $dispatch, $receipt, $correction] = $state;
-            $phase->current_block = 'planning_resolution_correction';
-            $phase->save();
-            $failure = $delivery->failure_details;
+            if ($phase->current_block === null) {
+                $phase->current_block = 'planning_resolution_correction';
+                $phase->save();
+                $failure = $delivery->failure_details;
 
-            if (! is_array($failure)) {
-                throw new OrbitPlanningResolutionCorrectionFailed(
-                    'The planning-resolution failure evidence is missing.',
-                );
+                if (! is_array($failure)) {
+                    throw new OrbitPlanningResolutionCorrectionFailed(
+                        'The planning-resolution failure evidence is missing.',
+                    );
+                }
+
+                $delivery->failure_details = [
+                    ...$failure,
+                    'code' => 'planning_resolution_reconciliation_required',
+                ];
+                $delivery->save();
             }
-
-            $delivery->failure_details = [
-                ...$failure,
-                'code' => 'planning_resolution_reconciliation_required',
-            ];
-            $delivery->save();
 
             return [
                 'stage' => 'correction',
