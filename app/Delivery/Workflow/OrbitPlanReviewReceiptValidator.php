@@ -22,6 +22,26 @@ final readonly class OrbitPlanReviewReceiptValidator
         AgentDispatch $dispatch,
         Receipt $receipt,
     ): bool {
+        return $this->matchesForCandidate(
+            $delivery,
+            $phase,
+            $dispatch,
+            $receipt,
+            $delivery->candidate_sha,
+        );
+    }
+
+    private function matchesForCandidate(
+        Delivery $delivery,
+        PhaseRun $phase,
+        AgentDispatch $dispatch,
+        Receipt $receipt,
+        mixed $candidateSha,
+    ): bool {
+        if (! is_string($candidateSha)) {
+            return false;
+        }
+
         return $receipt->phase_run_id === $phase->id
             && $receipt->kind === 'orbit_plan_review'
             && $receipt->schema_version === 1
@@ -31,12 +51,30 @@ final readonly class OrbitPlanReviewReceiptValidator
                 hash('sha256', json_encode($receipt->payload, JSON_THROW_ON_ERROR)),
             )
             && $receipt->candidate_sha === ($receipt->payload['candidate_sha'] ?? null)
-            && $this->matchesInput($delivery, $phase)
-            && $this->matchesPayload($delivery, $phase, $dispatch, $receipt->payload);
+            && $this->matchesInputForCandidate($delivery, $phase, $candidateSha)
+            && $this->matchesPayloadForCandidate(
+                $delivery,
+                $phase,
+                $dispatch,
+                $receipt->payload,
+                $candidateSha,
+            );
     }
 
     public function matchesInput(Delivery $delivery, PhaseRun $review): bool
     {
+        return $this->matchesInputForCandidate($delivery, $review, $delivery->candidate_sha);
+    }
+
+    private function matchesInputForCandidate(
+        Delivery $delivery,
+        PhaseRun $review,
+        mixed $candidateSha,
+    ): bool {
+        if (! is_string($candidateSha)) {
+            return false;
+        }
+
         $input = $review->input;
         $receiptId = is_array($input) ? ($input['planning_receipt_id'] ?? null) : null;
         $payload = is_array($input) ? ($input['planning_receipt'] ?? null) : null;
@@ -67,7 +105,7 @@ final readonly class OrbitPlanReviewReceiptValidator
             && $planningDispatch->status === AgentDispatchStatus::Settled
             && $planningReceipt->payload === $payload
             && ($payload['result'] ?? null) === 'ready'
-            && ($payload['candidate_sha'] ?? null) === $delivery->candidate_sha
+            && ($payload['candidate_sha'] ?? null) === $candidateSha
             && $this->matchesPlanningProvenance($delivery, $planningPhase)
             && $this->planningReceipts->matches(
                 $delivery,
@@ -96,8 +134,16 @@ final readonly class OrbitPlanReviewReceiptValidator
         $receipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($receiptId);
         $review = $receipt?->phaseRun;
         $dispatch = $review?->agentDispatches->first();
+        $reviewInput = $review?->input;
+        $planningPayload = is_array($reviewInput)
+            ? ($reviewInput['planning_receipt'] ?? null)
+            : null;
+        $candidateSha = is_array($planningPayload)
+            ? ($planningPayload['candidate_sha'] ?? null)
+            : null;
 
         return $receipt !== null && $review !== null && $dispatch !== null
+            && is_string($candidateSha)
             && $review->delivery_id === $delivery->id
             && $review->phase_name === OrbitFeatureWorkflow::PLAN_REVIEW_PHASE
             && $review->attempt === $planning->attempt - 1
@@ -108,7 +154,13 @@ final readonly class OrbitPlanReviewReceiptValidator
             && $dispatch->status === AgentDispatchStatus::Settled
             && $receipt->payload === $payload
             && ($payload['result'] ?? null) === 'fix'
-            && $this->matches($delivery, $review, $dispatch, $receipt);
+            && $this->matchesForCandidate(
+                $delivery,
+                $review,
+                $dispatch,
+                $receipt,
+                $candidateSha,
+            );
     }
 
     /** @param array<string, mixed> $payload */
@@ -118,6 +170,27 @@ final readonly class OrbitPlanReviewReceiptValidator
         AgentDispatch $dispatch,
         array $payload,
     ): bool {
+        return $this->matchesPayloadForCandidate(
+            $delivery,
+            $phase,
+            $dispatch,
+            $payload,
+            $delivery->candidate_sha,
+        );
+    }
+
+    /** @param array<string, mixed> $payload */
+    private function matchesPayloadForCandidate(
+        Delivery $delivery,
+        PhaseRun $phase,
+        AgentDispatch $dispatch,
+        array $payload,
+        mixed $candidateSha,
+    ): bool {
+        if (! is_string($candidateSha)) {
+            return false;
+        }
+
         $allowed = [
             'kind', 'schema_version', 'delivery_id', 'dispatch_id', 'issue_key', 'phase', 'attempt',
             'result', 'worktree', 'candidate_sha', 'handoff_path', 'handoff', 'artifact_sha', 'plan_sha256',
@@ -134,7 +207,7 @@ final readonly class OrbitPlanReviewReceiptValidator
             && ($payload['attempt'] ?? null) === $phase->attempt
             && in_array($payload['result'] ?? null, ['pass', 'fix', 'blocked'], true)
             && ($payload['worktree'] ?? null) === $delivery->worktree_path
-            && ($payload['candidate_sha'] ?? null) === $delivery->candidate_sha
+            && ($payload['candidate_sha'] ?? null) === $candidateSha
             && is_string($payload['handoff_path'] ?? null)
             && str_starts_with($payload['handoff_path'], '.loop/')
             && is_string($payload['handoff'] ?? null)

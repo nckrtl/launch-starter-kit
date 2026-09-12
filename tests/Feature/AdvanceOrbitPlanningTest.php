@@ -24,6 +24,7 @@ use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanningAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPlanReviewReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
@@ -433,6 +434,13 @@ it('records a blocked planning handoff without creating a reviewer', function ()
 
 it('routes a ready planning correction to plan review attempt two', function () {
     [$fixReceipt, $correction] = preparePlanningCorrectionAdvancement($this);
+    $this->candidateSha = str_repeat('1', 40);
+    $this->repository->outcome = new VerifiedOrbitPlanningOutcome(
+        $this->candidateSha,
+        $this->treeSha,
+        $this->artifactSha,
+        $this->planHash,
+    );
     $receipt = capturePlanningAdvancementReceipt($this);
     $action = app(AdvanceOrbitPlanning::class);
 
@@ -447,6 +455,7 @@ it('routes a ready planning correction to plan review attempt two', function () 
 
     expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE)
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->candidate_sha)->toBe($this->candidateSha)
         ->and($correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($correction->fresh()->output)->toBe(['receipt_id' => $receipt->id, 'result' => 'ready'])
         ->and($correction->input)->toBe([
@@ -460,6 +469,10 @@ it('routes a ready planning correction to plan review attempt two', function () 
         ->and($reviewer->agent_role)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE)
         ->and($reviewer->herdr_agent_name)->toBe('orb-234-loop-plan-review-2')
         ->and($reviewer->status)->toBe(AgentDispatchStatus::Pending)
+        ->and(app(OrbitPlanReviewReceiptValidator::class)->matchesInput(
+            $this->delivery->fresh(),
+            $review,
+        ))->toBeTrue()
         ->and(PhaseRun::count())->toBe(4)
         ->and(AgentDispatch::count())->toBe(4)
         ->and($this->repository->verifications)->toBe(1);
