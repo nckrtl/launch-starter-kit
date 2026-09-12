@@ -115,6 +115,16 @@ ownership marker without starting either controller; detailed delivery state
 remains available through Commander. This is a label-scoped entry-point cutover,
 not broad automatic admission.
 
+Commander also exposes the read-only `get_next_eligible_issue` MCP tool. It
+checks configured project capacity, reads the complete Orbit Todo page through
+the existing Hermes Linear RPC, applies the legacy ordering and deterministic
+eligibility holds, and returns the first candidate without changing Linear or
+starting a delivery. An incomplete nested collection holds only that issue; an
+incomplete queue or malformed identity fails the read. The result reports
+whether the candidate already has `controller:commander`. Selection does not yet
+transfer ownership or call the loop entry point, so scheduled reconciliation
+still cannot admit a new issue by itself.
+
 The read-only `delivery:shadow-parity` gate now compares each legacy debounced
 Herdr notification with one raw Commander event. A live run on 2026-09-11
 passed: every compatibility notification in the observed capture window

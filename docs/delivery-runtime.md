@@ -39,7 +39,14 @@ The scheduler timer runs Laravel's scheduler once per minute. It queues one
 short, unique reconciliation job. That job finds recoverable deliveries for
 enabled projects and queues the existing `AdvanceDelivery` path. It skips
 paused projects and terminal, paused, or blocked deliveries. It does not contain
-a second workflow state machine.
+a second workflow state machine. It does not select or admit new Linear issues;
+when there are no active deliveries, reconciliation has no work to queue.
+
+Tom can inspect the next candidate through Commander's read-only
+`get_next_eligible_issue` MCP tool. The tool checks project capacity and applies
+Orbit's queue order and eligibility rules, but it does not add
+`controller:commander`, change issue state, or invoke `/home/nckrtl/orbit/bin/loop`.
+Those ownership and admission steps remain an explicit follow-up boundary.
 
 For a prepared live Orbit delivery, `AdvanceDelivery` queues the bounded initial
 planning-dispatch job. Duplicate jobs serialize on a delivery-specific cache

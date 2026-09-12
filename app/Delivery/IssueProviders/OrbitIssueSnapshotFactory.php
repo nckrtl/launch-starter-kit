@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Delivery\IssueProviders;
 
+use App\Delivery\Data\OrbitEligibleIssue;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use Illuminate\Support\Str;
@@ -138,6 +139,93 @@ final readonly class OrbitIssueSnapshotFactory
         return hash_equals($expectedContractHash, $this->contractHash($payload));
     }
 
+    public function nextEligible(
+        mixed $response,
+        string $expectedViewerId,
+        string $expectedTeamId,
+    ): ?OrbitEligibleIssue {
+        $root = $this->map($response);
+        $data = $this->map($root['data'] ?? null);
+        $viewer = $this->map($data['viewer'] ?? null);
+        $team = $this->map($data['team'] ?? null);
+        $issues = $this->map($team['issues'] ?? null);
+        $pageInfo = $this->map($issues['pageInfo'] ?? null);
+        $viewerId = $this->requiredUuid($viewer['id'] ?? null);
+        $teamId = $this->requiredUuid($team['id'] ?? null);
+
+        if (($root['errors'] ?? []) !== []
+            || ! $this->isUuid($expectedViewerId)
+            || ! $this->isUuid($expectedTeamId)
+            || $viewerId !== $expectedViewerId
+            || $teamId !== $expectedTeamId
+            || $this->requiredBool($pageInfo['hasNextPage'] ?? null)) {
+            throw new OrbitIssueProviderFailed('The Linear eligible issue response is incomplete or does not match Orbit.');
+        }
+
+        /** @var list<array{sort_order: float|int|null, issue_key: string, issue: OrbitEligibleIssue}> $candidates */
+        $candidates = [];
+        $identities = [];
+
+        foreach ($this->limitedList($issues['nodes'] ?? null) as $value) {
+            $rawIssue = $this->map($value);
+            $rawTeam = $this->map($rawIssue['team'] ?? null);
+            $rawTeam['states'] = $this->map($team['states'] ?? ($rawTeam['states'] ?? null));
+            $rawIssue['team'] = $rawTeam;
+            $sortOrder = $this->nullableNumber($rawIssue['sortOrder'] ?? null);
+            $issue = $this->normalizeIssue($rawIssue);
+            $identity = $issue['id'].'|'.$issue['identifier'];
+
+            if (isset($identities[$issue['id']])
+                || isset($identities[$issue['identifier']])
+                || $issue['team']['id'] !== $expectedTeamId
+                || $issue['state']['name'] !== 'Todo'
+                || $issue['state']['type'] !== 'unstarted') {
+                throw new OrbitIssueProviderFailed('The Linear eligible issue response is incomplete or does not match Orbit.');
+            }
+
+            $identities[$issue['id']] = $identity;
+            $identities[$issue['identifier']] = $identity;
+
+            $labelNames = array_column($issue['labels']['nodes'], 'name');
+
+            if (($issue['delegate']['id'] ?? null) !== $expectedViewerId
+                || $issue['assignee'] !== null
+                || in_array('maintenance:monorepo', $labelNames, true)
+                || $this->hasContractHold($issue)) {
+                continue;
+            }
+
+            $snapshot = new OrbitIssueSnapshot(
+                issueId: $issue['id'],
+                issueKey: $issue['identifier'],
+                payload: $issue,
+                contractHash: $this->contractHash($issue),
+            );
+            $candidates[] = [
+                'sort_order' => $sortOrder,
+                'issue_key' => $issue['identifier'],
+                'issue' => new OrbitEligibleIssue(
+                    snapshot: $snapshot,
+                    title: $issue['title'],
+                    url: $issue['url'],
+                    labels: $labelNames,
+                ),
+            ];
+        }
+
+        usort($candidates, static fn (array $left, array $right): int => [
+            $left['sort_order'] === null,
+            $left['sort_order'] ?? 0,
+            $left['issue_key'],
+        ] <=> [
+            $right['sort_order'] === null,
+            $right['sort_order'] ?? 0,
+            $right['issue_key'],
+        ]);
+
+        return $candidates[0]['issue'] ?? null;
+    }
+
     private function makeSnapshot(
         mixed $response,
         ?string $expectedIssueId,
@@ -186,13 +274,7 @@ final readonly class OrbitIssueSnapshotFactory
         if (! $validAssignee
             || ! $validDelegate
             || ! $validState
-            || ($issue['description'] !== null && str_contains($issue['description'], '## Readiness'))
-            || $issue['children']['nodes'] !== []
-            || $issue['labels']['pageInfo']['hasNextPage']
-            || $issue['attachments']['pageInfo']['hasNextPage']
-            || $issue['children']['pageInfo']['hasNextPage']
-            || $issue['inverseRelations']['pageInfo']['hasNextPage']
-            || $this->hasUnfinishedBlocker($issue['inverseRelations']['nodes'])) {
+            || $this->hasContractHold($issue)) {
             throw new OrbitIssueProviderFailed(
                 match (true) {
                     $closeout => 'The Orbit closeout issue must be either solely delegated to Tom in In Review or in Done with no unexpected owner or contract hold.',
@@ -433,6 +515,24 @@ final readonly class OrbitIssueSnapshotFactory
         return false;
     }
 
+    /** @param OrbitIssuePayload $issue */
+    private function hasContractHold(array $issue): bool
+    {
+        return ($issue['description'] !== null && str_contains($issue['description'], '## Readiness'))
+            || $issue['children']['nodes'] !== []
+            || $this->hasIncompleteCollections($issue)
+            || $this->hasUnfinishedBlocker($issue['inverseRelations']['nodes']);
+    }
+
+    /** @param OrbitIssuePayload $issue */
+    private function hasIncompleteCollections(array $issue): bool
+    {
+        return $issue['labels']['pageInfo']['hasNextPage']
+            || $issue['attachments']['pageInfo']['hasNextPage']
+            || $issue['children']['pageInfo']['hasNextPage']
+            || $issue['inverseRelations']['pageInfo']['hasNextPage'];
+    }
+
     /** @return array<mixed, mixed> */
     private function map(mixed $value): array
     {
@@ -498,6 +598,19 @@ final readonly class OrbitIssueSnapshotFactory
     private function requiredBool(mixed $value): bool
     {
         if (! is_bool($value)) {
+            throw new OrbitIssueProviderFailed('The Linear issue response is malformed.');
+        }
+
+        return $value;
+    }
+
+    private function nullableNumber(mixed $value): float|int|null
+    {
+        if ($value !== null && ! is_float($value) && ! is_int($value)) {
+            throw new OrbitIssueProviderFailed('The Linear issue response is malformed.');
+        }
+
+        if (is_float($value) && ! is_finite($value)) {
             throw new OrbitIssueProviderFailed('The Linear issue response is malformed.');
         }
 

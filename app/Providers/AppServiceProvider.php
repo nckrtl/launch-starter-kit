@@ -7,6 +7,7 @@ use App\Delivery\Contracts\HerdrWorkspaceRuntime;
 use App\Delivery\Contracts\OrbitAbandonedWorktreeCleaner;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
+use App\Delivery\Contracts\OrbitEligibleIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitIssueProvider;
@@ -54,6 +55,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitIssueResolver::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitActiveIssueProvider::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitCloseoutIssueProvider::class, SshOrbitIssueProvider::class);
+        $this->app->bind(OrbitEligibleIssueProvider::class, SshOrbitIssueProvider::class);
         $this->app->bind(OrbitIssueCompletionTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitIssueTransitioner::class, SshOrbitIssueTransitioner::class);
         $this->app->bind(OrbitMainCorrectnessInspector::class, ProcessOrbitRepository::class);

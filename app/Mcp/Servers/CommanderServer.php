@@ -7,6 +7,7 @@ namespace App\Mcp\Servers;
 use App\Mcp\Tools\CreateProject;
 use App\Mcp\Tools\GetDelivery;
 use App\Mcp\Tools\GetDeliveryTimeline;
+use App\Mcp\Tools\GetNextEligibleIssue;
 use App\Mcp\Tools\GetProject;
 use App\Mcp\Tools\GetProjectConfig;
 use App\Mcp\Tools\GetProjectStatus;
@@ -29,6 +30,7 @@ final class CommanderServer extends Server
         GetProjectStatus::class,
         GetDelivery::class,
         GetDeliveryTimeline::class,
+        GetNextEligibleIssue::class,
         CreateProject::class,
         UpdateProject::class,
     ];

@@ -6,15 +6,17 @@ namespace App\Delivery\IssueProviders;
 
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
+use App\Delivery\Contracts\OrbitEligibleIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueResolver;
+use App\Delivery\Data\OrbitEligibleIssue;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitIssueProvider, OrbitIssueResolver
+final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitEligibleIssueProvider, OrbitIssueProvider, OrbitIssueResolver
 {
     private const string QUERY = <<<'GRAPHQL'
 query LoopIssue($id: String!) {
@@ -28,6 +30,30 @@ query LoopIssue($id: String!) {
     children(first: 100) { nodes { id } pageInfo { hasNextPage } }
     inverseRelations(first: 100) {
       nodes { type issue { identifier state { type } } } pageInfo { hasNextPage }
+    }
+  }
+}
+GRAPHQL;
+
+    private const string QUEUE_QUERY = <<<'GRAPHQL'
+query OrbitEligibleIssues($teamId: String!) {
+  viewer { id }
+  team(id: $teamId) {
+    id
+    states { nodes { id name } }
+    issues(first: 100, filter: {state: {name: {eq: "Todo"}}}) {
+      pageInfo { hasNextPage }
+      nodes {
+        id identifier title url description updatedAt sortOrder
+        state { id name type } assignee { id } delegate { id }
+        team { id }
+        labels(first: 100) { nodes { name } pageInfo { hasNextPage } }
+        attachments(first: 100) { nodes { title url } pageInfo { hasNextPage } }
+        children(first: 10) { nodes { id } pageInfo { hasNextPage } }
+        inverseRelations(first: 10) {
+          nodes { type issue { identifier state { type } } } pageInfo { hasNextPage }
+        }
+      }
     }
   }
 }
@@ -73,6 +99,25 @@ GRAPHQL;
         return $this->snapshots->makeForCloseout($response, $issueId, $issueKey, $viewerId, $assigneeId);
     }
 
+    public function next(): ?OrbitEligibleIssue
+    {
+        $target = config('commander.hermes.ssh_target');
+        $profile = config('commander.hermes.profiles.tom');
+        $viewerId = config('commander.hermes.tom_linear_viewer_id');
+        $teamId = config('commander.hermes.orbit_linear_team_id');
+
+        if (! is_string($target) || preg_match('/^[A-Za-z0-9._-]+@[A-Za-z0-9.:-]+$/', $target) !== 1
+            || ! is_string($profile) || preg_match('/^\/[A-Za-z0-9._\/-]+$/', $profile) !== 1
+            || ! is_string($viewerId) || ! $this->isUuid($viewerId)
+            || ! is_string($teamId) || ! $this->isUuid($teamId)) {
+            throw new OrbitIssueProviderFailed('The Hermes Orbit eligible issue provider is not configured.');
+        }
+
+        $response = $this->runRequest($target, $profile, self::QUEUE_QUERY, ['teamId' => $teamId]);
+
+        return $this->snapshots->nextEligible($response, $viewerId, $teamId);
+    }
+
     /** @return array{array<mixed, mixed>, string} */
     private function request(string $identifier, string $issueKey): array
     {
@@ -88,11 +133,22 @@ GRAPHQL;
             throw new OrbitIssueProviderFailed('The Hermes Orbit issue provider is not configured.');
         }
 
+        $response = $this->runRequest($target, $profile, self::QUERY, ['id' => $identifier]);
+
+        return [$response, $viewerId];
+    }
+
+    /**
+     * @param  array<string, string>  $variables
+     * @return array<mixed, mixed>
+     */
+    private function runRequest(string $target, string $profile, string $document, array $variables): array
+    {
         try {
             $input = json_encode([
                 'service' => 'linear',
-                'document' => self::QUERY,
-                'variables' => ['id' => $identifier],
+                'document' => $document,
+                'variables' => $variables,
             ], JSON_THROW_ON_ERROR);
             $result = Process::input($input)
                 ->timeout(30)
@@ -118,7 +174,7 @@ GRAPHQL;
             throw new OrbitIssueProviderFailed('The Hermes Orbit issue provider returned invalid JSON.');
         }
 
-        return [$response, $viewerId];
+        return $response;
     }
 
     private function isUuid(string $value): bool
