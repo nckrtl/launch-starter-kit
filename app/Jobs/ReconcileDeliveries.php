@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
+use App\Delivery\Actions\DispatchOrbitPullRequestReview as DispatchOrbitPullRequestReviewAction;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Enums\AgentDispatchStatus;
@@ -60,7 +61,10 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         RecoverExhaustedOrbitPlanningCorrection $planningCorrections,
         RecoverExhaustedOrbitPlanResolution $planResolutions,
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
+        ?DispatchOrbitPullRequestReviewAction $reviewDispatches = null,
     ): void {
+        $reviewDispatches ??= app(DispatchOrbitPullRequestReviewAction::class);
+
         Delivery::query()
             ->select([
                 'deliveries.id',
@@ -100,6 +104,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                                 'failure_details->code',
                                 'pr_review_publication_reconciliation_required',
                             );
+                    })
+                    ->orWhere(function (Builder $query): void {
+                        $query->where('status', DeliveryStatus::Blocked)
+                            ->where('current_phase', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+                            ->where('failure_details->code', 'herdr_start_ambiguous');
                     });
             })
             ->orderBy('deliveries.id')
@@ -107,6 +116,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 $planningCorrections,
                 $planResolutions,
                 $reviewPublications,
+                $reviewDispatches,
             ): void {
                 foreach ($deliveries as $delivery) {
                     $this->dispatchRecovery(
@@ -114,6 +124,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $planningCorrections,
                         $planResolutions,
                         $reviewPublications,
+                        $reviewDispatches,
                     );
                 }
             }, 'deliveries.id', 'id');
@@ -124,6 +135,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         RecoverExhaustedOrbitPlanningCorrection $planningCorrections,
         RecoverExhaustedOrbitPlanResolution $planResolutions,
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
+        DispatchOrbitPullRequestReviewAction $reviewDispatches,
     ): void {
         if ($delivery->status === DeliveryStatus::Failed) {
             if ($planningCorrections->handle($delivery->id)
@@ -146,6 +158,15 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
 
                 if (is_int($phaseRunId)) {
                     AdvanceOrbitPullRequestReview::dispatch($delivery->id, $phaseRunId);
+                }
+            }
+
+            if ($delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+                && $failureCode === 'herdr_start_ambiguous') {
+                $phaseRunId = $reviewDispatches->bindAmbiguousStartRecovery($delivery->id);
+
+                if (is_int($phaseRunId)) {
+                    DispatchOrbitPullRequestReview::dispatch($delivery->id, $phaseRunId);
                 }
             }
 

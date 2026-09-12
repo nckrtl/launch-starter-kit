@@ -1,8 +1,11 @@
 <?php
 
 use App\Delivery\Actions\AdvanceDeliveryAction;
+use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPullRequestReview;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Actions\RecoverOrbitPullRequestReviewTransition;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
@@ -36,8 +39,10 @@ use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitImplementationReceiptValidator;
+use App\Herdr\RequestFailed;
 use App\Jobs\DispatchOrbitImplementation as DispatchImplementationJob;
 use App\Jobs\DispatchOrbitPullRequestReview as DispatchPullRequestReviewJob;
+use App\Jobs\ReconcileDeliveries;
 use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
@@ -47,6 +52,7 @@ use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Queue;
+use Illuminate\Support\Sleep;
 
 uses(RefreshDatabase::class);
 
@@ -311,6 +317,12 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
 
     public ?string $failure = null;
 
+    /** @var list<string> */
+    public array $startFailureCodes = [];
+
+    /** @var list<string> */
+    public array $getFailureCodes = [];
+
     public ?Closure $beforePromptReturn = null;
 
     public bool $reuseBuilder = false;
@@ -361,6 +373,12 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
         $this->calls[] = 'start';
         $this->launch = $launch;
 
+        $failureCode = array_shift($this->startFailureCodes);
+
+        if (is_string($failureCode)) {
+            throw new RequestFailed("Start failed ({$failureCode}).", $failureCode);
+        }
+
         if ($this->failure === 'start') {
             throw new RuntimeException('Start outcome is unknown.');
         }
@@ -389,6 +407,12 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
     {
         $this->calls[] = 'get';
 
+        $failureCode = array_shift($this->getFailureCodes);
+
+        if (is_string($failureCode)) {
+            throw new RequestFailed("Get failed ({$failureCode}).", $failureCode);
+        }
+
         if ($this->failure === 'start') {
             throw new RuntimeException('Agent recovery failed.');
         }
@@ -413,6 +437,7 @@ final class PullRequestReviewDispatchHerdr implements HerdrRuntime
 }
 
 beforeEach(function () {
+    Sleep::fake();
     $this->base = storage_path('framework/testing/orbit-pr-review-dispatch-'.bin2hex(random_bytes(4)));
     $projects = $this->base.'/projects';
     File::makeDirectory($projects, 0755, true);
@@ -610,7 +635,10 @@ beforeEach(function () {
     app()->instance(HerdrRuntime::class, $this->herdr);
 });
 
-afterEach(fn () => File::deleteDirectory($this->base));
+afterEach(function (): void {
+    Sleep::fake(false);
+    File::deleteDirectory($this->base);
+});
 
 function prReviewDispatch(PhaseRun $phase, string $role, string $name): AgentDispatch
 {
@@ -735,6 +763,63 @@ function interruptPullRequestReviewBeforePrompt(object $test): void
             'code' => 'pr_review_dispatch_interrupted',
             'dispatch_id' => $test->dispatch->id,
             'stage' => 'pr_review_final_verification',
+        ],
+    ])->save();
+}
+
+function ambiguousPullRequestReviewerStart(object $test): void
+{
+    addKnownPullRequestAttachment($test);
+    $payload = $test->issues->snapshot->payload;
+    $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
+    $payload['assignee'] = null;
+    $test->issues->snapshot = new OrbitIssueSnapshot(
+        $test->issues->snapshot->issueId,
+        $test->issues->snapshot->issueKey,
+        $payload,
+        $test->issues->snapshot->contractHash,
+    );
+    $test->review->forceFill([
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now(),
+    ])->save();
+    $prompt = app(OrbitFeatureWorkflow::class)->pullRequestReviewPrompt(
+        'ORB-234',
+        $test->worktree,
+        $test->delivery->id,
+        $test->review->id,
+        $test->dispatch->id,
+        sprintf(
+            "'%s' '%s' delivery:submit-orbit-pr-review-receipt %d %d",
+            PHP_BINARY,
+            base_path('artisan'),
+            $test->review->id,
+            $test->dispatch->id,
+        ),
+        $test->implementationPayload,
+        $test->review->input['pull_request'],
+    );
+    $message = 'agent.start failed: agent target pane reviewer-pane is not an available shell (agent_pane_busy)';
+    $test->dispatch->forceFill([
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'workspace',
+        'herdr_tab_id' => 'tab',
+        'herdr_pane_id' => 'reviewer-pane',
+        'herdr_terminal_id' => 'reviewer-terminal',
+        'herdr_agent_id' => null,
+        'state_change_seq' => null,
+        'prompt_hash' => hash('sha256', $prompt),
+        'status' => AgentDispatchStatus::Ambiguous,
+        'error_code' => 'herdr_start_ambiguous',
+        'error_message' => $message,
+        'dispatched_at' => null,
+    ])->save();
+    $test->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'herdr_start_ambiguous',
+            'dispatch_id' => $test->dispatch->id,
+            'message' => $message,
         ],
     ])->save();
 }
@@ -1256,6 +1341,106 @@ it('blocks ambiguous Linear and Herdr mutation failures', function (string $fail
         ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous)
         ->and($this->repository->reservationIsHeld())->toBeFalse();
 })->with(['linear', 'open', 'split', 'start', 'prompt']);
+
+it('retries the same reviewer start after delayed pane readiness', function () {
+    $this->herdr->startFailureCodes = ['agent_pane_busy', 'agent_pane_busy'];
+    $this->herdr->getFailureCodes = ['agent_not_found', 'agent_not_found'];
+
+    $result = app(DispatchOrbitPullRequestReview::class)->handle($this->delivery->id, $this->review->id);
+
+    expect($result->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($this->herdr->calls)->toBe([
+            'open', 'split', 'start', 'get', 'start', 'get', 'start', 'prompt',
+        ]);
+    Sleep::assertSleptTimes(1);
+});
+
+it('reads back a lost reviewer start response without starting again', function () {
+    $this->herdr->startFailureCodes = ['transport_lost'];
+
+    $result = app(DispatchOrbitPullRequestReview::class)->handle($this->delivery->id, $this->review->id);
+
+    expect($result->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($this->herdr->calls)->toBe(['open', 'split', 'start', 'get', 'prompt']);
+    Sleep::assertNeverSlept();
+});
+
+it('recovers the exact retained reviewer after a busy pane and never replays it', function () {
+    ambiguousPullRequestReviewerStart($this);
+    $this->herdr->getFailureCodes = ['agent_not_found'];
+    $job = new DispatchPullRequestReviewJob($this->delivery->id, $this->review->id);
+
+    $job->handle(app(DispatchOrbitPullRequestReview::class));
+    $job->handle(app(DispatchOrbitPullRequestReview::class));
+
+    expect($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->herdr->calls)->toBe(['get', 'start', 'prompt'])
+        ->and($this->herdr->prompts)->toHaveCount(1);
+});
+
+it('keeps ambiguous start recovery blocked when the retained reviewer identity drifts', function () {
+    ambiguousPullRequestReviewerStart($this);
+    $this->herdr->reuseBuilder = true;
+
+    expect(fn () => app(DispatchOrbitPullRequestReview::class)->recoverAmbiguousStart(
+        $this->delivery->id,
+        $this->review->id,
+    ))->toThrow(OrbitPullRequestReviewDispatchFailed::class, 'does not match');
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Ambiguous)
+        ->and($this->herdr->calls)->toBe(['get'])
+        ->and($this->herdr->prompts)->toBe([]);
+});
+
+it('rejects malformed or stale ambiguous start recovery ledgers', function (string $drift) {
+    ambiguousPullRequestReviewerStart($this);
+
+    match ($drift) {
+        'message' => $this->dispatch->forceFill(['error_message' => 'Start outcome is unknown.'])->save(),
+        'prompt' => $this->dispatch->forceFill(['prompt_hash' => str_repeat('0', 64)])->save(),
+        'identity' => $this->dispatch->forceFill(['herdr_agent_id' => 'unexpected-agent'])->save(),
+        'phase' => PhaseRun::query()->create([
+            'delivery_id' => $this->delivery->id,
+            'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+            'attempt' => 2,
+            'status' => PhaseRunStatus::Pending,
+        ]),
+    };
+
+    expect(app(DispatchOrbitPullRequestReview::class)->bindAmbiguousStartRecovery($this->delivery->id))
+        ->toBeNull()
+        ->and($this->herdr->calls)->toBe([]);
+})->with(['message', 'prompt', 'identity', 'phase']);
+
+it('schedules only the exact retained ambiguous reviewer start', function () {
+    Queue::fake();
+    ambiguousPullRequestReviewerStart($this);
+    $job = new ReconcileDeliveries;
+
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    Queue::assertPushed(
+        DispatchPullRequestReviewJob::class,
+        fn (DispatchPullRequestReviewJob $queued): bool => $queued->deliveryId === $this->delivery->id
+            && $queued->phaseRunId === $this->review->id,
+    );
+
+    $this->dispatch->forceFill(['error_message' => 'Start outcome is unknown.'])->save();
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    Queue::assertPushed(DispatchPullRequestReviewJob::class, 1);
+});
 
 it('resumes the exact existing reviewer after final-verification dispatch interruption', function () {
     interruptPullRequestReviewBeforePrompt($this);

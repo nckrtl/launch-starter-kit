@@ -63,7 +63,16 @@ final class DispatchOrbitPullRequestReview implements ShouldQueue, ShouldQueueAf
         }
 
         try {
-            $dispatch->handle($this->deliveryId, $this->phaseRunId);
+            $delivery = Delivery::query()->find($this->deliveryId);
+            $failure = $delivery?->failure_details;
+
+            if ($delivery?->status === DeliveryStatus::Blocked
+                && is_array($failure)
+                && ($failure['code'] ?? null) === 'herdr_start_ambiguous') {
+                $dispatch->recoverAmbiguousStart($this->deliveryId, $this->phaseRunId);
+            } else {
+                $dispatch->handle($this->deliveryId, $this->phaseRunId);
+            }
         } catch (OrbitPullRequestReviewDispatchFailed $exception) {
             $delivery = Delivery::query()->find($this->deliveryId);
 
