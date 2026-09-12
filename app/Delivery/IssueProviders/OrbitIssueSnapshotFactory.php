@@ -98,6 +98,24 @@ final readonly class OrbitIssueSnapshotFactory
         );
     }
 
+    public function makeForPlanningResolution(
+        mixed $response,
+        string $expectedIssueId,
+        string $expectedIssueKey,
+        string $expectedViewerId,
+        string $expectedAssigneeId,
+    ): OrbitIssueSnapshot {
+        return $this->makeSnapshot(
+            $response,
+            $expectedIssueId,
+            $expectedIssueKey,
+            $expectedViewerId,
+            $expectedAssigneeId,
+            false,
+            true,
+        );
+    }
+
     public function matchesExpectedContract(
         OrbitIssueSnapshot $snapshot,
         string $expectedContractHash,
@@ -233,6 +251,7 @@ final readonly class OrbitIssueSnapshotFactory
         string $expectedViewerId,
         ?string $expectedAssigneeId,
         bool $closeout = false,
+        bool $planningResolution = false,
     ): OrbitIssueSnapshot {
         $root = $this->map($response);
         $data = $this->map($root['data'] ?? null);
@@ -251,10 +270,18 @@ final readonly class OrbitIssueSnapshotFactory
             throw new OrbitIssueProviderFailed('The Linear issue response does not match the requested Orbit issue.');
         }
 
-        $active = $expectedAssigneeId !== null && ! $closeout;
+        $active = $expectedAssigneeId !== null && ! $closeout && ! $planningResolution;
         $validAssignee = $issue['assignee'] === null
             || ($expectedAssigneeId !== null && $issue['assignee']['id'] === $expectedAssigneeId);
         $validState = match (true) {
+            $planningResolution => in_array([
+                $issue['state']['name'],
+                $issue['state']['type'],
+            ], [
+                ['In Progress', 'started'],
+                ['Backlog', 'backlog'],
+                ['Todo', 'unstarted'],
+            ], true),
             $closeout => ($issue['state']['name'] === 'In Review'
                     && $issue['state']['type'] === 'started'
                     && $issue['assignee'] === null
@@ -277,6 +304,7 @@ final readonly class OrbitIssueSnapshotFactory
             || $this->hasContractHold($issue)) {
             throw new OrbitIssueProviderFailed(
                 match (true) {
+                    $planningResolution => 'The planning-resolution issue must remain delegated to Tom in In Progress, Backlog, or Todo without an unexpected owner or contract hold.',
                     $closeout => 'The Orbit closeout issue must be either solely delegated to Tom in In Review or in Done with no unexpected owner or contract hold.',
                     $active => 'The active Orbit issue must remain delegated to Tom in In Progress or In Review with no unexpected assignee or contract hold.',
                     default => 'The Orbit issue is not eligible: it must be solely delegated to Tom and be in Todo or In Progress without readiness, children, or unfinished blockers.',

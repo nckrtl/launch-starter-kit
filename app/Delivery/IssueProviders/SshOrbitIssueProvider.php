@@ -9,6 +9,7 @@ use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitEligibleIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueResolver;
+use App\Delivery\Contracts\OrbitPlanningResolutionIssueProvider;
 use App\Delivery\Data\OrbitEligibleIssue;
 use App\Delivery\Data\OrbitIssueSnapshot;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
@@ -16,7 +17,7 @@ use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitEligibleIssueProvider, OrbitIssueProvider, OrbitIssueResolver
+final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitEligibleIssueProvider, OrbitIssueProvider, OrbitIssueResolver, OrbitPlanningResolutionIssueProvider
 {
     private const string QUERY = <<<'GRAPHQL'
 query LoopIssue($id: String!) {
@@ -97,6 +98,24 @@ GRAPHQL;
         }
 
         return $this->snapshots->makeForCloseout($response, $issueId, $issueKey, $viewerId, $assigneeId);
+    }
+
+    public function fetchForPlanningResolution(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        [$response, $viewerId] = $this->request($issueId, $issueKey);
+        $assigneeId = config('commander.hermes.nick_linear_user_id');
+
+        if (! is_string($assigneeId) || ! $this->isUuid($assigneeId)) {
+            throw new OrbitIssueProviderFailed('The Hermes Orbit planning-resolution issue provider is not configured.');
+        }
+
+        return $this->snapshots->makeForPlanningResolution(
+            $response,
+            $issueId,
+            $issueKey,
+            $viewerId,
+            $assigneeId,
+        );
     }
 
     public function next(): ?OrbitEligibleIssue

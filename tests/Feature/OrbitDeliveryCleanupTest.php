@@ -27,6 +27,7 @@ use App\Delivery\Exceptions\OrbitLandingAdvancementFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitCleanup as AdvanceOrbitCleanupJob;
+use App\Jobs\ApplyOrbitPlanningResolution as ApplyOrbitPlanningResolutionJob;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -335,6 +336,110 @@ it('records already-absent cleanup honestly and terminalizes the blocked deliver
 
     expect($advance->handle($this->delivery->id, $phase->id))->toBeNull()
         ->and($worktrees->cleanups)->toBe(1);
+});
+
+it('accepts a cleanup intent retained by the previously deployed ledger shape', function () {
+    $phase = app(StartOrbitDeliveryCleanup::class)->handle($this->delivery->id);
+    $input = $phase->input;
+    unset($input['source']['current_block'], $input['source']['output']);
+    $phase->input = $input;
+    $phase->save();
+    $worktrees = new AbsentOrbitWorktreeCleaner;
+    $advance = new AdvanceOrbitCleanup(
+        app(ProjectConfigRegistry::class),
+        new ShutdownOrbitHerdrWorkspace(new AbsentCleanupHerdrRuntime),
+        $worktrees,
+    );
+
+    expect($advance->handle($this->delivery->id, $phase->id))->toBeNull()
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('delivery_aborted')
+        ->and($phase->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($worktrees->cleanups)->toBe(1);
+});
+
+it('terminalizes an exact corrected planning resolution for fresh admission', function () {
+    $correction = [
+        'issue_id' => $this->delivery->external_issue_id,
+        'issue_key' => $this->delivery->external_issue_key,
+        'resolution_receipt_sha256' => str_repeat('b', 64),
+        'old_contract_sha256' => str_repeat('c', 64),
+        'new_contract_sha256' => str_repeat('d', 64),
+        'description_sha256' => str_repeat('e', 64),
+        'linear_state_id' => '55555555-6666-4777-8888-999999999999',
+        'linear_state' => 'Todo',
+        'linear_state_type' => 'unstarted',
+        'linear_updated_at' => '2026-09-12T18:00:00.000Z',
+    ];
+    $this->source->forceFill([
+        'phase_name' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'status' => PhaseRunStatus::Completed,
+        'current_block' => null,
+        'output' => [
+            'receipt_id' => $this->receipt->id,
+            'result' => 'proposal',
+            'planning_resolution_correction' => $correction,
+        ],
+        'failure_code' => null,
+        'failure_message' => null,
+        'failure_details' => null,
+    ])->save();
+    $this->delivery->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'failure_details' => [
+            'code' => 'planning_resolution_cleanup_ready',
+            'phase_run_id' => $this->source->id,
+            'dispatch_id' => $this->dispatch->id,
+            'receipt_id' => $this->receipt->id,
+            'correction' => $correction,
+        ],
+    ])->save();
+    $phase = app(StartOrbitDeliveryCleanup::class)->handle($this->delivery->id);
+    $advance = new AdvanceOrbitCleanup(
+        app(ProjectConfigRegistry::class),
+        new ShutdownOrbitHerdrWorkspace(new AbsentCleanupHerdrRuntime),
+        new AbsentOrbitWorktreeCleaner,
+    );
+
+    expect($advance->handle($this->delivery->id, $phase->id))->toBeNull();
+
+    $delivery = $this->delivery->fresh();
+    expect($delivery->status)->toBe(DeliveryStatus::Failed)
+        ->and($delivery->active_issue_key)->toBeNull()
+        ->and($delivery->failure_details['code'])->toBe('planning_resolution_restarted')
+        ->and($delivery->failure_details['original']['delivery_failure_details']['correction'])
+        ->toBe($correction)
+        ->and($this->source->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->source->fresh()->output['planning_resolution_correction'])
+        ->toBe($correction);
+});
+
+it('retains an actionable reconciliation state when planning correction retries exhaust', function () {
+    $this->source->forceFill([
+        'phase_name' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'status' => PhaseRunStatus::Completed,
+        'current_block' => 'planning_resolution_correction',
+    ])->save();
+    $this->delivery->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'failure_details' => [
+            'code' => 'planning_resolution_reconciliation_required',
+            'phase_run_id' => $this->source->id,
+            'dispatch_id' => $this->dispatch->id,
+            'receipt_id' => $this->receipt->id,
+        ],
+    ])->save();
+    $job = new ApplyOrbitPlanningResolutionJob($this->delivery->id, $this->source->id);
+
+    $job->failed(new RuntimeException('Linear read-back remained unavailable.'));
+
+    expect($job->tries)->toBe(0)
+        ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
+        ->and(ApplyOrbitPlanningResolutionJob::LOCK_SECONDS)->toBeGreaterThan($job->timeout)
+        ->and($job->retryUntil() > now())->toBeTrue()
+        ->and($this->delivery->fresh()->failure_details['code'])
+        ->toBe('planning_resolution_reconciliation_required')
+        ->and($this->delivery->fresh()->failure_details['message'])
+        ->toBe('Linear read-back remained unavailable.');
 });
 
 it('cleans only the exact retained waiting reviewer after an allowed review failure', function (string $code) {

@@ -3,6 +3,7 @@
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitPlanReview;
 use App\Delivery\Actions\AdvanceOrbitResolution;
+use App\Delivery\Actions\ApplyOrbitPlanningResolution;
 use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\CaptureOrbitPlanReviewReceipt;
@@ -16,6 +17,8 @@ use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitPlanningResolutionIssueProvider;
+use App\Delivery\Contracts\OrbitPlanningResolutionTransitioner;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Contracts\OrbitResolutionPublisher;
 use App\Delivery\Data\CandidateCheck;
@@ -24,6 +27,7 @@ use App\Delivery\Data\HerdrAgentLaunch;
 use App\Delivery\Data\OpenedHerdrWorktree;
 use App\Delivery\Data\OrbitDeliveryReservation;
 use App\Delivery\Data\OrbitIssueSnapshot;
+use App\Delivery\Data\OrbitPlanningResolutionCorrection;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
@@ -39,11 +43,13 @@ use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanReviewAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
 use App\Delivery\Exceptions\OrbitResolutionDispatchFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
+use App\Jobs\ApplyOrbitPlanningResolution as ApplyOrbitPlanningResolutionJob;
 use App\Jobs\DispatchOrbitPlanReview as DispatchOrbitPlanReviewJob;
 use App\Jobs\ReconcileDeliveries;
 use App\Models\AgentDispatch;
@@ -174,7 +180,7 @@ final class PlanReviewDispatchRepository implements OrbitRepository
     }
 }
 
-final class PlanReviewIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
+final class PlanReviewIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider, OrbitPlanningResolutionIssueProvider
 {
     public function __construct(public OrbitIssueSnapshot $snapshot) {}
 
@@ -186,6 +192,40 @@ final class PlanReviewIssueProvider implements OrbitActiveIssueProvider, OrbitIs
     public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         return $this->snapshot;
+    }
+
+    public function fetchForPlanningResolution(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        return $this->snapshot;
+    }
+}
+
+final class PlanReviewPlanningResolutionTransitioner implements OrbitPlanningResolutionTransitioner
+{
+    /** @var list<OrbitPlanningResolutionCorrection> */
+    public array $corrections = [];
+
+    public function applyPlanningResolution(
+        OrbitIssueSnapshot $current,
+        OrbitPlanningResolutionCorrection $correction,
+    ): OrbitIssueSnapshot {
+        $this->corrections[] = $correction;
+        $payload = $current->payload;
+        $payload['description'] = $correction->correctedDescription;
+        $payload['updatedAt'] = '2026-09-12T18:00:00.000Z';
+        $payload['state'] = [
+            'id' => '55555555-6666-4777-8888-999999999999',
+            'name' => 'Todo',
+            'type' => 'unstarted',
+        ];
+        $payload['assignee'] = null;
+
+        return new OrbitIssueSnapshot(
+            $current->issueId,
+            $current->issueKey,
+            $payload,
+            app(OrbitIssueSnapshotFactory::class)->contractHash($payload),
+        );
     }
 }
 
@@ -430,9 +470,29 @@ beforeEach(function () {
     $payload = [
         'id' => '11111111-2222-4333-8444-555555555555',
         'identifier' => 'ORB-234',
-        'state' => ['id' => 'state-1', 'name' => 'In Progress', 'type' => 'started'],
+        'title' => 'Build the delivery boundary',
+        'url' => 'https://linear.app/orbit/issue/ORB-234',
+        'description' => "## Outcome\n\nDeliver it.",
+        'updatedAt' => '2026-09-12T17:00:00.000Z',
+        'state' => [
+            'id' => '44444444-5555-4666-8777-888888888888',
+            'name' => 'In Progress',
+            'type' => 'started',
+        ],
         'delegate' => ['id' => config('commander.hermes.tom_linear_viewer_id')],
         'assignee' => ['id' => config('commander.hermes.nick_linear_user_id')],
+        'team' => [
+            'id' => '33333333-4444-4555-8666-777777777777',
+            'states' => ['nodes' => [
+                ['id' => '44444444-5555-4666-8777-888888888888', 'name' => 'In Progress'],
+                ['id' => '55555555-6666-4777-8888-999999999999', 'name' => 'Todo'],
+                ['id' => '88888888-9999-4aaa-8bbb-cccccccccccc', 'name' => 'Backlog'],
+            ]],
+        ],
+        'labels' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
+        'attachments' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
+        'children' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
+        'inverseRelations' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
     ];
     $this->repository = new PlanReviewDispatchRepository;
     $this->issues = new PlanReviewIssueProvider(new OrbitIssueSnapshot(
@@ -446,6 +506,12 @@ beforeEach(function () {
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitActiveIssueProvider::class, $this->issues);
     app()->instance(OrbitIssueProvider::class, $this->issues);
+    app()->instance(OrbitPlanningResolutionIssueProvider::class, $this->issues);
+    $this->planningResolutionTransitions = new PlanReviewPlanningResolutionTransitioner;
+    app()->instance(
+        OrbitPlanningResolutionTransitioner::class,
+        $this->planningResolutionTransitions,
+    );
     app()->instance(OrbitResolutionPublisher::class, $this->resolutionPublisher);
     app()->instance(HerdrRuntime::class, $this->herdr);
     Queue::fake();
@@ -723,7 +789,7 @@ it('dispatches an initial planning blocker through the planning resolver', funct
         );
 });
 
-it('dispatches, captures, and publishes a blocked plan review through the planning resolver', function () {
+it('applies an exact planning resolution and queues cleanup for a fresh Todo admission', function () {
     $reviewReceipt = capturedPlanReviewResult($this, 'blocked');
     app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);
     $resolution = PhaseRun::query()
@@ -756,8 +822,8 @@ it('dispatches, captures, and publishes a blocked plan review through the planni
         'resume_phase' => 'planning',
         'required_adrs' => [],
         'human_decisions' => [],
-        'issue_changes' => [],
-        'plan_changes' => [],
+        'issue_changes' => ['Publish the corrected issue contract.'],
+        'plan_changes' => ['Rerun planning from the corrected contract.'],
     ];
     $payload = [
         'kind' => 'orbit_resolution',
@@ -824,6 +890,61 @@ it('dispatches, captures, and publishes a blocked plan review through the planni
         ->and($this->delivery->fresh()->failure_details['code'])
         ->toBe('resolution_decision_required')
         ->and($this->resolutionPublisher->calls)->toBe(1);
+
+    $descriptionPath = resource_path('delivery/orbit/planning-resolutions/orb-71.md');
+    $correctedDescription = rtrim(File::get($descriptionPath), "\r\n");
+    $correctedPayload = $this->issues->snapshot->payload;
+    $correctedPayload['description'] = $correctedDescription;
+    $correctedContractHash = app(OrbitIssueSnapshotFactory::class)
+        ->contractHash($correctedPayload);
+    config()->set('commander.delivery.orbit_planning_resolutions.ORB-234', [
+        'issue_id' => $this->delivery->external_issue_id,
+        'resolution_receipt_sha256' => $receipt->payload_hash,
+        'current_contract_sha256' => str_repeat('d', 64),
+        'corrected_contract_sha256' => $correctedContractHash,
+        'corrected_description' => $descriptionPath,
+        'corrected_description_sha256' => hash('sha256', $correctedDescription),
+    ]);
+
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    Queue::assertPushed(
+        ApplyOrbitPlanningResolutionJob::class,
+        fn (ApplyOrbitPlanningResolutionJob $job): bool => $job->deliveryId === $this->delivery->id
+            && $job->phaseRunId === $resolution->id,
+    );
+
+    $apply = app(ApplyOrbitPlanningResolution::class);
+    $apply->handle($this->delivery->id, $resolution->id);
+    $apply->handle($this->delivery->id, $resolution->id);
+
+    $delivery = $this->delivery->fresh();
+    $resolution = $resolution->fresh();
+    $cleanup = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::CLEANUP_PHASE)
+        ->sole();
+    $correctionEvidence = $resolution->output['planning_resolution_correction'];
+
+    expect($delivery->status)->toBe(DeliveryStatus::Cleaning)
+        ->and($delivery->current_phase)->toBe(OrbitFeatureWorkflow::CLEANUP_PHASE)
+        ->and($delivery->failure_details['code'])->toBe('planning_resolution_cleanup_ready')
+        ->and($correctionEvidence['old_contract_sha256'])->toBe(str_repeat('d', 64))
+        ->and($correctionEvidence['new_contract_sha256'])->toBe($correctedContractHash)
+        ->and($correctionEvidence['linear_state'])->toBe('Todo')
+        ->and($resolution->status)->toBe(PhaseRunStatus::Completed)
+        ->and($resolution->current_block)->toBeNull()
+        ->and($cleanup->status)->toBe(PhaseRunStatus::Pending)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::CLEANUP_PHASE)
+            ->count())->toBe(1)
+        ->and($cleanup->input['source']['status'])->toBe(PhaseRunStatus::Completed->value)
+        ->and($cleanup->input['source']['current_block'])->toBeNull()
+        ->and($cleanup->input['source']['output'])->toBe($resolution->output)
+        ->and($this->planningResolutionTransitions->corrections)->toHaveCount(1);
 });
 
 it('resumes the exact retained idle resolver when dispatch stopped before its prompt', function () {

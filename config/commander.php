@@ -15,6 +15,16 @@ return [
     'delivery' => [
         'orbit_auto_admission' => (bool) env('COMMANDER_ORBIT_AUTO_ADMISSION', false),
         'orbit_controller_label_id' => env('COMMANDER_ORBIT_CONTROLLER_LABEL_ID', '34651888-f68e-4bf2-b322-ec05c2a7fc64'),
+        'orbit_planning_resolutions' => [
+            'ORB-71' => [
+                'issue_id' => '6c72f49f-55f7-4cb9-b47a-41fa9d9473cf',
+                'resolution_receipt_sha256' => '43640aaf5de5c119a3b1651c03c9fea4638b4aa002cf74596e9714373cdda4e4',
+                'current_contract_sha256' => '45d634da29199f29881ee2511c7803f9fde3e296ef9bb66c35530b9664e19a2e',
+                'corrected_contract_sha256' => 'a1aaca1eed1efead10af4e6fb561f0aa2fda98fd42d33581d31679f42ac5657b',
+                'corrected_description' => resource_path('delivery/orbit/planning-resolutions/orb-71.md'),
+                'corrected_description_sha256' => '0a167f2d51d776771a8a6622767db17bef9422a26fd814f12192bf43920c222f',
+            ],
+        ],
     ],
 
     'hermes' => [

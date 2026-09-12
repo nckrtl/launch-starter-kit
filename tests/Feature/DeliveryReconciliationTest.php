@@ -26,6 +26,7 @@ use App\Jobs\AdoptOrbitResolution;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitPullRequestReview;
 use App\Jobs\AdvanceOrbitResolution;
+use App\Jobs\ApplyOrbitPlanningResolution;
 use App\Jobs\ReconcileDeliveries;
 use App\Jobs\ReconcileDelivery;
 use App\Models\AgentDispatch;
@@ -412,6 +413,10 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
     Queue::assertNotPushed(
         AdoptOrbitResolution::class,
         fn (AdoptOrbitResolution $queued): bool => $queued->deliveryId === $resolutionDecision->id,
+    );
+    Queue::assertNotPushed(
+        ApplyOrbitPlanningResolution::class,
+        fn (ApplyOrbitPlanningResolution $queued): bool => $queued->deliveryId === $resolutionDecision->id,
     );
     Queue::assertNotPushed(ReconcileDelivery::class);
 

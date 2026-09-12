@@ -100,15 +100,23 @@ final readonly class AdvanceOrbitCleanup
         $source = is_array($input) ? ($input['source'] ?? null) : null;
         $sourcePhaseId = is_array($source) ? ($source['phase_run_id'] ?? null) : null;
         $sourcePhase = is_int($sourcePhaseId) ? PhaseRun::query()->find($sourcePhaseId) : null;
+        $legacySourceKeys = [
+            'delivery_status', 'current_phase', 'delivery_failure_details',
+            'phase_run_id', 'phase_name', 'attempt', 'status', 'failure_code',
+            'failure_message', 'failure_details',
+        ];
+        $sourceKeys = [
+            'delivery_status', 'current_phase', 'delivery_failure_details',
+            'phase_run_id', 'phase_name', 'attempt', 'status', 'current_block', 'output', 'failure_code',
+            'failure_message', 'failure_details',
+        ];
+        $retainsSourceState = is_array($source) && array_keys($source) === $sourceKeys;
 
         if (! is_array($input) || array_keys($input) !== [
             'repository', 'issue_key', 'worktree', 'branch', 'candidate_sha', 'source',
         ]
-            || ! is_array($source) || array_keys($source) !== [
-                'delivery_status', 'current_phase', 'delivery_failure_details',
-                'phase_run_id', 'phase_name', 'attempt', 'status', 'failure_code',
-                'failure_message', 'failure_details',
-            ]
+            || ! is_array($source)
+            || (! $retainsSourceState && array_keys($source) !== $legacySourceKeys)
             || ($input['issue_key'] ?? null) !== $delivery->external_issue_key
             || ($input['worktree'] ?? null) !== $delivery->worktree_path
             || ($input['branch'] ?? null) !== $delivery->branch
@@ -118,12 +126,33 @@ final readonly class AdvanceOrbitCleanup
             || $sourcePhase->phase_name !== ($source['phase_name'] ?? null)
             || $sourcePhase->phase_name !== ($source['current_phase'] ?? null)
             || $sourcePhase->attempt !== ($source['attempt'] ?? null)
-            || $sourcePhase->status !== PhaseRunStatus::Failed
             || $sourcePhase->status->value !== ($source['status'] ?? null)
+            || ($retainsSourceState && $sourcePhase->current_block !== ($source['current_block'] ?? null))
+            || ($retainsSourceState && $sourcePhase->output !== ($source['output'] ?? null))
             || $sourcePhase->failure_code !== ($source['failure_code'] ?? null)
             || $sourcePhase->failure_message !== ($source['failure_message'] ?? null)
             || $sourcePhase->failure_details !== ($source['failure_details'] ?? null)
             || $sourcePhase->finished_at === null) {
+            return false;
+        }
+
+        $sourceFailure = $source['delivery_failure_details'];
+
+        if (! is_array($sourceFailure)) {
+            return false;
+        }
+
+        $abortable = $sourcePhase->status === PhaseRunStatus::Failed;
+        $restartable = $retainsSourceState
+            && $sourcePhase->status === PhaseRunStatus::Completed
+            && $source['current_phase'] === OrbitFeatureWorkflow::RESOLUTION_PHASE
+            && ($sourceFailure['code'] ?? null) === 'planning_resolution_cleanup_ready'
+            && $sourcePhase->current_block === null
+            && is_array($sourcePhase->output)
+            && ($sourcePhase->output['planning_resolution_correction'] ?? null)
+                === ($sourceFailure['correction'] ?? null);
+
+        if (! $abortable && ! $restartable) {
             return false;
         }
 
@@ -147,7 +176,9 @@ final readonly class AdvanceOrbitCleanup
             && is_array($phase->output)
             && $phase->started_at !== null
             && $phase->finished_at !== null
-            && ($delivery->failure_details['code'] ?? null) === 'delivery_aborted'
+            && ($delivery->failure_details['code'] ?? null) === (
+                $restartable ? 'planning_resolution_restarted' : 'delivery_aborted'
+            )
             && ($delivery->failure_details['cleanup_phase_run_id'] ?? null) === $phase->id;
     }
 
@@ -482,10 +513,13 @@ final readonly class AdvanceOrbitCleanup
             $phase->finished_at = now();
             $phase->save();
 
+            $sourceFailure = $source['delivery_failure_details'] ?? null;
+            $restarted = is_array($sourceFailure)
+                && ($sourceFailure['code'] ?? null) === 'planning_resolution_cleanup_ready';
             $delivery->status = DeliveryStatus::Failed;
             $delivery->failed_at = now();
             $delivery->failure_details = [
-                'code' => 'delivery_aborted',
+                'code' => $restarted ? 'planning_resolution_restarted' : 'delivery_aborted',
                 'cleanup_phase_run_id' => $phase->id,
                 'original' => $source,
                 'cleanup' => [

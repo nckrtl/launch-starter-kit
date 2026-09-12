@@ -9,15 +9,18 @@ use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
+use App\Delivery\Contracts\OrbitPlanningResolutionIssueProvider;
+use App\Delivery\Contracts\OrbitPlanningResolutionTransitioner;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\Data\OrbitIssueSnapshot;
+use App\Delivery\Data\OrbitPlanningResolutionCorrection;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitIssueTransitioner implements OrbitIssueCompletionTransitioner, OrbitIssueTransitioner, OrbitReviewIssueTransitioner
+final readonly class SshOrbitIssueTransitioner implements OrbitIssueCompletionTransitioner, OrbitIssueTransitioner, OrbitPlanningResolutionTransitioner, OrbitReviewIssueTransitioner
 {
     private const string MUTATION = <<<'GRAPHQL'
 mutation LoopState($id: String!, $input: IssueUpdateInput!) {
@@ -29,6 +32,8 @@ GRAPHQL;
         private OrbitIssueProvider $issues,
         private OrbitActiveIssueProvider $activeIssues,
         private OrbitCloseoutIssueProvider $closeoutIssues,
+        private OrbitPlanningResolutionIssueProvider $planningResolutionIssues,
+        private OrbitIssueSnapshotFactory $snapshots,
     ) {}
 
     public function transitionToInProgress(
@@ -43,6 +48,103 @@ GRAPHQL;
         string $expectedContractHash,
     ): OrbitIssueSnapshot {
         return $this->transition($current, $expectedContractHash, 'In Review', true);
+    }
+
+    public function applyPlanningResolution(
+        OrbitIssueSnapshot $current,
+        OrbitPlanningResolutionCorrection $correction,
+    ): OrbitIssueSnapshot {
+        [$target, $profile] = $this->planningResolutionConfiguration($current, $correction);
+        $correctedPayload = $current->payload;
+        $correctedPayload['description'] = $correction->correctedDescription;
+        $correctedContractHash = $correction->correctedContractHash;
+        $computedCorrectedContractHash = $this->snapshots->contractHash($correctedPayload);
+        $backlogStateId = $this->planningResolutionStateId($current, 'Backlog');
+        $todoStateId = $this->planningResolutionStateId($current, 'Todo');
+        $inProgressStateId = $this->planningResolutionStateId($current, 'In Progress');
+        $state = $current->payload['state'] ?? null;
+        $stateName = is_array($state) ? ($state['name'] ?? null) : null;
+        $stateType = is_array($state) ? ($state['type'] ?? null) : null;
+        $stateId = is_array($state) ? ($state['id'] ?? null) : null;
+        $isCorrected = hash_equals($correctedContractHash, $current->contractHash)
+            && ($current->payload['description'] ?? null) === $correction->correctedDescription;
+
+        if ($stateName === 'Todo' && $stateType === 'unstarted' && $stateId === $todoStateId
+            && $isCorrected && $current->payload['assignee'] === null) {
+            return $current;
+        }
+
+        if ($stateName === 'In Progress'
+            && $stateType === 'started'
+            && $stateId === $inProgressStateId
+            && hash_equals($correctedContractHash, $computedCorrectedContractHash)
+            && hash_equals($correction->currentContractHash, $current->contractHash)) {
+            $mutationFailure = null;
+
+            try {
+                $this->mutate($target, $profile, $current->issueId, [
+                    'stateId' => $backlogStateId,
+                    'description' => $correction->correctedDescription,
+                ]);
+            } catch (OrbitIssueTransitionFailed $exception) {
+                $mutationFailure = $exception;
+            }
+
+            $current = $this->planningResolutionReadBack(
+                $current,
+                $correction,
+                $correctedContractHash,
+                'Backlog',
+                $backlogStateId,
+                $mutationFailure,
+            );
+            $state = $current->payload['state'] ?? null;
+
+            if (! is_array($state)) {
+                throw new OrbitIssueTransitionFailed(
+                    'The Orbit planning-resolution Backlog read-back has no state evidence.',
+                    ambiguous: true,
+                );
+            }
+
+            $stateName = $state['name'] ?? null;
+            $stateType = $state['type'] ?? null;
+            $stateId = $state['id'] ?? null;
+            $isCorrected = true;
+        }
+
+        $recoverableStage = ($stateName === 'Backlog'
+                && $stateType === 'backlog'
+                && $stateId === $backlogStateId)
+            || ($stateName === 'Todo'
+                && $stateType === 'unstarted'
+                && $stateId === $todoStateId);
+
+        if (! $recoverableStage || ! $isCorrected) {
+            throw new OrbitIssueTransitionFailed(
+                'The Orbit planning-resolution correction is not at an exact recoverable Linear stage.',
+            );
+        }
+
+        $mutationFailure = null;
+
+        try {
+            $this->mutate($target, $profile, $current->issueId, [
+                'stateId' => $todoStateId,
+                'assigneeId' => null,
+            ]);
+        } catch (OrbitIssueTransitionFailed $exception) {
+            $mutationFailure = $exception;
+        }
+
+        return $this->planningResolutionReadBack(
+            $current,
+            $correction,
+            $correctedContractHash,
+            'Todo',
+            $todoStateId,
+            $mutationFailure,
+        );
     }
 
     public function transitionToDone(
@@ -320,7 +422,7 @@ GRAPHQL;
         return $targetStateId;
     }
 
-    /** @param array{stateId: string, assigneeId?: null, delegateId?: null} $fields */
+    /** @param array{stateId: string, description?: string, assigneeId?: null, delegateId?: null} $fields */
     private function mutate(string $target, string $profile, string $issueId, array $fields): void
     {
         try {
@@ -365,6 +467,115 @@ GRAPHQL;
                 ambiguous: true,
             );
         }
+    }
+
+    /** @return array{string, string} */
+    private function planningResolutionConfiguration(
+        OrbitIssueSnapshot $current,
+        OrbitPlanningResolutionCorrection $correction,
+    ): array {
+        $target = config('commander.hermes.ssh_target');
+        $profile = config('commander.hermes.profiles.tom');
+        $viewerId = config('commander.hermes.tom_linear_viewer_id');
+        $nickId = config('commander.hermes.nick_linear_user_id');
+        $payload = $current->payload;
+        $delegate = $payload['delegate'] ?? null;
+        $assignee = $payload['assignee'] ?? null;
+        $validAssignee = $assignee === null
+            || (is_array($assignee) && ($assignee['id'] ?? null) === $nickId);
+
+        if (! is_string($target) || preg_match('/^[A-Za-z0-9._-]+@[A-Za-z0-9.:-]+$/', $target) !== 1
+            || ! is_string($profile) || preg_match('/^\/[A-Za-z0-9._\/-]+$/', $profile) !== 1
+            || ! is_string($viewerId) || ! $this->isUuid($viewerId)
+            || ! is_string($nickId) || ! $this->isUuid($nickId)
+            || preg_match('/^[a-f0-9]{64}$/', $correction->currentContractHash) !== 1
+            || preg_match('/^[a-f0-9]{64}$/', $correction->correctedContractHash) !== 1
+            || $current->issueId !== $correction->issueId
+            || $current->issueKey !== $correction->issueKey
+            || ($payload['id'] ?? null) !== $correction->issueId
+            || ($payload['identifier'] ?? null) !== $correction->issueKey
+            || ! $validAssignee
+            || ! is_array($delegate) || ($delegate['id'] ?? null) !== $viewerId
+            || hash('sha256', $correction->correctedDescription) !== $correction->correctedDescriptionHash) {
+            throw new OrbitIssueTransitionFailed(
+                'The Orbit planning-resolution correction input or Hermes configuration is invalid.',
+            );
+        }
+
+        return [$target, $profile];
+    }
+
+    private function planningResolutionStateId(OrbitIssueSnapshot $current, string $name): string
+    {
+        $team = $current->payload['team'] ?? null;
+        $states = is_array($team) ? ($team['states'] ?? null) : null;
+        $nodes = is_array($states) ? ($states['nodes'] ?? null) : null;
+        $matches = is_array($nodes) ? array_values(array_filter(
+            $nodes,
+            static fn (mixed $state): bool => is_array($state) && ($state['name'] ?? null) === $name,
+        )) : [];
+        $stateId = count($matches) === 1 ? ($matches[0]['id'] ?? null) : null;
+
+        if (! is_string($stateId) || ! $this->isUuid($stateId)) {
+            throw new OrbitIssueTransitionFailed(
+                "Linear did not provide exactly one valid {$name} state for the Orbit team.",
+            );
+        }
+
+        return $stateId;
+    }
+
+    private function planningResolutionReadBack(
+        OrbitIssueSnapshot $before,
+        OrbitPlanningResolutionCorrection $correction,
+        string $correctedContractHash,
+        string $stateName,
+        string $stateId,
+        ?OrbitIssueTransitionFailed $mutationFailure,
+    ): OrbitIssueSnapshot {
+        try {
+            $readBack = $this->planningResolutionIssues->fetchForPlanningResolution(
+                $correction->issueId,
+                $correction->issueKey,
+            );
+        } catch (OrbitIssueProviderFailed $exception) {
+            throw new OrbitIssueTransitionFailed(
+                'The Orbit planning-resolution correction could not be verified by Linear read-back.',
+                ambiguous: true,
+                mutationFailure: $mutationFailure,
+                previous: $exception,
+            );
+        }
+
+        $expectedType = $stateName === 'Backlog' ? 'backlog' : 'unstarted';
+        $state = $readBack->payload['state'] ?? null;
+        $beforePayload = $before->payload;
+        $afterPayload = $readBack->payload;
+        unset($beforePayload['description'], $beforePayload['state'], $beforePayload['updatedAt']);
+        unset($afterPayload['description'], $afterPayload['state'], $afterPayload['updatedAt']);
+        $ownershipMatches = $stateName === 'Todo'
+            ? ($readBack->payload['assignee'] ?? null) === null
+            : ($readBack->payload['assignee'] ?? null) === ($before->payload['assignee'] ?? null);
+        unset($beforePayload['assignee'], $afterPayload['assignee']);
+
+        if ($readBack->issueId === $before->issueId
+            && $readBack->issueKey === $before->issueKey
+            && hash_equals($correctedContractHash, $readBack->contractHash)
+            && ($readBack->payload['description'] ?? null) === $correction->correctedDescription
+            && is_array($state)
+            && ($state['id'] ?? null) === $stateId
+            && ($state['name'] ?? null) === $stateName
+            && ($state['type'] ?? null) === $expectedType
+            && $ownershipMatches
+            && $afterPayload === $beforePayload) {
+            return $readBack;
+        }
+
+        throw new OrbitIssueTransitionFailed(
+            "The Orbit planning-resolution Linear read-back did not confirm the exact corrected {$stateName} contract.",
+            ambiguous: true,
+            mutationFailure: $mutationFailure,
+        );
     }
 
     private function isVerifiedReadBack(

@@ -77,6 +77,18 @@ final readonly class StartOrbitDeliveryCleanup
             $source = is_int($sourceId)
                 ? $delivery->phaseRuns()->whereKey($sourceId)->lockForUpdate()->first()
                 : null;
+            $abortable = $source !== null
+                && $source->status === PhaseRunStatus::Failed
+                && $source->finished_at !== null;
+            $restartable = $source !== null
+                && $delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
+                && ($delivery->failure_details['code'] ?? null) === 'planning_resolution_cleanup_ready'
+                && $source->status === PhaseRunStatus::Completed
+                && $source->current_block === null
+                && is_array($source->output)
+                && ($source->output['planning_resolution_correction'] ?? null)
+                    === ($delivery->failure_details['correction'] ?? null)
+                && $source->finished_at !== null;
 
             if (! $config instanceof OrbitProjectConfig
                 || $delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
@@ -88,8 +100,7 @@ final readonly class StartOrbitDeliveryCleanup
                 || ! is_array($delivery->failure_details)
                 || $source === null
                 || $source->phase_name !== $delivery->current_phase
-                || $source->status !== PhaseRunStatus::Failed
-                || $source->finished_at === null) {
+                || (! $abortable && ! $restartable)) {
                 throw new OrbitDeliveryCleanupFailed(
                     'The blocked Orbit delivery does not have a complete pre-merge cleanup ledger.',
                 );
@@ -135,6 +146,8 @@ final readonly class StartOrbitDeliveryCleanup
                 'phase_name' => $source->phase_name,
                 'attempt' => $source->attempt,
                 'status' => $source->status->value,
+                'current_block' => $source->current_block,
+                'output' => $source->output,
                 'failure_code' => $source->failure_code,
                 'failure_message' => $source->failure_message,
                 'failure_details' => $source->failure_details,

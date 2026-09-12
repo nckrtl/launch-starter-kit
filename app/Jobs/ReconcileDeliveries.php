@@ -16,6 +16,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPlanningResolutionCatalog;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -67,10 +68,12 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         ?DispatchOrbitPullRequestReviewAction $reviewDispatches = null,
         ?RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries = null,
         ?RecoverInitialOrbitPlanningBlocker $initialPlanningBlockers = null,
+        ?OrbitPlanningResolutionCatalog $planningResolutionCatalog = null,
     ): void {
         $reviewDispatches ??= app(DispatchOrbitPullRequestReviewAction::class);
         $reviewTransitionRecoveries ??= app(RecoverOrbitPullRequestReviewTransition::class);
         $initialPlanningBlockers ??= app(RecoverInitialOrbitPlanningBlocker::class);
+        $planningResolutionCatalog ??= app(OrbitPlanningResolutionCatalog::class);
 
         Delivery::query()
             ->select([
@@ -80,6 +83,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 'deliveries.failure_details',
                 'deliveries.workflow_type',
                 'deliveries.workflow_version',
+                'deliveries.external_issue_key',
             ])
             ->whereHas('projectOrchestration', function (Builder $query): void {
                 $query->where('state', ProjectOrchestrationState::Enabled->value);
@@ -109,6 +113,9 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                                 'resolution_publication_reconciliation_required',
                                 'resolution_adoption_ready',
                                 'resolution_adoption_reconciliation_required',
+                                'resolution_decision_required',
+                                'planning_resolution_reconciliation_required',
+                                'planning_resolution_cleanup_ready',
                             ]);
                     })
                     ->orWhere(function (Builder $query): void {
@@ -138,6 +145,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 $reviewDispatches,
                 $reviewTransitionRecoveries,
                 $initialPlanningBlockers,
+                $planningResolutionCatalog,
             ): void {
                 foreach ($deliveries as $delivery) {
                     $this->dispatchRecovery(
@@ -148,6 +156,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $reviewDispatches,
                         $reviewTransitionRecoveries,
                         $initialPlanningBlockers,
+                        $planningResolutionCatalog,
                     );
                 }
             }, 'deliveries.id', 'id');
@@ -161,6 +170,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         DispatchOrbitPullRequestReviewAction $reviewDispatches,
         RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries,
         RecoverInitialOrbitPlanningBlocker $initialPlanningBlockers,
+        OrbitPlanningResolutionCatalog $planningResolutionCatalog,
     ): void {
         if ($delivery->status === DeliveryStatus::Failed) {
             if ($planningCorrections->handle($delivery->id)
@@ -218,6 +228,18 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
 
             if ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
                 && is_int($phaseRunId)) {
+                if (is_string($delivery->external_issue_key)
+                    && $planningResolutionCatalog->has($delivery->external_issue_key)
+                    && in_array($failureCode, [
+                        'resolution_decision_required',
+                        'planning_resolution_reconciliation_required',
+                        'planning_resolution_cleanup_ready',
+                    ], true)) {
+                    ApplyOrbitPlanningResolution::dispatch($delivery->id, $phaseRunId);
+
+                    return;
+                }
+
                 if ($failureCode === 'resolution_dispatch_failed') {
                     DispatchOrbitPullRequestResolution::dispatch($delivery->id, $phaseRunId);
                 }

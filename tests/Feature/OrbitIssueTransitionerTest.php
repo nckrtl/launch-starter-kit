@@ -5,13 +5,17 @@ use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitIssueCompletionTransitioner;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
+use App\Delivery\Contracts\OrbitPlanningResolutionIssueProvider;
+use App\Delivery\Contracts\OrbitPlanningResolutionTransitioner;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\Data\OrbitIssueSnapshot;
+use App\Delivery\Data\OrbitPlanningResolutionCorrection;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use Illuminate\Support\Facades\Process;
 
-final class TransitionReadBackIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitIssueProvider
+final class TransitionReadBackIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitIssueProvider, OrbitPlanningResolutionIssueProvider
 {
     /** @var list<array{issue_id: string, issue_key: string}> */
     public array $requests = [];
@@ -37,6 +41,11 @@ final class TransitionReadBackIssueProvider implements OrbitActiveIssueProvider,
     }
 
     public function fetchForCloseout(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        return $this->fetch($issueId, $issueKey);
+    }
+
+    public function fetchForPlanningResolution(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         return $this->fetch($issueId, $issueKey);
     }
@@ -91,6 +100,11 @@ function transitionSnapshot(string $state = 'Todo', ?string $contractHash = null
                 'name' => 'Done',
                 'type' => 'completed',
             ],
+            'Backlog' => [
+                'id' => '88888888-9999-4aaa-8bbb-cccccccccccc',
+                'name' => 'Backlog',
+                'type' => 'backlog',
+            ],
             default => [
                 'id' => '55555555-6666-4777-8888-999999999999',
                 'name' => 'Todo',
@@ -106,6 +120,7 @@ function transitionSnapshot(string $state = 'Todo', ?string $contractHash = null
                 ['id' => '44444444-5555-4666-8777-888888888888', 'name' => 'In Progress'],
                 ['id' => '66666666-7777-4888-8999-aaaaaaaaaaaa', 'name' => 'In Review'],
                 ['id' => '77777777-8888-4999-8aaa-bbbbbbbbbbbb', 'name' => 'Done'],
+                ['id' => '88888888-9999-4aaa-8bbb-cccccccccccc', 'name' => 'Backlog'],
             ]],
         ],
         'labels' => ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]],
@@ -129,6 +144,7 @@ function bindTransitionReadBack(OrbitIssueSnapshot $snapshot): TransitionReadBac
     app()->instance(OrbitIssueProvider::class, $provider);
     app()->instance(OrbitActiveIssueProvider::class, $provider);
     app()->instance(OrbitCloseoutIssueProvider::class, $provider);
+    app()->instance(OrbitPlanningResolutionIssueProvider::class, $provider);
 
     return $provider;
 }
@@ -142,6 +158,249 @@ function completedTransitionSnapshot(?string $contractHash = null, array $overri
         ...$overrides,
     ]);
 }
+
+function planningResolutionCorrection(OrbitIssueSnapshot $current, string $description): OrbitPlanningResolutionCorrection
+{
+    $correctedPayload = $current->payload;
+    $correctedPayload['description'] = $description;
+
+    return new OrbitPlanningResolutionCorrection(
+        issueId: $current->issueId,
+        issueKey: $current->issueKey,
+        resolutionReceiptHash: str_repeat('b', 64),
+        currentContractHash: $current->contractHash,
+        correctedContractHash: app(OrbitIssueSnapshotFactory::class)->contractHash($correctedPayload),
+        correctedDescription: $description,
+        correctedDescriptionHash: hash('sha256', $description),
+    );
+}
+
+it('moves an exact planning correction through Backlog to Todo with read-back at each stage', function () {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $original = transitionSnapshot('In Progress', overrides: [
+        'assignee' => ['id' => transitionNickId()],
+    ]);
+    $original = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $original->payload,
+        $factory->contractHash($original->payload),
+    );
+    $description = "## Outcome\n\nUse the accepted boundary.";
+    $correction = planningResolutionCorrection($original, $description);
+    $backlogPayload = transitionSnapshot('Backlog')->payload;
+    $backlogPayload['description'] = $description;
+    $backlogPayload['assignee'] = ['id' => transitionNickId()];
+    $backlogPayload['updatedAt'] = '2026-09-12T10:01:00.000Z';
+    $correctedHash = $factory->contractHash($backlogPayload);
+    $backlog = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $backlogPayload,
+        $correctedHash,
+    );
+    $todoPayload = $backlogPayload;
+    $todoPayload['state'] = transitionSnapshot('Todo')->payload['state'];
+    $todoPayload['assignee'] = null;
+    $todoPayload['updatedAt'] = '2026-09-12T10:02:00.000Z';
+    $todo = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $todoPayload,
+        $correctedHash,
+    );
+    $provider = bindTransitionReadBack($original);
+    Process::fake(function ($process) use ($provider, $backlog, $todo) {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+        $stateId = is_array($input) ? ($input['variables']['input']['stateId'] ?? null) : null;
+        $provider->snapshot = $stateId === '88888888-9999-4aaa-8bbb-cccccccccccc'
+            ? $backlog
+            : $todo;
+
+        return Process::result(output: '{"data":{"issueUpdate":{"success":true}}}');
+    })->preventStrayProcesses();
+
+    $result = app(OrbitPlanningResolutionTransitioner::class)
+        ->applyPlanningResolution($original, $correction);
+
+    expect($result)->toBe($todo)
+        ->and($provider->requests)->toHaveCount(2);
+    Process::assertRanTimes(fn () => true, 2);
+    Process::assertRan(function ($process) use ($description): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input) && ($input['variables']['input'] ?? null) === [
+            'stateId' => '88888888-9999-4aaa-8bbb-cccccccccccc',
+            'description' => $description,
+        ];
+    });
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input) && ($input['variables']['input'] ?? null) === [
+            'stateId' => '55555555-6666-4777-8888-999999999999',
+            'assigneeId' => null,
+        ];
+    });
+});
+
+it('resumes an exact corrected Backlog issue without repeating the description mutation', function () {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $original = transitionSnapshot('In Progress', overrides: [
+        'assignee' => ['id' => transitionNickId()],
+    ]);
+    $original = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $original->payload,
+        $factory->contractHash($original->payload),
+    );
+    $description = "## Outcome\n\nUse the accepted boundary.";
+    $correction = planningResolutionCorrection($original, $description);
+    $backlogPayload = $original->payload;
+    $backlogPayload['description'] = $description;
+    $backlogPayload['state'] = transitionSnapshot('Backlog')->payload['state'];
+    $backlogPayload['updatedAt'] = '2026-09-12T10:01:00.000Z';
+    $backlog = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $backlogPayload,
+        $correction->correctedContractHash,
+    );
+    $todoPayload = $backlogPayload;
+    $todoPayload['state'] = transitionSnapshot('Todo')->payload['state'];
+    $todoPayload['assignee'] = null;
+    $todoPayload['updatedAt'] = '2026-09-12T10:02:00.000Z';
+    $todo = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $todoPayload,
+        $correction->correctedContractHash,
+    );
+    $provider = bindTransitionReadBack($todo);
+    Process::fake(['*' => Process::result(output: '{"data":{"issueUpdate":{"success":true}}}')])
+        ->preventStrayProcesses();
+
+    expect(app(OrbitPlanningResolutionTransitioner::class)
+        ->applyPlanningResolution($backlog, $correction))->toBe($todo)
+        ->and($provider->requests)->toHaveCount(1);
+    Process::assertRanTimes(fn () => true, 1);
+});
+
+it('rejects unrelated issue-contract drift after a planning correction starts', function () {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $original = transitionSnapshot('In Progress');
+    $original = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $original->payload,
+        $factory->contractHash($original->payload),
+    );
+    $description = "## Outcome\n\nUse the accepted boundary.";
+    $correction = planningResolutionCorrection($original, $description);
+    $driftedPayload = $original->payload;
+    $driftedPayload['description'] = $description;
+    $driftedPayload['title'] = 'An unrelated title edit';
+    $driftedPayload['state'] = transitionSnapshot('Backlog')->payload['state'];
+    $drifted = new OrbitIssueSnapshot(
+        $original->issueId,
+        $original->issueKey,
+        $driftedPayload,
+        $factory->contractHash($driftedPayload),
+    );
+    bindTransitionReadBack($drifted);
+    Process::fake()->preventStrayProcesses();
+
+    expect(fn () => app(OrbitPlanningResolutionTransitioner::class)
+        ->applyPlanningResolution($drifted, $correction))
+        ->toThrow(OrbitIssueTransitionFailed::class, 'not at an exact recoverable Linear stage');
+    Process::assertNothingRan();
+});
+
+it('replays an already corrected Todo planning resolution without another mutation', function () {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $description = "## Outcome\n\nUse the accepted boundary.";
+    $payload = transitionSnapshot('Todo')->payload;
+    $payload['description'] = $description;
+    $todo = new OrbitIssueSnapshot(
+        transitionIssueId(),
+        'ORB-234',
+        $payload,
+        $factory->contractHash($payload),
+    );
+    $correction = new OrbitPlanningResolutionCorrection(
+        issueId: $todo->issueId,
+        issueKey: $todo->issueKey,
+        resolutionReceiptHash: str_repeat('b', 64),
+        currentContractHash: str_repeat('a', 64),
+        correctedContractHash: $todo->contractHash,
+        correctedDescription: $description,
+        correctedDescriptionHash: hash('sha256', $description),
+    );
+    bindTransitionReadBack($todo);
+    Process::fake()->preventStrayProcesses();
+
+    expect(app(OrbitPlanningResolutionTransitioner::class)
+        ->applyPlanningResolution($todo, $correction))->toBe($todo);
+    Process::assertNothingRan();
+});
+
+it('clears a retained Nick assignment from an already corrected Todo issue', function () {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $description = "## Outcome\n\nUse the accepted boundary.";
+    $assignedPayload = transitionSnapshot('Todo')->payload;
+    $assignedPayload['description'] = $description;
+    $assignedPayload['assignee'] = ['id' => transitionNickId()];
+    $assigned = new OrbitIssueSnapshot(
+        transitionIssueId(),
+        'ORB-234',
+        $assignedPayload,
+        $factory->contractHash($assignedPayload),
+    );
+    $clearedPayload = $assignedPayload;
+    $clearedPayload['assignee'] = null;
+    $clearedPayload['updatedAt'] = '2026-09-12T10:03:00.000Z';
+    $cleared = new OrbitIssueSnapshot(
+        transitionIssueId(),
+        'ORB-234',
+        $clearedPayload,
+        $factory->contractHash($clearedPayload),
+    );
+    $correction = new OrbitPlanningResolutionCorrection(
+        issueId: $assigned->issueId,
+        issueKey: $assigned->issueKey,
+        resolutionReceiptHash: str_repeat('b', 64),
+        currentContractHash: str_repeat('a', 64),
+        correctedContractHash: $assigned->contractHash,
+        correctedDescription: $description,
+        correctedDescriptionHash: hash('sha256', $description),
+    );
+    $provider = bindTransitionReadBack($cleared);
+    Process::fake(['*' => Process::result(output: '{"data":{"issueUpdate":{"success":true}}}')])
+        ->preventStrayProcesses();
+
+    $result = app(OrbitPlanningResolutionTransitioner::class)
+        ->applyPlanningResolution($assigned, $correction);
+
+    expect($result)->toBe($cleared)
+        ->and($provider->requests)->toHaveCount(1);
+    Process::assertRan(function ($process): bool {
+        $input = is_string($process->input)
+            ? json_decode($process->input, true, flags: JSON_THROW_ON_ERROR)
+            : null;
+
+        return is_array($input) && ($input['variables']['input'] ?? null) === [
+            'stateId' => '55555555-6666-4777-8888-999999999999',
+            'assigneeId' => null,
+        ];
+    });
+});
 
 it('moves an In Review issue to Done and clears both owners', function () {
     $provider = bindTransitionReadBack(transitionSnapshot('In Review'));

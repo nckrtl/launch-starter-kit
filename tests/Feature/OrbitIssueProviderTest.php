@@ -3,6 +3,7 @@
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitIssueResolver;
+use App\Delivery\Contracts\OrbitPlanningResolutionIssueProvider;
 use App\Delivery\Exceptions\OrbitIssueProviderFailed;
 use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
@@ -309,6 +310,64 @@ it('reads an active In Review issue with the exact temporary PR-author assignmen
             'id' => '691cb14c-60d5-415a-a5c7-a7c19fe83424',
         ]);
 });
+
+it('reads only exact recoverable planning-resolution states and known ownership', function (
+    string $stateName,
+    string $stateType,
+    bool $assigned,
+) {
+    fakeProviderResponse(providerResponse([
+        'state' => [
+            'id' => '88888888-9999-4aaa-8bbb-cccccccccccc',
+            'name' => $stateName,
+            'type' => $stateType,
+        ],
+        'assignee' => $assigned
+            ? ['id' => '691cb14c-60d5-415a-a5c7-a7c19fe83424']
+            : null,
+    ]));
+
+    $snapshot = app(OrbitPlanningResolutionIssueProvider::class)
+        ->fetchForPlanningResolution(providerIssueId(), 'ORB-234');
+
+    expect($snapshot->payload['state']['name'])->toBe($stateName)
+        ->and($snapshot->payload['state']['type'])->toBe($stateType)
+        ->and($snapshot->payload['assignee'] === null)->toBe(! $assigned);
+})->with([
+    'original In Progress issue' => ['In Progress', 'started', true],
+    'corrected Backlog issue' => ['Backlog', 'backlog', true],
+    'corrected Todo issue' => ['Todo', 'unstarted', false],
+]);
+
+it('rejects planning-resolution state, ownership, and contract holds', function (array $overrides) {
+    fakeProviderResponse(providerResponse($overrides));
+
+    expect(fn () => app(OrbitPlanningResolutionIssueProvider::class)
+        ->fetchForPlanningResolution(providerIssueId(), 'ORB-234'))
+        ->toThrow(OrbitIssueProviderFailed::class, 'planning-resolution issue');
+})->with([
+    'mismatched state type' => [[
+        'state' => [
+            'id' => '88888888-9999-4aaa-8bbb-cccccccccccc',
+            'name' => 'Backlog',
+            'type' => 'started',
+        ],
+    ]],
+    'unrecoverable state' => [[
+        'state' => [
+            'id' => '66666666-7777-4888-8999-aaaaaaaaaaaa',
+            'name' => 'In Review',
+            'type' => 'started',
+        ],
+    ]],
+    'unexpected assignee' => [[
+        'assignee' => ['id' => 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'],
+    ]],
+    'missing delegate' => [['delegate' => null]],
+    'readiness hold' => [[
+        'description' => "## Outcome\n\nNo.\n\n## Readiness\n\nDecision needed.",
+    ]],
+]);
 
 it('keeps new-delivery issue reads restricted while active reads reject unexpected ownership', function () {
     $inReview = [

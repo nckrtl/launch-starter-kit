@@ -102,6 +102,17 @@ project and rechecking capacity. Malformed evidence stays blocked. Planning
 resolutions remain advisory and require an explicit decision; they are not adopted
 as issue, ADR, or flow changes automatically.
 
+An explicit, checked-in planning-resolution correction may retire one exact
+blocked delivery without rewriting its immutable preparation history. The
+catalog binds the issue identity, resolution receipt, original contract,
+corrected description, and corrected contract by hash. Commander moves only
+that issue through authoritative Backlog and Todo read-backs, clears the
+temporary assignee, shuts down the retained workspace, removes the contained
+worktree, and terminalizes the old delivery as `planning_resolution_restarted`.
+Normal Todo admission then creates a fresh delivery from the corrected
+contract. Drift remains blocked, and this path does not make planning
+resolutions generally self-adopting.
+
 Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
 repository checks still support only discovery. Before proof is enabled, move
 the potentially hour-long topology operation out of the 540-second landing job
