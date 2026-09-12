@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
+use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
+use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -148,10 +150,21 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
             return;
         }
 
+        $dispatch = $dispatches->firstOrFail();
+
+        if ($dispatch->status === AgentDispatchStatus::Settled
+            && $phase->receipts()
+                ->where('validation_status', ReceiptValidationStatus::Valid)
+                ->exists()) {
+            AdvanceDelivery::dispatch($delivery->id);
+
+            return;
+        }
+
         ReconcileDelivery::dispatch(
             $delivery->id,
             $phase->id,
-            $dispatches->firstOrFail()->id,
+            $dispatch->id,
         );
     }
 

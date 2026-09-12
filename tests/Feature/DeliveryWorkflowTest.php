@@ -4,6 +4,7 @@ use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\CaptureHarmlessReceipt;
 use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
+use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\CandidateCheck;
@@ -15,9 +16,12 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Jobs\AdvanceDelivery;
+use App\Jobs\ReconcileDeliveries;
+use App\Jobs\ReconcileDelivery;
 use App\Models\AgentDispatch;
 use App\Models\ExternalEvent;
 use App\Models\PhaseRun;
+use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Contracts\Queue\ShouldQueueAfterCommit;
 use Illuminate\Foundation\Testing\RefreshDatabase;
@@ -401,6 +405,42 @@ it('marks a missing receipt as actionable and recovers when the receipt arrives 
 
     expect($phase->fresh()->status)->toBe(PhaseRunStatus::Completed)
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued);
+});
+
+it('completes a transition recovered from a lost receipt continuation enqueue', function () {
+    Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
+    $action = app(AdvanceDeliveryAction::class);
+    (new AdvanceDelivery($this->delivery->id))->handle($action);
+    $phase = PhaseRun::sole();
+    $dispatch = AgentDispatch::sole();
+    $dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+    $payload = workflowReceipt($phase);
+    Receipt::create([
+        'phase_run_id' => $phase->id,
+        'kind' => 'herdr_test',
+        'schema_version' => 1,
+        'payload' => $payload,
+        'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+        'candidate_sha' => $payload['head_sha'],
+        'validation_status' => ReceiptValidationStatus::Valid,
+        'captured_at' => now(),
+        'validated_at' => now(),
+    ]);
+
+    (new ReconcileDeliveries)->handle(app(RecoverExhaustedOrbitPlanningCorrection::class));
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $job): bool => $job->deliveryId === $this->delivery->id,
+    );
+
+    (new AdvanceDelivery($this->delivery->id))->handle($action);
+
+    expect($phase->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->current_phase)->toBe('herdr_confirm');
 });
 
 it('reconciles an ambiguous deterministic agent start without starting a second agent', function () {
