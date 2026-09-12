@@ -174,10 +174,21 @@ final readonly class OrbitPullRequestReviewSourceValidator
 
     private function reviewAttempt(PhaseRun $implementation): int
     {
-        return $implementation->attempt === 2
-            && is_array($implementation->input)
-            && array_key_exists('pr_review_receipt_id', $implementation->input)
-                ? 2
-                : 1;
+        if ($implementation->attempt !== 2) {
+            return 1;
+        }
+
+        if (is_array($implementation->input)
+            && array_key_exists('pr_review_receipt_id', $implementation->input)) {
+            return 2;
+        }
+
+        return PhaseRun::query()
+            ->where('delivery_id', $implementation->delivery_id)
+            ->where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+            ->where('attempt', 1)
+            ->where('status', PhaseRunStatus::Failed)
+            ->where('failure_code', 'pr_review_mergeability_changed')
+            ->exists() ? 2 : 1;
     }
 }

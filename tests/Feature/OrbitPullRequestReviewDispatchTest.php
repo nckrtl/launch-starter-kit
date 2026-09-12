@@ -752,6 +752,78 @@ function promotePullRequestReviewSourceToCorrection(object $test): void
     $test->pullRequests->body = $body;
 }
 
+function promotePullRequestReviewSourceFromLateConflict(object $test): void
+{
+    promotePullRequestReviewSourceToCorrection($test);
+    $correction = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 2)
+        ->sole();
+    $receipt = $correction->receipts()->where('kind', 'orbit_implementation')->sole();
+    $test->implementation->forceFill(['output' => [
+        'receipt_id' => $test->implementationReceipt->id,
+        'result' => 'ready',
+        'pull_request_number' => 42,
+        'pull_request_url' => 'https://github.com/nckrtl/orbit/pull/42',
+        'mergeable' => true,
+    ]])->save();
+    $test->review->forceFill([
+        'status' => PhaseRunStatus::Failed,
+        'input' => [
+            'implementation_receipt_id' => $test->implementationReceipt->id,
+            'implementation_receipt' => $test->implementationPayload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => true,
+            ],
+        ],
+        'failure_code' => 'pr_review_mergeability_changed',
+        'failure_message' => 'The published pull request became unmergeable before independent review.',
+        'finished_at' => now(),
+    ])->save();
+    $test->dispatch->forceFill([
+        'status' => AgentDispatchStatus::Failed,
+        'error_code' => 'pr_review_mergeability_changed',
+        'error_message' => 'The published pull request became unmergeable before independent review.',
+    ])->save();
+    $test->review = PhaseRun::query()->create([
+        'delivery_id' => $test->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'attempt' => 2,
+        'status' => PhaseRunStatus::Pending,
+        'input' => [
+            'implementation_receipt_id' => $receipt->id,
+            'implementation_receipt' => $receipt->payload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => true,
+            ],
+        ],
+    ]);
+    $test->dispatch = AgentDispatch::query()->create([
+        'phase_run_id' => $test->review->id,
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $test->delivery->id,
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+            2,
+            OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-pr-review-2',
+        'prompt_name' => 'orbit_pr_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Pending,
+    ]);
+    $test->delivery->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'status' => DeliveryStatus::Queued,
+    ])->save();
+    $test->herdr->agentName = 'orb-234-loop-pr-review-2';
+}
+
 function promotePullRequestReviewToSecondRound(object $test): void
 {
     $firstReviewPrompt = app(OrbitFeatureWorkflow::class)->pullRequestReviewPrompt(
@@ -985,6 +1057,19 @@ it('dispatches a distinct independent reviewer for the second review round', fun
         )
         ->and($this->transitions->calls)->toBe(2)
         ->and($this->repository->reservationIsHeld())->toBeFalse();
+});
+
+it('dispatches review attempt two after a late merge-conflict correction', function () {
+    promotePullRequestReviewSourceFromLateConflict($this);
+
+    $result = app(DispatchOrbitPullRequestReview::class)->handle($this->delivery->id, $this->review->id);
+
+    expect($result->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($result->herdr_agent_name)->toBe('orb-234-loop-pr-review-2')
+        ->and($this->herdr->prompts[0])->toContain(
+            '"attempt": 2',
+            '"candidate_sha": "'.str_repeat('e', 40).'"',
+        );
 });
 
 it('rejects an older implementation receipt when a later implementation phase exists', function () {
