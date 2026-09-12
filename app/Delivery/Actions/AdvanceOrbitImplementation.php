@@ -20,6 +20,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitImplementationAdvancementFailed;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitImplementationReceiptValidator;
@@ -40,6 +41,7 @@ final readonly class AdvanceOrbitImplementation
         private OrbitIssueProvider $issues,
         private OrbitPullRequestPublisher $pullRequests,
         private OrbitImplementationReceiptValidator $receipts,
+        private OrbitIssueSnapshotFactory $snapshots,
     ) {}
 
     /** Return true when GitHub mergeability needs another bounded queue attempt. */
@@ -105,7 +107,7 @@ final readonly class AdvanceOrbitImplementation
                 $preparation->snapshot->issueId,
                 $preparation->snapshot->issueKey,
             );
-            $this->assertCurrentIssue($preparation->snapshot, $issue);
+            $this->assertCurrentIssue($delivery, $preparation->snapshot, $issue);
             $verified = $this->implementations->verifyImplementationOutcome(
                 $config,
                 $preparation->worktree,
@@ -192,13 +194,20 @@ final readonly class AdvanceOrbitImplementation
         return [$phase, $dispatch, $receipt];
     }
 
-    private function assertCurrentIssue(PreparedIssueSnapshot $expected, OrbitIssueSnapshot $issue): void
-    {
+    private function assertCurrentIssue(
+        Delivery $delivery,
+        PreparedIssueSnapshot $expected,
+        OrbitIssueSnapshot $issue,
+    ): void {
         $state = $issue->payload['state'] ?? null;
 
         if ($issue->issueId !== $expected->issueId
             || $issue->issueKey !== $expected->issueKey
-            || ! hash_equals($expected->contractHash, $issue->contractHash)
+            || ! $this->snapshots->matchesExpectedContract(
+                $issue,
+                $expected->contractHash,
+                $delivery->pull_request_url,
+            )
             || ! is_array($state)
             || ($state['name'] ?? null) !== 'In Progress'
             || ($state['type'] ?? null) !== 'started') {

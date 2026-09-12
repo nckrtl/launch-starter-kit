@@ -25,6 +25,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitImplementationAdvancementFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\AdvanceDelivery;
@@ -421,6 +422,30 @@ function advancementComplete(PhaseRun $phase, Receipt $receipt, string $result):
         'started_at' => now(),
         'finished_at' => now(),
     ])->save();
+}
+
+function addImplementationPullRequestAttachment(object $test): void
+{
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $payload = $test->issues->snapshot->payload;
+    $payload['description'] = null;
+    $payload['labels'] = ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]];
+    $payload['attachments'] = ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]];
+    $expectedContractHash = $factory->contractHash($payload);
+    $planning = PhaseRun::query()->oldest('id')->firstOrFail();
+    $input = $planning->input;
+    $input['issue_snapshot']['contract_sha256'] = $expectedContractHash;
+    $planning->forceFill(['input' => $input])->save();
+    $payload['attachments']['nodes'] = [[
+        'title' => $test->issues->snapshot->issueKey.': '.$payload['title'],
+        'url' => $test->delivery->pull_request_url,
+    ]];
+    $test->issues->snapshot = new OrbitIssueSnapshot(
+        $test->issues->snapshot->issueId,
+        $test->issues->snapshot->issueKey,
+        $payload,
+        $factory->contractHash($payload),
+    );
 }
 
 function promoteImplementationAdvancementToCorrection(object $test, string $result = 'ready'): void
@@ -870,6 +895,18 @@ it('publishes the corrected candidate to the same pull request and creates one P
         ->and($this->issues->calls)->toBe(1)
         ->and($this->pullRequests->calls)->toBe(1)
         ->and(PhaseRun::where('phase_name', OrbitFeatureWorkflow::PR_REVIEW_PHASE)->count())->toBe(1);
+});
+
+it('allows the known pull request attachment while advancing a corrected candidate', function () {
+    promoteImplementationAdvancementToCorrection($this);
+    addImplementationPullRequestAttachment($this);
+
+    expect(app(AdvanceOrbitImplementation::class)->handle($this->delivery->id))->toBeFalse();
+
+    expect($this->correction->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PR_REVIEW_PHASE)
+        ->and($this->verifier->calls)->toBe(1)
+        ->and($this->pullRequests->calls)->toBe(1);
 });
 
 it('publishes a review correction and creates the second independent review intent', function () {
