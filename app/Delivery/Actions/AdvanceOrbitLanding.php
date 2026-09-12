@@ -35,6 +35,7 @@ use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitLandingAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPlanningHandoffFailed;
 use App\Delivery\Exceptions\OrbitPullRequestLandingFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPullRequestReviewReceiptValidator;
 use App\Delivery\Workflow\OrbitPullRequestReviewSourceValidator;
@@ -68,6 +69,7 @@ final readonly class AdvanceOrbitLanding
         private ShutdownOrbitHerdrWorkspace $workspaceShutdown,
         private OrbitWorktreeCleaner $worktreeCleaner,
         private OrbitIssueCompletionTransitioner $issueCompletion,
+        private OrbitIssueSnapshotFactory $snapshots,
     ) {}
 
     /** Return a delay when the same queued job should retry a non-failing wait. */
@@ -130,6 +132,7 @@ final readonly class AdvanceOrbitLanding
             [$phase, $review, $implementation] = $intent;
             $verified = $this->verifyImplementation($config, $preparation, $implementation);
             $this->assertCurrentIssue(
+                $delivery,
                 $preparation,
                 $this->issues->fetchActive(
                     $preparation->snapshot->issueId,
@@ -863,6 +866,7 @@ final readonly class AdvanceOrbitLanding
     }
 
     private function assertCurrentIssue(
+        Delivery $delivery,
         OrbitDeliveryPreparation $preparation,
         OrbitIssueSnapshot $issue,
     ): void {
@@ -872,7 +876,11 @@ final readonly class AdvanceOrbitLanding
 
         if ($issue->issueId !== $preparation->snapshot->issueId
             || $issue->issueKey !== $preparation->snapshot->issueKey
-            || ! hash_equals($preparation->snapshot->contractHash, $issue->contractHash)
+            || ! $this->snapshots->matchesExpectedContract(
+                $issue,
+                $preparation->snapshot->contractHash,
+                $delivery->pull_request_url,
+            )
             || ! is_array($state) || ($state['name'] ?? null) !== 'In Review'
             || ($state['type'] ?? null) !== 'started'
             || ! is_string($viewerId)
@@ -1897,7 +1905,8 @@ final readonly class AdvanceOrbitLanding
         $delivery = $this->delivery($deliveryId);
         $intent = $this->landingIntent($delivery, $phaseId);
         $phase = $intent[0] ?? null;
-        $expected = $this->preparations->startup($delivery)->snapshot;
+        $preparation = $this->preparations->startup($delivery);
+        $expected = $preparation->snapshot;
 
         if ($phase === null || $phase->current_block !== 'linear_closeout') {
             throw new OrbitLandingAdvancementFailed(
@@ -1905,10 +1914,13 @@ final readonly class AdvanceOrbitLanding
             );
         }
 
+        $current = $this->issues->fetchActive($expected->issueId, $expected->issueKey);
+        $this->assertCurrentIssue($delivery, $preparation, $current);
+
         $completed = $this->issueCompletion->transitionToDone(
             $expected->issueId,
             $expected->issueKey,
-            $expected->contractHash,
+            $current->contractHash,
         );
         $state = $completed->payload['state'] ?? null;
 

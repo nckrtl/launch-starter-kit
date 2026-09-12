@@ -227,6 +227,38 @@ it('changes the controller contract hash for planning-relevant issue fields', fu
     ]]],
 ]);
 
+it('allows only the known Linear pull request attachment after publication', function () {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $baseline = $factory->make(providerResponse(), providerIssueId(), 'ORB-234', providerViewerId());
+    $pullRequestUrl = 'https://github.com/nckrtl/orbit/pull/42';
+    $withPullRequest = $factory->make(providerResponse(['attachments' => [
+        'nodes' => [
+            ...providerIssue()['attachments']['nodes'],
+            ['title' => 'ORB-234: Build the delivery boundary', 'url' => $pullRequestUrl],
+        ],
+        'pageInfo' => ['hasNextPage' => false],
+    ]]), providerIssueId(), 'ORB-234', providerViewerId());
+    $withUnexpectedAttachment = $factory->make(providerResponse(['attachments' => [
+        'nodes' => [
+            ...providerIssue()['attachments']['nodes'],
+            ['title' => 'ORB-234: Build the delivery boundary', 'url' => $pullRequestUrl],
+            ['title' => 'Unexpected', 'url' => 'https://example.test/unexpected'],
+        ],
+        'pageInfo' => ['hasNextPage' => false],
+    ]]), providerIssueId(), 'ORB-234', providerViewerId());
+
+    expect($factory->matchesExpectedContract(
+        $withPullRequest,
+        $baseline->contractHash,
+        $pullRequestUrl,
+    ))->toBeTrue()
+        ->and($factory->matchesExpectedContract(
+            $withUnexpectedAttachment,
+            $baseline->contractHash,
+            $pullRequestUrl,
+        ))->toBeFalse();
+});
+
 it('rejects an issue response with different stable identity', function (array $overrides) {
     fakeProviderResponse(providerResponse($overrides));
 

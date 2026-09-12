@@ -12,6 +12,7 @@ use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitPullRequestReviewDispatchFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPullRequestReviewSourceValidator;
@@ -26,6 +27,7 @@ final readonly class RecoverOrbitPullRequestReviewTransition
         private ResolveOrbitDeliveryPreparation $preparations,
         private OrbitActiveIssueProvider $issues,
         private OrbitPullRequestReviewSourceValidator $sources,
+        private OrbitIssueSnapshotFactory $snapshots,
     ) {}
 
     public function handle(int $deliveryId): PhaseRun
@@ -41,7 +43,7 @@ final readonly class RecoverOrbitPullRequestReviewTransition
             $preparation->snapshot->issueId,
             $preparation->snapshot->issueKey,
         );
-        $this->assertExactInReview($preparation, $issue);
+        $this->assertExactInReview($delivery, $preparation, $issue);
 
         return DB::transaction(function () use ($deliveryId): PhaseRun {
             $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
@@ -122,6 +124,7 @@ final readonly class RecoverOrbitPullRequestReviewTransition
     }
 
     private function assertExactInReview(
+        Delivery $delivery,
         OrbitDeliveryPreparation $preparation,
         OrbitIssueSnapshot $issue,
     ): void {
@@ -131,7 +134,11 @@ final readonly class RecoverOrbitPullRequestReviewTransition
 
         if ($issue->issueId !== $preparation->snapshot->issueId
             || $issue->issueKey !== $preparation->snapshot->issueKey
-            || ! hash_equals($preparation->snapshot->contractHash, $issue->contractHash)
+            || ! $this->snapshots->matchesExpectedContract(
+                $issue,
+                $preparation->snapshot->contractHash,
+                $delivery->pull_request_url,
+            )
             || ! is_array($state)
             || ($state['name'] ?? null) !== 'In Review'
             || ($state['type'] ?? null) !== 'started'

@@ -25,6 +25,7 @@ use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPullRequestReviewDispatchFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPullRequestReviewSourceValidator;
@@ -48,6 +49,7 @@ final readonly class DispatchOrbitPullRequestReview
         private HerdrRuntime $herdr,
         private OrbitFeatureWorkflow $workflow,
         private OrbitPullRequestReviewSourceValidator $sources,
+        private OrbitIssueSnapshotFactory $snapshots,
     ) {}
 
     public function handle(int $deliveryId, ?int $expectedPhaseId = null): AgentDispatch
@@ -93,12 +95,12 @@ final readonly class DispatchOrbitPullRequestReview
                 $preparation->snapshot->issueId,
                 $preparation->snapshot->issueKey,
             );
-            $this->assertCurrentIssue($preparation, $currentIssue, false);
+            $this->assertCurrentIssue($delivery, $preparation, $currentIssue, false);
 
             try {
                 $reviewIssue = $this->transitions->transitionToInReview(
                     $currentIssue,
-                    $preparation->snapshot->contractHash,
+                    $currentIssue->contractHash,
                 );
             } catch (OrbitIssueTransitionFailed $exception) {
                 $this->markBlocked(
@@ -116,7 +118,7 @@ final readonly class DispatchOrbitPullRequestReview
                 );
             }
 
-            $this->assertCurrentIssue($preparation, $reviewIssue, true);
+            $this->assertCurrentIssue($delivery, $preparation, $reviewIssue, true);
 
             if (! $this->claim($dispatch)) {
                 throw new OrbitPullRequestReviewDispatchFailed(
@@ -433,6 +435,7 @@ final readonly class DispatchOrbitPullRequestReview
     }
 
     private function assertCurrentIssue(
+        Delivery $delivery,
         OrbitDeliveryPreparation $preparation,
         OrbitIssueSnapshot $issue,
         bool $inReview,
@@ -453,7 +456,11 @@ final readonly class DispatchOrbitPullRequestReview
 
         if ($issue->issueId !== $preparation->snapshot->issueId
             || $issue->issueKey !== $preparation->snapshot->issueKey
-            || ! hash_equals($preparation->snapshot->contractHash, $issue->contractHash)
+            || ! $this->snapshots->matchesExpectedContract(
+                $issue,
+                $preparation->snapshot->contractHash,
+                $delivery->pull_request_url,
+            )
             || ! is_string($viewerId) || ! is_string($nickId)
             || ! is_array($delegate) || ($delegate['id'] ?? null) !== $viewerId
             || ! array_key_exists('assignee', $issue->payload)
@@ -564,9 +571,9 @@ final readonly class DispatchOrbitPullRequestReview
             );
             $issue = $this->transitions->transitionToInReview(
                 $issue,
-                $preparation->snapshot->contractHash,
+                $issue->contractHash,
             );
-            $this->assertCurrentIssue($preparation, $issue, true);
+            $this->assertCurrentIssue($freshDelivery, $preparation, $issue, true);
         } catch (Exception $exception) {
             $this->markBlocked(
                 $delivery,

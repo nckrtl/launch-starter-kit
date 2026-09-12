@@ -97,6 +97,47 @@ final readonly class OrbitIssueSnapshotFactory
         );
     }
 
+    public function matchesExpectedContract(
+        OrbitIssueSnapshot $snapshot,
+        string $expectedContractHash,
+        ?string $pullRequestUrl = null,
+    ): bool {
+        if (hash_equals($expectedContractHash, $snapshot->contractHash)) {
+            return true;
+        }
+
+        if ($pullRequestUrl === null) {
+            return false;
+        }
+
+        $payload = $snapshot->payload;
+        $attachments = $payload['attachments'] ?? null;
+        $nodes = is_array($attachments) ? ($attachments['nodes'] ?? null) : null;
+        $title = $payload['title'] ?? null;
+
+        if (! is_array($nodes) || ! is_string($title)) {
+            return false;
+        }
+
+        $expectedTitle = $snapshot->issueKey.': '.$title;
+        $matches = array_keys(array_filter(
+            $nodes,
+            static fn (mixed $attachment): bool => is_array($attachment)
+                && ($attachment['title'] ?? null) === $expectedTitle
+                && ($attachment['url'] ?? null) === $pullRequestUrl,
+        ));
+
+        if (count($matches) !== 1) {
+            return false;
+        }
+
+        unset($nodes[$matches[0]]);
+        $attachments['nodes'] = array_values($nodes);
+        $payload['attachments'] = $attachments;
+
+        return hash_equals($expectedContractHash, $this->contractHash($payload));
+    }
+
     private function makeSnapshot(
         mixed $response,
         ?string $expectedIssueId,
@@ -317,28 +358,37 @@ final readonly class OrbitIssueSnapshotFactory
         return $normalized;
     }
 
-    /** @param OrbitIssuePayload $issue */
-    private function contractHash(array $issue): string
+    /** @param array<string, mixed> $issue */
+    public function contractHash(array $issue): string
     {
+        $labelsPayload = $this->map($issue['labels'] ?? null);
+        $attachmentsPayload = $this->map($issue['attachments'] ?? null);
         $labels = array_map(
-            static fn (array $label): string => str_replace('proof:incus', 'incus', $label['name']),
-            $issue['labels']['nodes'],
+            fn (mixed $label): string => str_replace(
+                'proof:incus',
+                'incus',
+                $this->requiredText($this->map($label)['name'] ?? null, 100),
+            ),
+            $this->limitedList($labelsPayload['nodes'] ?? null),
         );
         $labels = array_values(array_unique($labels));
         sort($labels);
 
         $attachments = array_map(
-            static fn (array $attachment): array => [$attachment['title'], $attachment['url']],
-            $issue['attachments']['nodes'],
+            fn (mixed $attachment): array => [
+                $this->requiredText($this->map($attachment)['title'] ?? null, 1_000),
+                $this->requiredText($this->map($attachment)['url'] ?? null, 2_048),
+            ],
+            $this->limitedList($attachmentsPayload['nodes'] ?? null),
         );
         sort($attachments);
 
         $contents = $this->pythonJson([
             'attachments' => $attachments,
-            'description' => $issue['description'],
-            'id' => $issue['id'],
+            'description' => $this->nullableText($issue['description'] ?? null, 100_000),
+            'id' => $this->requiredUuid($issue['id'] ?? null),
             'labels' => $labels,
-            'title' => $issue['title'],
+            'title' => $this->requiredText($issue['title'] ?? null, 1_000),
         ]);
 
         return hash('sha256', $contents);

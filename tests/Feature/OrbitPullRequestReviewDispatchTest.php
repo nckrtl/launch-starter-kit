@@ -31,6 +31,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPullRequestReviewDispatchFailed;
+use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Jobs\DispatchOrbitPullRequestReview as DispatchPullRequestReviewJob;
@@ -205,7 +206,7 @@ final class PullRequestReviewDispatchTransitioner implements OrbitReviewIssueTra
         string $expectedContractHash,
     ): OrbitIssueSnapshot {
         expect(DB::transactionLevel())->toBe($this->transactionLevel)
-            ->and($expectedContractHash)->toBe(str_repeat('d', 64));
+            ->and($expectedContractHash)->toBe($current->contractHash);
         $this->calls++;
 
         if ($this->fail) {
@@ -613,6 +614,34 @@ function prReviewComplete(PhaseRun $phase, Receipt $receipt, array $output): voi
     ])->save();
 }
 
+/** @param list<array{title: string, url: string}> $extraAttachments */
+function addKnownPullRequestAttachment(object $test, array $extraAttachments = []): void
+{
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $payload = $test->issues->snapshot->payload;
+    $payload['description'] = null;
+    $payload['labels'] = ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]];
+    $payload['attachments'] = ['nodes' => [], 'pageInfo' => ['hasNextPage' => false]];
+    $expectedContractHash = $factory->contractHash($payload);
+    $planning = PhaseRun::query()->oldest('id')->firstOrFail();
+    $input = $planning->input;
+    $input['issue_snapshot']['contract_sha256'] = $expectedContractHash;
+    $planning->forceFill(['input' => $input])->save();
+    $payload['attachments']['nodes'] = [
+        [
+            'title' => $test->issues->snapshot->issueKey.': '.$payload['title'],
+            'url' => $test->delivery->pull_request_url,
+        ],
+        ...$extraAttachments,
+    ];
+    $test->issues->snapshot = new OrbitIssueSnapshot(
+        $test->issues->snapshot->issueId,
+        $test->issues->snapshot->issueKey,
+        $payload,
+        $factory->contractHash($payload),
+    );
+}
+
 function promotePullRequestReviewSourceToCorrection(object $test): void
 {
     $test->implementation->forceFill(['output' => [
@@ -898,6 +927,16 @@ it('dispatches an independent reviewer with an exact immutable prompt', function
         ->and($this->repository->reservationIsHeld())->toBeFalse();
 });
 
+it('dispatches review when Linear adds only the known pull request attachment', function () {
+    addKnownPullRequestAttachment($this);
+
+    $result = app(DispatchOrbitPullRequestReview::class)->handle($this->delivery->id, $this->review->id);
+
+    expect($result->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($this->herdr->prompts)->toHaveCount(1)
+        ->and($this->transitions->calls)->toBe(2);
+});
+
 it('dispatches from the latest corrected implementation receipt', function () {
     promotePullRequestReviewSourceToCorrection($this);
 
@@ -1051,6 +1090,7 @@ it('rearms the same pull request review dispatch after exact Linear read-back', 
             'message' => 'The prior transition outcome was unresolved.',
         ],
     ])->save();
+    addKnownPullRequestAttachment($this);
     $payload = $this->issues->snapshot->payload;
     $payload['state'] = ['id' => 'state-review', 'name' => 'In Review', 'type' => 'started'];
     $payload['assignee'] = null;

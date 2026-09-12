@@ -1463,7 +1463,7 @@ it('lands one exact approved Orbit candidate and replays as a no-op', function (
         ])
         ->and($this->repository->reservationIsHeld())->toBeFalse()
         ->and($this->implementations->calls)->toBe(1)
-        ->and($this->issues->calls)->toBe(1)
+        ->and($this->issues->calls)->toBe(2)
         ->and($this->main->calls)->toBe(2)
         ->and($this->gateway->reserveCalls)->toBe(1)
         ->and($this->gateway->inspectCalls)->toBe(1)
