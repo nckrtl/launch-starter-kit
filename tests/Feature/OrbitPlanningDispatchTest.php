@@ -204,6 +204,8 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
 
     public ?HerdrAgentLaunch $launch = null;
 
+    public ?HerdrAgentIdentifiers $observedAgent = null;
+
     public ?string $startedAgentId = 'codex-session-1';
 
     public ?string $promptedAgentId = 'codex-session-1';
@@ -271,7 +273,7 @@ final class PlanningDispatchHerdrRuntime implements HerdrRuntime
     {
         $this->call('herdr.get');
 
-        return $this->identifiers($name, 40, $this->startedAgentId);
+        return $this->observedAgent ?? $this->identifiers($name, 40, $this->startedAgentId);
     }
 
     private function call(string $event): void
@@ -611,6 +613,133 @@ it('blocks an interrupted persisted startup without replaying external work', fu
             'stage' => 'planning_dispatch_starting',
         ])
         ->and($this->log->events)->toBe(['repository.reserve', 'repository.verify.1', 'linear.fetch', 'linear.transition', 'herdr.open', 'repository.reserve']);
+    Queue::assertNothingPushed();
+});
+
+it('reconciles a working planner after prompt delivery was interrupted without replaying the prompt', function () {
+    config()->set('herdr.orchestration.enabled', true);
+    config()->set('herdr.session', 'orbit');
+    $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+    $dispatch->forceFill([
+        'status' => AgentDispatchStatus::Starting,
+        'state_change_seq' => 40,
+        'error_code' => 'herdr_prompt_attempted',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'planning_dispatch_interrupted',
+            'dispatch_id' => $dispatch->id,
+            'stage' => 'herdr_prompt_attempted',
+        ],
+    ])->save();
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $dispatch->herdr_workspace_id,
+        tabId: (string) $dispatch->herdr_tab_id,
+        paneId: (string) $dispatch->herdr_pane_id,
+        terminalId: (string) $dispatch->herdr_terminal_id,
+        agentId: $dispatch->herdr_agent_id,
+        agentName: (string) $dispatch->herdr_agent_name,
+        stateChangeSeq: 43,
+        workingDirectory: $this->worktree,
+        agentStatus: 'working',
+    );
+    $this->herdr->prompts = [];
+    $this->log->events = [];
+
+    $reconciled = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+
+    expect($reconciled->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($reconciled->state_change_seq)->toBe(43)
+        ->and($reconciled->error_code)->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->herdr->prompts)->toBe([])
+        ->and($this->log->events)->toBe(['herdr.get'])
+        ->and(ExternalEvent::count())->toBe(0);
+    Queue::assertNothingPushed();
+});
+
+it('records and settles a terminal planner observation while recovering an interrupted prompt', function (string $status) {
+    config()->set('herdr.orchestration.enabled', true);
+    config()->set('herdr.session', 'orbit');
+    $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+    $dispatch->forceFill([
+        'status' => AgentDispatchStatus::Starting,
+        'state_change_seq' => 40,
+        'error_code' => 'herdr_prompt_attempted',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'planning_dispatch_interrupted',
+            'dispatch_id' => $dispatch->id,
+            'stage' => 'herdr_prompt_attempted',
+        ],
+    ])->save();
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $dispatch->herdr_workspace_id,
+        tabId: (string) $dispatch->herdr_tab_id,
+        paneId: (string) $dispatch->herdr_pane_id,
+        terminalId: (string) $dispatch->herdr_terminal_id,
+        agentId: $dispatch->herdr_agent_id,
+        agentName: (string) $dispatch->herdr_agent_name,
+        stateChangeSeq: 43,
+        workingDirectory: $this->worktree,
+        agentStatus: $status,
+    );
+    $this->herdr->prompts = [];
+    $this->log->events = [];
+
+    $reconciled = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+
+    expect($reconciled->status)->toBe(AgentDispatchStatus::Settled)
+        ->and($reconciled->state_change_seq)->toBe(43)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->herdr->prompts)->toBe([])
+        ->and($this->log->events)->toBe(['herdr.get'])
+        ->and(ExternalEvent::sole()->agent_dispatch_id)->toBe($dispatch->id)
+        ->and(ExternalEvent::sole()->processed_at)->not->toBeNull();
+    Queue::assertPushed(AdvanceDelivery::class, 1);
+})->with(['idle', 'done']);
+
+it('rejects an interrupted prompt observation that does not exactly match the retained planner', function () {
+    config()->set('herdr.orchestration.enabled', true);
+    config()->set('herdr.session', 'orbit');
+    $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+    $dispatch->forceFill([
+        'status' => AgentDispatchStatus::Starting,
+        'state_change_seq' => 40,
+        'error_code' => 'herdr_prompt_attempted',
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'planning_dispatch_interrupted',
+            'dispatch_id' => $dispatch->id,
+            'stage' => 'herdr_prompt_attempted',
+        ],
+    ])->save();
+    $this->herdr->observedAgent = new HerdrAgentIdentifiers(
+        workspaceId: (string) $dispatch->herdr_workspace_id,
+        tabId: (string) $dispatch->herdr_tab_id,
+        paneId: (string) $dispatch->herdr_pane_id,
+        terminalId: (string) $dispatch->herdr_terminal_id,
+        agentId: $dispatch->herdr_agent_id,
+        agentName: (string) $dispatch->herdr_agent_name,
+        stateChangeSeq: 40,
+        workingDirectory: '/fast/worktrees/orbit/another-issue',
+        agentStatus: 'working',
+    );
+    $this->herdr->prompts = [];
+
+    expect(fn () => app(DispatchOrbitPlanning::class)->handle($this->delivery->id))
+        ->toThrow(OrbitPlanningDispatchFailed::class, 'not safe to reconcile');
+
+    expect($dispatch->fresh()->status)->toBe(AgentDispatchStatus::Starting)
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->herdr->prompts)->toBe([]);
     Queue::assertNothingPushed();
 });
 

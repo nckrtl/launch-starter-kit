@@ -40,12 +40,20 @@ final readonly class DispatchOrbitPlanning
         private OrbitIssueProvider $issues,
         private OrbitIssueTransitioner $transitioner,
         private HerdrRuntime $herdr,
+        private CaptureHerdrEvent $events,
         private OrbitFeatureWorkflow $workflow,
     ) {}
 
     public function handle(int $deliveryId): AgentDispatch
     {
         $delivery = Delivery::query()->with('projectOrchestration')->findOrFail($deliveryId);
+
+        $reconciled = $this->reconcileInterruptedPrompt($delivery);
+
+        if ($reconciled !== null) {
+            return $reconciled;
+        }
+
         $this->assertLiveDelivery($delivery);
         $config = $this->configs->hydrate($delivery->projectOrchestration->config);
 
@@ -102,6 +110,182 @@ final readonly class DispatchOrbitPlanning
         } finally {
             $reservation->release();
         }
+    }
+
+    private function reconcileInterruptedPrompt(Delivery $delivery): ?AgentDispatch
+    {
+        if ($delivery->status !== DeliveryStatus::Blocked
+            || $delivery->failure_details !== [
+                'code' => 'planning_dispatch_interrupted',
+                'dispatch_id' => $delivery->failure_details['dispatch_id'] ?? null,
+                'stage' => 'herdr_prompt_attempted',
+            ]
+            || ! is_int($delivery->failure_details['dispatch_id'] ?? null)) {
+            return null;
+        }
+
+        $config = $this->configs->hydrate($delivery->projectOrchestration->config);
+
+        if (! $config instanceof OrbitProjectConfig
+            || $config->herdrSession !== config('herdr.session')) {
+            throw new OrbitPlanningDispatchFailed(
+                'The interrupted planning dispatch does not use Commander\'s active Orbit configuration.',
+            );
+        }
+
+        $dispatch = AgentDispatch::query()
+            ->with('phaseRun')
+            ->findOrFail($delivery->failure_details['dispatch_id']);
+
+        $this->assertInterruptedPromptLedger($delivery, $dispatch, $config);
+
+        try {
+            $agent = $this->herdr->getAgent((string) $dispatch->herdr_agent_name);
+        } catch (Exception $exception) {
+            throw new OrbitPlanningDispatchFailed(
+                'Commander could not observe the retained Orbit planning agent.',
+                0,
+                $exception,
+            );
+        }
+
+        if (! $this->sameInterruptedAgent($delivery, $dispatch, $agent)) {
+            throw new OrbitPlanningDispatchFailed(
+                'The retained Orbit planning agent is not safe to reconcile.',
+            );
+        }
+
+        $dispatch = $this->restoreInterruptedPrompt($delivery->id, $dispatch->id, $config, $agent);
+
+        if (in_array($agent->agentStatus, ['idle', 'done'], true)) {
+            $event = $this->events->reconcile($dispatch, $agent);
+            $dispatch = $dispatch->refresh();
+
+            if ($event?->agent_dispatch_id !== $dispatch->id
+                || $dispatch->status !== AgentDispatchStatus::Settled) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The terminal Orbit planning observation did not settle the recovered dispatch.',
+                );
+            }
+        }
+
+        return $dispatch;
+    }
+
+    private function assertInterruptedPromptLedger(
+        Delivery $delivery,
+        AgentDispatch $dispatch,
+        OrbitProjectConfig $config,
+    ): void {
+        $phase = $dispatch->phaseRun;
+        $latestPhaseId = PhaseRun::query()
+            ->where('delivery_id', $delivery->id)
+            ->where('phase_name', $delivery->current_phase)
+            ->latest('attempt')
+            ->value('id');
+
+        if ($delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
+            || $delivery->projectOrchestration->config !== $config->toArray()
+            || $delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
+            || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
+            || $delivery->current_phase !== OrbitFeatureWorkflow::INITIAL_PHASE
+            || $delivery->status !== DeliveryStatus::Blocked
+            || $delivery->failure_details !== [
+                'code' => 'planning_dispatch_interrupted',
+                'dispatch_id' => $dispatch->id,
+                'stage' => 'herdr_prompt_attempted',
+            ]
+            || $latestPhaseId !== $phase->id
+            || $dispatch->phase_run_id !== $phase->id
+            || $phase->delivery_id !== $delivery->id
+            || $phase->phase_name !== OrbitFeatureWorkflow::INITIAL_PHASE
+            || $phase->attempt !== 1
+            || $phase->status !== PhaseRunStatus::Running
+            || $phase->finished_at !== null
+            || $phase->agentDispatches()->count() !== 1
+            || $dispatch->agent_role !== OrbitFeatureWorkflow::PLANNING_AGENT_ROLE
+            || $dispatch->status !== AgentDispatchStatus::Starting
+            || $dispatch->error_code !== 'herdr_prompt_attempted'
+            || $dispatch->error_message !== null
+            || $dispatch->herdr_session !== $config->herdrSession
+            || $dispatch->herdr_workspace_id === null
+            || $dispatch->herdr_tab_id === null
+            || $dispatch->herdr_pane_id === null
+            || $dispatch->herdr_terminal_id === null
+            || $dispatch->herdr_agent_name !== strtolower((string) $delivery->external_issue_key).'-loop-builder'
+            || $dispatch->state_change_seq === null
+            || $dispatch->dispatched_at === null
+            || $dispatch->settled_at !== null) {
+            throw new OrbitPlanningDispatchFailed(
+                'The interrupted Orbit planning prompt ledger is not safe to reconcile.',
+            );
+        }
+    }
+
+    private function sameInterruptedAgent(
+        Delivery $delivery,
+        AgentDispatch $dispatch,
+        HerdrAgentIdentifiers $agent,
+    ): bool {
+        return $agent->workspaceId === $dispatch->herdr_workspace_id
+            && $agent->tabId === $dispatch->herdr_tab_id
+            && $agent->paneId === $dispatch->herdr_pane_id
+            && $agent->terminalId === $dispatch->herdr_terminal_id
+            && ($dispatch->herdr_agent_id === null
+                || ($agent->agentId !== null && $agent->agentId === $dispatch->herdr_agent_id))
+            && $agent->agentName === $dispatch->herdr_agent_name
+            && $agent->workingDirectory === $delivery->worktree_path
+            && $agent->stateChangeSeq !== null
+            && $dispatch->state_change_seq !== null
+            && $agent->stateChangeSeq > $dispatch->state_change_seq
+            && in_array($agent->agentStatus, ['working', 'idle', 'done'], true);
+    }
+
+    private function restoreInterruptedPrompt(
+        int $deliveryId,
+        int $dispatchId,
+        OrbitProjectConfig $config,
+        HerdrAgentIdentifiers $agent,
+    ): AgentDispatch {
+        return DB::transaction(function () use ($deliveryId, $dispatchId, $config, $agent): AgentDispatch {
+            $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
+            $delivery->setRelation(
+                'projectOrchestration',
+                $delivery->projectOrchestration()->lockForUpdate()->firstOrFail(),
+            );
+            $phase = PhaseRun::query()
+                ->where('delivery_id', $delivery->id)
+                ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+                ->latest('attempt')
+                ->lockForUpdate()
+                ->firstOrFail();
+            $dispatch = AgentDispatch::query()->whereKey($dispatchId)->lockForUpdate()->firstOrFail();
+            $dispatch->setRelation('phaseRun', $phase);
+
+            $this->assertInterruptedPromptLedger($delivery, $dispatch, $config);
+
+            if (! $this->sameInterruptedAgent($delivery, $dispatch, $agent)) {
+                throw new OrbitPlanningDispatchFailed(
+                    'The retained Orbit planning agent changed before reconciliation.',
+                );
+            }
+
+            $dispatch->forceFill([
+                'status' => AgentDispatchStatus::Waiting,
+                'herdr_agent_id' => $agent->agentId ?? $dispatch->herdr_agent_id,
+                'state_change_seq' => $agent->agentStatus === 'working'
+                    ? $agent->stateChangeSeq
+                    : $dispatch->state_change_seq,
+                'error_code' => null,
+                'error_message' => null,
+            ])->save();
+            $delivery->forceFill([
+                'status' => DeliveryStatus::WaitingForAgent,
+                'failure_details' => null,
+            ])->save();
+
+            return $dispatch;
+        });
     }
 
     private function assertLiveDelivery(Delivery $delivery): void
