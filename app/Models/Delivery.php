@@ -80,7 +80,10 @@ final class Delivery extends Model
         $query->active()->where(function (Builder $query): void {
             $query->where('status', '!=', DeliveryStatus::Blocked)
                 ->orWhereNull('failure_details->code')
-                ->orWhere('failure_details->code', '!=', 'resolution_decision_required');
+                ->orWhereNotIn('failure_details->code', [
+                    'planning_blocked',
+                    'resolution_decision_required',
+                ]);
         });
     }
 

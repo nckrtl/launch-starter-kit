@@ -403,7 +403,10 @@ it('refuses a different issue when project delivery capacity is full', function 
     expectOrbitControllerReservationReleased($this->commonDirectory);
 });
 
-it('starts a different issue while a retained delivery awaits a resolution decision', function () {
+it('starts a different issue while a retained blocked delivery is inactive', function (
+    string $phase,
+    string $failureCode,
+) {
     $blocked = Delivery::query()->create([
         'project_orchestration_id' => $this->project->id,
         'external_issue_provider' => 'linear',
@@ -412,8 +415,8 @@ it('starts a different issue while a retained delivery awaits a resolution decis
         'workflow_type' => OrbitFeatureWorkflow::TYPE,
         'workflow_version' => OrbitFeatureWorkflow::VERSION,
         'status' => DeliveryStatus::Blocked,
-        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
-        'failure_details' => ['code' => 'resolution_decision_required'],
+        'current_phase' => $phase,
+        'failure_details' => ['code' => $failureCode],
     ]);
 
     $this->artisan('delivery:start-orbit', [
@@ -426,7 +429,10 @@ it('starts a different issue while a retained delivery awaits a resolution decis
         ->and(Delivery::query()->occupiesCapacity()->count())->toBe(1)
         ->and($this->issueProvider->resolveRequests)->toBe(['ORB-234']);
     Queue::assertPushed(AdvanceDelivery::class, 1);
-});
+})->with([
+    'planning blocker' => [OrbitFeatureWorkflow::INITIAL_PHASE, 'planning_blocked'],
+    'resolution decision' => [OrbitFeatureWorkflow::RESOLUTION_PHASE, 'resolution_decision_required'],
+]);
 
 it('reconciles an idempotent retry when the active delivery appears under the reservation', function () {
     $lockPath = $this->commonDirectory.'/orbit-delivery/v1/orb-234/controller.lock';

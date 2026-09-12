@@ -94,6 +94,11 @@ delivery, records the landing phase reference in `completion_details`, sets the
 completion time, and clears the delivery's active-issue key. Replays validate
 that exact terminal state and do not repeat landing mutations.
 
+An exact terminal `planning_blocked` receipt retains its delivery, worktree, and
+Linear evidence but no longer consumes project execution capacity. Like
+`resolution_decision_required`, it has no running agent or queued phase. Any
+future resume path must recheck capacity before it rearms work.
+
 Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
 repository checks still support only discovery. Before proof is enabled, move
 the potentially hour-long topology operation out of the 540-second landing job

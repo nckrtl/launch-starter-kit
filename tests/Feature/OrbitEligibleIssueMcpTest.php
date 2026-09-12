@@ -200,7 +200,10 @@ it('does not read Linear when Commander project capacity is full', function () {
     Process::assertNothingRan();
 });
 
-it('releases capacity while retaining a delivery that awaits an explicit resolution decision', function () {
+it('releases capacity while retaining an inactive blocked delivery', function (
+    string $phase,
+    string $failureCode,
+) {
     fakeEligibleResponse(eligibleResponse([eligibleIssue(200, -200)]));
     $delivery = Delivery::query()->create([
         'project_orchestration_id' => $this->project->id,
@@ -210,8 +213,8 @@ it('releases capacity while retaining a delivery that awaits an explicit resolut
         'workflow_type' => 'orbit-feature',
         'workflow_version' => 1,
         'status' => DeliveryStatus::Blocked,
-        'current_phase' => 'resolution',
-        'failure_details' => ['code' => 'resolution_decision_required'],
+        'current_phase' => $phase,
+        'failure_details' => ['code' => $failureCode],
     ]);
 
     CommanderServer::tool(GetNextEligibleIssue::class, ['id' => 'orbit'])
@@ -224,7 +227,10 @@ it('releases capacity while retaining a delivery that awaits an explicit resolut
     expect($delivery->fresh()->active_issue_key)->not->toBeNull()
         ->and(Delivery::query()->active()->count())->toBe(1)
         ->and(Delivery::query()->occupiesCapacity()->count())->toBe(0);
-});
+})->with([
+    'planning blocker' => ['planning', 'planning_blocked'],
+    'resolution decision' => ['resolution', 'resolution_decision_required'],
+]);
 
 it('fails closed when the Linear queue response cannot be trusted', function (array $response) {
     fakeEligibleResponse($response);
