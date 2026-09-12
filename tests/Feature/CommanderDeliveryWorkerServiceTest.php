@@ -9,6 +9,7 @@ it('ships a bounded restartable Commander delivery worker', function (): void {
 
     expect($unit)
         ->toContain('WorkingDirectory=/fast/apps/commander')
+        ->toContain('UnsetEnvironment=SSH_AUTH_SOCK')
         ->toContain('ExecStart=/usr/bin/php /fast/apps/commander/artisan queue:work database')
         ->toContain('--name=commander-delivery')
         ->toContain('--queue=default')
