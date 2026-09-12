@@ -98,20 +98,33 @@ final readonly class OrbitImplementationReceiptValidator
         $pullRequest = is_array($input) ? ($input['pull_request'] ?? null) : null;
         $isPullRequestReviewCorrection = is_array($input)
             && array_key_exists('pr_review_receipt_id', $input);
-        $allowed = $isPullRequestReviewCorrection
-            ? [
+        $isResolutionCorrection = is_array($input)
+            && array_key_exists('resolution_receipt_id', $input);
+        $allowed = match (true) {
+            $isPullRequestReviewCorrection => [
                 'pr_review_receipt_id',
                 'pr_review_receipt',
                 'implementation_receipt_id',
                 'implementation_receipt',
                 'pull_request',
                 'published_review',
-            ]
-            : [
+            ],
+            $isResolutionCorrection => [
+                'resolution_phase_run_id',
+                'resolution_dispatch_id',
+                'resolution_receipt_id',
+                'resolution_receipt',
+                'resolution_publication',
                 'implementation_receipt_id',
                 'implementation_receipt',
                 'pull_request',
-            ];
+            ],
+            default => [
+                'implementation_receipt_id',
+                'implementation_receipt',
+                'pull_request',
+            ],
+        };
         if (! is_int($receiptId) || ! is_array($payload) || array_is_list($payload)
             || ! is_array($pullRequest) || array_is_list($pullRequest)
             || array_diff(array_keys($input), $allowed) !== []
@@ -128,16 +141,23 @@ final readonly class OrbitImplementationReceiptValidator
         $preReviewMergeabilityCorrection = ! $isPullRequestReviewCorrection
             && $receipt !== null
             && $this->matchesPreReviewMergeabilityCorrection($delivery, $correction, $receipt);
-        $expectedSourceMergeable = $isPullRequestReviewCorrection || $preReviewMergeabilityCorrection;
+        $expectedSourceMergeable = $isPullRequestReviewCorrection
+            || $isResolutionCorrection
+            || $preReviewMergeabilityCorrection;
         $expectedSourcePrompt = match (true) {
             $source?->attempt === 1 => 'orbit_implementation',
             $source !== null && is_array($source->input)
                 && array_key_exists('pr_review_receipt_id', $source->input) => 'orbit_pr_review_correction',
+            $source !== null && is_array($source->input)
+                && array_key_exists('resolution_receipt_id', $source->input) => 'orbit_resolution_correction',
             default => 'orbit_implementation_correction',
         };
-        $expectedSourceVersion = $source?->attempt === 1
-            ? OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION
-            : OrbitFeatureWorkflow::IMPLEMENTATION_CORRECTION_PROMPT_VERSION;
+        $expectedSourceVersion = match (true) {
+            $source?->attempt === 1 => OrbitFeatureWorkflow::IMPLEMENTATION_PROMPT_VERSION,
+            $source !== null && is_array($source->input)
+                && array_key_exists('resolution_receipt_id', $source->input) => OrbitFeatureWorkflow::RESOLUTION_CORRECTION_PROMPT_VERSION,
+            default => OrbitFeatureWorkflow::IMPLEMENTATION_CORRECTION_PROMPT_VERSION,
+        };
 
         return $receipt !== null && $source !== null && $sourceDelivery !== null
             && $sourceDispatches !== null && $sourceDispatch !== null
@@ -182,14 +202,162 @@ final readonly class OrbitImplementationReceiptValidator
             && $pullRequest === [
                 'number' => $delivery->pull_request_number,
                 'url' => $delivery->pull_request_url,
-                'mergeable' => $isPullRequestReviewCorrection,
+                'mergeable' => $isPullRequestReviewCorrection || $isResolutionCorrection,
             ]
             && $this->matches($sourceDelivery, $source, $sourceDispatch, $receipt)
             && (! $isPullRequestReviewCorrection || $this->matchesPullRequestReviewCorrection(
                 $delivery,
                 $correction,
                 $receipt,
+            ))
+            && (! $isResolutionCorrection || $this->matchesResolutionCorrection(
+                $delivery,
+                $correction,
+                $receipt,
             ));
+    }
+
+    private function matchesResolutionCorrection(
+        Delivery $delivery,
+        PhaseRun $correction,
+        Receipt $implementationReceipt,
+    ): bool {
+        $input = $correction->input;
+        $phaseId = is_array($input) ? ($input['resolution_phase_run_id'] ?? null) : null;
+        $dispatchId = is_array($input) ? ($input['resolution_dispatch_id'] ?? null) : null;
+        $receiptId = is_array($input) ? ($input['resolution_receipt_id'] ?? null) : null;
+        $payload = is_array($input) ? ($input['resolution_receipt'] ?? null) : null;
+        $publication = is_array($input) ? ($input['resolution_publication'] ?? null) : null;
+
+        if (! is_int($phaseId) || ! is_int($dispatchId) || ! is_int($receiptId)
+            || ! is_array($payload) || array_is_list($payload)
+            || ! is_array($publication) || array_is_list($publication)) {
+            return false;
+        }
+
+        $resolution = PhaseRun::query()->find($phaseId);
+        $resolutionDispatches = $resolution?->agentDispatches()->get();
+        $resolutionDispatch = $resolutionDispatches?->first();
+        $resolutionReceipts = $resolution?->receipts()->get();
+        $resolutionReceipt = $resolutionReceipts?->first();
+        $output = $resolution?->output;
+        $adoption = is_array($output) ? ($output['adoption'] ?? null) : null;
+        $resolutionInput = $resolution?->input;
+        $repository = $delivery->projectOrchestration->config['repository'] ?? null;
+        $expectedPrompt = is_string($repository) && is_array($resolutionInput)
+            && $resolutionDispatch !== null
+            ? $this->workflow->pullRequestResolutionPrompt(
+                (string) $delivery->external_issue_key,
+                $repository,
+                (string) $delivery->worktree_path,
+                $delivery->id,
+                $resolution->id,
+                $resolutionDispatch->id,
+                sprintf(
+                    '%s %s delivery:submit-orbit-resolution-receipt %d %d',
+                    escapeshellarg(PHP_BINARY),
+                    escapeshellarg(base_path('artisan')),
+                    $resolution->id,
+                    $resolutionDispatch->id,
+                ),
+                $resolutionInput,
+            )
+            : null;
+        $marker = "ORBIT-LOOP-RESOLUTION:{$dispatchId}";
+        $handoff = $payload['handoff'] ?? null;
+        $expectedBody = is_string($handoff)
+            ? implode("\n\n", [
+                $marker,
+                $handoff,
+                'Commander routing: Needs an explicit decision or recovery action.',
+            ])
+            : null;
+
+        return $resolution !== null && $resolutionDispatches !== null
+            && $resolutionDispatch !== null && $resolutionReceipts !== null
+            && $resolutionReceipt !== null && is_array($resolutionInput)
+            && $resolution->delivery_id === $delivery->id
+            && $resolution->phase_name === OrbitFeatureWorkflow::RESOLUTION_PHASE
+            && $resolution->attempt >= 1
+            && $resolution->status === PhaseRunStatus::Completed
+            && $resolution->finished_at !== null
+            && $resolution->current_block === null
+            && $resolutionDispatches->count() === 1
+            && $resolutionDispatch->id === $dispatchId
+            && $resolutionDispatch->agent_role === OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
+            && $resolutionDispatch->status === AgentDispatchStatus::Settled
+            && $resolutionDispatch->settled_at !== null
+            && $resolutionDispatch->idempotency_key === IdempotencyKey::forDispatch(
+                $delivery->id,
+                OrbitFeatureWorkflow::RESOLUTION_PHASE,
+                $resolution->attempt,
+                OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+            )->value
+            && $resolutionDispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$resolution->attempt
+            && $resolutionDispatch->prompt_name === 'orbit_resolution'
+            && $resolutionDispatch->prompt_version === OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION
+            && is_string($expectedPrompt)
+            && hash_equals($resolutionDispatch->prompt_hash, hash('sha256', $expectedPrompt))
+            && $resolutionReceipts->count() === 1
+            && $resolutionReceipt->id === $receiptId
+            && $resolutionReceipt->kind === 'orbit_resolution'
+            && $resolutionReceipt->schema_version === 1
+            && $resolutionReceipt->validation_status === ReceiptValidationStatus::Valid
+            && $resolutionReceipt->validated_at !== null
+            && $resolutionReceipt->payload === $payload
+            && hash_equals(
+                $resolutionReceipt->payload_hash,
+                hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+            )
+            && ($payload['result'] ?? null) === 'proposal'
+            && ($resolutionInput['implementation_receipt_id'] ?? null) === $implementationReceipt->id
+            && ($resolutionInput['implementation_receipt'] ?? null) === $implementationReceipt->payload
+            && ($resolutionInput['pull_request'] ?? null) === ($input['pull_request'] ?? null)
+            && is_array($output)
+            && $output === [
+                'receipt_id' => $resolutionReceipt->id,
+                'result' => 'proposal',
+                'publication' => $publication,
+                'adopted' => true,
+                'automatic_adoption_eligible' => true,
+                'expected_resume_phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+                'requirements' => [],
+                'reason' => 'Eligible for automatic adoption into implementing; adoption is pending.',
+                'adoption' => $adoption,
+            ]
+            && is_array($adoption)
+            && $adoption === [
+                'implementation_phase_run_id' => $correction->id,
+                'implementation_attempt' => $correction->attempt,
+                'linear_state_id' => $adoption['linear_state_id'] ?? null,
+                'linear_state' => 'In Progress',
+                'contract_sha256' => $adoption['contract_sha256'] ?? null,
+            ]
+            && is_string($adoption['linear_state_id'] ?? null)
+            && preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $adoption['linear_state_id']) === 1
+            && ($adoption['contract_sha256'] ?? null) === $this->startupContractHash($delivery)
+            && $publication === [
+                'comment_id' => $publication['comment_id'] ?? null,
+                'marker' => $marker,
+                'body_sha256' => hash('sha256', (string) $expectedBody),
+            ]
+            && is_string($publication['comment_id'] ?? null)
+            && preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/', $publication['comment_id']) === 1;
+    }
+
+    private function startupContractHash(Delivery $delivery): ?string
+    {
+        $planning = $delivery->phaseRuns()
+            ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+            ->where('attempt', 1)
+            ->first();
+        $input = $planning?->input;
+        $snapshot = is_array($input) ? ($input['issue_snapshot'] ?? null) : null;
+        $hash = is_array($snapshot) ? ($snapshot['contract_sha256'] ?? null) : null;
+
+        return is_string($hash) && preg_match('/^[a-f0-9]{64}$/', $hash) === 1
+            ? $hash
+            : null;
     }
 
     private function deliveryAtStartOf(Delivery $delivery, PhaseRun $implementation): ?Delivery

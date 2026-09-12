@@ -46,6 +46,8 @@ final readonly class OrbitFeatureWorkflow
 
     public const int IMPLEMENTATION_CORRECTION_PROMPT_VERSION = 1;
 
+    public const int RESOLUTION_CORRECTION_PROMPT_VERSION = 1;
+
     public const int RESOLUTION_PROMPT_VERSION = 1;
 
     public function planningPrompt(
@@ -342,6 +344,80 @@ Resolve only the real conflicts against current main. Do not restart preflight m
 main advanced. You may coordinate bounded native helpers within this process, but you must
 integrate their work and stop them before handoff. Do not change Linear, create or merge a
 GitHub pull request, or invoke the legacy Orbit controller's advance command.
+
+Run the required checks through the retained Builder, commit the correction, push the exact
+issue branch, and publish the corrected candidate artifact. Update the complete pull request
+body inside `.loop/runtime/` and write the complete correction handoff there. Keep `.loop`
+untracked.
+
+Before ending, run one receipt command from the assigned worktree root.
+
+Ready:
+`{$receiptCommand} --result=ready --handoff=.loop/runtime/implementation-handoff.md --artifact=FULL_SHA --gate=ABSOLUTE_GATE_PATH --body=.loop/runtime/pull-request-body.md`
+
+Blocked:
+`{$receiptCommand} --result=blocked --handoff=.loop/runtime/implementation-handoff.md`
+
+For ready, replace `FULL_SHA` and `ABSOLUTE_GATE_PATH` with the exact corrected artifact SHA
+and successful Builder gate receipt. The receipt command independently verifies the clean
+pushed candidate, artifact, gate, and pull request body. Correct a reported structural error
+before returning. If correction cannot complete, use `blocked` and record its classification,
+evidence, and smallest next action in the handoff. Return the receipt ID and stop.
+PROMPT;
+    }
+
+    /**
+     * @param  array<string, mixed>  $implementationReceipt
+     * @param  array<string, mixed>  $resolutionReceipt
+     * @param  array<string, mixed>  $publication
+     * @param  array<string, mixed>  $pullRequest
+     */
+    public function resolutionCorrectionPrompt(
+        string $issueKey,
+        string $worktree,
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+        string $receiptCommand,
+        array $implementationReceipt,
+        array $resolutionReceipt,
+        array $publication,
+        array $pullRequest,
+    ): string {
+        $evidence = json_encode(
+            [
+                'implementation_receipt' => $implementationReceipt,
+                'resolution_receipt' => $resolutionReceipt,
+                'resolution_publication' => $publication,
+                'pull_request' => $pullRequest,
+            ],
+            JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
+        );
+
+        return <<<PROMPT
+Apply the automatically adopted resolution for {$issueKey} in the retained Builder.
+
+Issue: {$issueKey}
+Worktree: {$worktree}
+Assigned phase: implementing
+Flow: discovery
+Delivery: {$deliveryId}
+Phase run: {$phaseRunId}
+Dispatch: {$dispatchId}
+Current process skill: {$worktree}/.agents/skills/developing-features/SKILL.md
+
+Preserve the approved plan, issue contract, completed implementation, and prior acceptance
+evidence. Commander adopted the requirement-free resolver proposal below and returned Linear
+to In Progress. Treat the resolution handoff as the complete correction instruction:
+
+```json
+{$evidence}
+```
+
+Apply only that resolution. Do not expand scope, change the issue contract, change Linear,
+create or merge a GitHub pull request, publish a review, or invoke the legacy Orbit controller.
+You may coordinate bounded native helpers, but you must integrate their work and stop them
+before handoff.
 
 Run the required checks through the retained Builder, commit the correction, push the exact
 issue branch, and publish the corrected candidate artifact. Update the complete pull request

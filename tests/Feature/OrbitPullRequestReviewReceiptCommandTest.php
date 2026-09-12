@@ -1,5 +1,6 @@
 <?php
 
+use App\Delivery\Actions\AdoptOrbitResolution;
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitImplementation;
 use App\Delivery\Actions\AdvanceOrbitPullRequestReview;
@@ -13,6 +14,7 @@ use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitIssueTransitioner;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
@@ -40,15 +42,18 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
+use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPullRequestReviewAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPullRequestReviewPublicationFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use App\Delivery\Exceptions\OrbitResolutionAdoptionFailed;
 use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitImplementationReceiptValidator;
 use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
 use App\Delivery\Workflow\OrbitPullRequestReviewReceiptValidator;
+use App\Jobs\AdoptOrbitResolution as AdoptResolutionJob;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitPullRequestReview as AdvancePullRequestReviewJob;
 use App\Jobs\AdvanceOrbitResolution as AdvanceResolutionJob;
@@ -58,6 +63,8 @@ use App\Models\AgentDispatch;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
+use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
+use Illuminate\Contracts\Queue\ShouldQueueAfterCommit;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Cache;
@@ -311,7 +318,13 @@ final class PullRequestReviewAdvanceIssues implements OrbitActiveIssueProvider, 
                 'id' => $issueId,
                 'identifier' => $issueKey,
                 'title' => 'Review receipt test issue',
-                'state' => ['id' => 'state-review', 'name' => $this->state, 'type' => 'started'],
+                'state' => [
+                    'id' => $this->state === 'In Progress'
+                        ? '33333333-4444-4555-8666-777777777777'
+                        : '22222222-3333-4444-8555-666666666666',
+                    'name' => $this->state,
+                    'type' => 'started',
+                ],
                 'assignee' => $this->assignee,
                 'delegate' => ['id' => config('commander.hermes.tom_linear_viewer_id')],
             ],
@@ -429,6 +442,116 @@ final class PullRequestResolutionPublisher implements OrbitResolutionPublisher
             commentId: '22222222-3333-4444-8555-666666666666',
             marker: $marker,
             bodyHash: hash('sha256', $body),
+        );
+    }
+}
+
+final class PullRequestResolutionTransitioner implements OrbitIssueTransitioner
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public int $mutations = 0;
+
+    public bool $loseNextResponse = false;
+
+    public ?Closure $afterTransition = null;
+
+    public function __construct(private readonly PullRequestReviewAdvanceIssues $issues) {}
+
+    public function transitionToInProgress(
+        OrbitIssueSnapshot $current,
+        string $expectedContractHash,
+    ): OrbitIssueSnapshot {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($current->issueKey)->toBe('ORB-234')
+            ->and($current->payload['state']['name'])->toBeIn(['In Review', 'In Progress'])
+            ->and($expectedContractHash)->toBe(str_repeat('d', 64));
+        $this->calls++;
+
+        if ($this->issues->state !== 'In Progress') {
+            $this->issues->state = 'In Progress';
+            $this->mutations++;
+        }
+
+        $resumed = $this->issues->fetchActive($current->issueId, $current->issueKey);
+
+        if ($this->afterTransition instanceof Closure) {
+            ($this->afterTransition)();
+        }
+
+        if ($this->loseNextResponse) {
+            $this->loseNextResponse = false;
+
+            throw new OrbitIssueTransitionFailed(
+                'The Linear response was lost.',
+                ambiguous: true,
+            );
+        }
+
+        return $resumed;
+    }
+}
+
+final class PullRequestResolutionBuilderHerdr implements HerdrRuntime
+{
+    /** @var list<string> */
+    public array $calls = [];
+
+    /** @var list<string> */
+    public array $prompts = [];
+
+    public function __construct(private readonly string $worktree) {}
+
+    public function openWorktree(
+        string $repositoryPath,
+        string $worktreePath,
+        ?string $label = null,
+    ): OpenedHerdrWorktree {
+        throw new LogicException('The retained Builder worktree must not be reopened.');
+    }
+
+    public function splitPane(string $paneId, string $workingDirectory): HerdrAgentIdentifiers
+    {
+        throw new LogicException('The retained Builder pane must not be split.');
+    }
+
+    public function startAgent(
+        string $paneId,
+        string $name,
+        ?HerdrAgentLaunch $launch = null,
+    ): HerdrAgentIdentifiers {
+        throw new LogicException('The retained Builder agent must not be restarted.');
+    }
+
+    public function promptAgent(string $name, string $prompt): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'prompt';
+        $this->prompts[] = $prompt;
+
+        return $this->identifiers(42, 'working');
+    }
+
+    public function getAgent(string $name): HerdrAgentIdentifiers
+    {
+        $this->calls[] = 'get';
+
+        return $this->identifiers(41, 'idle');
+    }
+
+    private function identifiers(int $sequence, string $status): HerdrAgentIdentifiers
+    {
+        return new HerdrAgentIdentifiers(
+            'workspace',
+            'tab',
+            'builder-pane',
+            'builder-terminal',
+            'builder-agent',
+            'orb-234-loop-builder',
+            $sequence,
+            $this->worktree,
+            $status,
         );
     }
 }
@@ -742,6 +865,7 @@ beforeEach(function () {
     $this->reviewPublisher->approvedBody = $this->approvedBody;
     $this->reviewPublisher->submittedBody = $this->submittedBody;
     $this->resolutionPublisher = new PullRequestResolutionPublisher;
+    $this->resolutionTransitioner = new PullRequestResolutionTransitioner($this->advanceIssues);
     $transactionLevel = DB::transactionLevel();
     $this->repository->transactionLevel = $transactionLevel;
     $this->pullRequests->transactionLevel = $transactionLevel;
@@ -749,6 +873,7 @@ beforeEach(function () {
     $this->advanceIssues->transactionLevel = $transactionLevel;
     $this->reviewPublisher->transactionLevel = $transactionLevel;
     $this->resolutionPublisher->transactionLevel = $transactionLevel;
+    $this->resolutionTransitioner->transactionLevel = $transactionLevel;
     app()->instance(OrbitImplementationRepository::class, $this->repository);
     app()->instance(OrbitPullRequestInspector::class, $this->pullRequests);
     app()->instance(OrbitPullRequestPublisher::class, $this->pullRequests);
@@ -757,6 +882,7 @@ beforeEach(function () {
     app()->instance(OrbitIssueProvider::class, $this->advanceIssues);
     app()->instance(OrbitPullRequestReviewPublisher::class, $this->reviewPublisher);
     app()->instance(OrbitResolutionPublisher::class, $this->resolutionPublisher);
+    app()->instance(OrbitIssueTransitioner::class, $this->resolutionTransitioner);
 
     chdir($this->worktreePath);
     Queue::fake();
@@ -1323,6 +1449,89 @@ function prepareResolutionProposalForPublication(object $test): array
         $resolver->fresh(),
         $resolution->receipts()->where('kind', 'orbit_resolution')->sole(),
     ];
+}
+
+/** @return array{PhaseRun, AgentDispatch, Receipt} */
+function preparePublishedResolutionAdoption(object $test): array
+{
+    [$resolution, $resolver, $receipt] = prepareResolutionProposalForPublication($test);
+    app(AdvanceOrbitResolution::class)->handle($test->delivery->id, $resolution->id);
+
+    return [$resolution->fresh(), $resolver->fresh(), $receipt->fresh()];
+}
+
+function normalizeResolutionCorrectionBuilder(object $test): void
+{
+    $planning = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::INITIAL_PHASE)
+        ->where('attempt', 1)
+        ->sole();
+    $implementation = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 1)
+        ->sole();
+    $identity = [
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'workspace',
+        'herdr_tab_id' => 'tab',
+        'herdr_pane_id' => 'builder-pane',
+        'herdr_terminal_id' => 'builder-terminal',
+        'herdr_agent_id' => 'builder-agent',
+        'herdr_agent_name' => 'orb-234-loop-builder',
+        'dispatched_at' => now(),
+    ];
+
+    $planning->agentDispatches()->sole()->forceFill($identity)->save();
+    $implementation->agentDispatches()->sole()->forceFill($identity)->save();
+}
+
+function exhaustResolutionAdoptionBudget(object $test, PhaseRun $resolution, AgentDispatch $resolver, Receipt $receipt): void
+{
+    $resolution->forceFill(['attempt' => 3])->save();
+    $payload = $receipt->payload;
+    $payload['attempt'] = 3;
+    DB::table('receipts')->where('id', $receipt->id)->update([
+        'payload' => json_encode($payload, JSON_THROW_ON_ERROR),
+        'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+    ]);
+    $prompt = app(OrbitFeatureWorkflow::class)->pullRequestResolutionPrompt(
+        'ORB-234',
+        $test->repositoryPath,
+        $test->worktreePath,
+        $test->delivery->id,
+        $resolution->id,
+        $resolver->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-resolution-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $resolution->id,
+            $resolver->id,
+        ),
+        $resolution->input,
+    );
+    $resolver->forceFill([
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $test->delivery->id,
+            OrbitFeatureWorkflow::RESOLUTION_PHASE,
+            3,
+            OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-resolution-3',
+        'prompt_hash' => hash('sha256', $prompt),
+    ])->save();
+
+    foreach ([1, 2] as $attempt) {
+        PhaseRun::query()->create([
+            'delivery_id' => $test->delivery->id,
+            'phase_name' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+            'attempt' => $attempt,
+            'status' => PhaseRunStatus::Completed,
+            'output' => ['adopted' => true],
+            'started_at' => now(),
+            'finished_at' => now(),
+        ]);
+    }
 }
 
 function blockPullRequestReviewReceiptAsMissing(object $test): void
@@ -2537,9 +2746,215 @@ it('publishes and classifies one immutable structured resolution proposal', func
         ->and($this->resolutionPublisher->calls)->toBe(1)
         ->and($this->resolutionPublisher->lastAdopted)->toBeFalse();
 
+    Queue::assertPushed(
+        AdoptResolutionJob::class,
+        fn (AdoptResolutionJob $job): bool => $job->deliveryId === $this->delivery->id
+            && $job->phaseRunId === $resolution->id,
+    );
+
     app(AdvanceOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
 
     expect($this->resolutionPublisher->calls)->toBe(1);
+});
+
+it('adopts one requirement-free resolution into one exact Builder correction and replays safely', function () {
+    [$resolution, $resolver, $receipt] = preparePublishedResolutionAdoption($this);
+    $publication = $resolution->output['publication'];
+    $sourceReceipt = Receipt::query()->findOrFail($resolution->input['implementation_receipt_id']);
+    $action = app(AdoptOrbitResolution::class);
+
+    $action->handle($this->delivery->id, $resolution->id);
+    $action->handle($this->delivery->id, $resolution->id);
+
+    $correction = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->where('attempt', 3)
+        ->sole();
+    $dispatch = $correction->agentDispatches()->sole();
+    $output = $resolution->fresh()->output;
+
+    expect($this->resolutionTransitioner->calls)->toBe(1)
+        ->and($this->resolutionTransitioner->mutations)->toBe(1)
+        ->and($this->advanceIssues->state)->toBe('In Progress')
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($resolution->fresh()->current_block)->toBeNull()
+        ->and($output)->toBe([
+            'receipt_id' => $receipt->id,
+            'result' => 'proposal',
+            'publication' => $publication,
+            'adopted' => true,
+            'automatic_adoption_eligible' => true,
+            'expected_resume_phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+            'requirements' => [],
+            'reason' => 'Eligible for automatic adoption into implementing; adoption is pending.',
+            'adoption' => [
+                'implementation_phase_run_id' => $correction->id,
+                'implementation_attempt' => 3,
+                'linear_state_id' => '33333333-4444-4555-8666-777777777777',
+                'linear_state' => 'In Progress',
+                'contract_sha256' => str_repeat('d', 64),
+            ],
+        ])
+        ->and($correction->status)->toBe(PhaseRunStatus::Pending)
+        ->and($correction->input)->toBe([
+            'resolution_phase_run_id' => $resolution->id,
+            'resolution_dispatch_id' => $resolver->id,
+            'resolution_receipt_id' => $receipt->id,
+            'resolution_receipt' => $receipt->payload,
+            'resolution_publication' => $publication,
+            'implementation_receipt_id' => $sourceReceipt->id,
+            'implementation_receipt' => $sourceReceipt->payload,
+            'pull_request' => [
+                'number' => 42,
+                'url' => 'https://github.com/nckrtl/orbit/pull/42',
+                'mergeable' => true,
+            ],
+        ])
+        ->and($dispatch->agent_role)->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE)
+        ->and($dispatch->idempotency_key)->toBe(IdempotencyKey::forDispatch(
+            $this->delivery->id,
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+            3,
+            OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        )->value)
+        ->and($dispatch->herdr_agent_name)->toBe('orb-234-loop-builder')
+        ->and($dispatch->prompt_name)->toBe('orbit_resolution_correction')
+        ->and($dispatch->prompt_version)->toBe(OrbitFeatureWorkflow::RESOLUTION_CORRECTION_PROMPT_VERSION)
+        ->and($dispatch->prompt_hash)->toBe(str_repeat('0', 64))
+        ->and($dispatch->status)->toBe(AgentDispatchStatus::Pending)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->count())->toBe(3);
+
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $job): bool => $job->deliveryId === $this->delivery->id,
+    );
+});
+
+it('dispatches an adopted resolution with its distinct exact correction prompt', function () {
+    [$resolution] = preparePublishedResolutionAdoption($this);
+    app(AdoptOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
+    normalizeResolutionCorrectionBuilder($this);
+    config()->set('herdr.session', 'orbit');
+    $herdr = new PullRequestResolutionBuilderHerdr($this->worktreePath);
+    app()->instance(HerdrRuntime::class, $herdr);
+    $this->repository->expectedBody = $this->submittedBody;
+
+    $dispatch = app(App\Delivery\Actions\DispatchOrbitImplementation::class)
+        ->handle($this->delivery->id);
+
+    expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->prompt_name)->toBe('orbit_resolution_correction')
+        ->and($herdr->calls)->toBe(['get', 'prompt'])
+        ->and($herdr->prompts)->toHaveCount(1)
+        ->and($herdr->prompts[0])->toContain('Apply the automatically adopted resolution for ORB-234')
+        ->and($herdr->prompts[0])->toContain('Use the loaded worker configuration as the health authority.')
+        ->and($herdr->prompts[0])->toContain('ORBIT-LOOP-RESOLUTION:')
+        ->and($herdr->prompts[0])->not->toContain('actual merge conflicts')
+        ->and($herdr->prompts[0])->not->toContain('independent pull request review finding');
+});
+
+it('rejects corrupted resolution adoption evidence before changing Linear', function (string $drift) {
+    [$resolution] = preparePublishedResolutionAdoption($this);
+
+    if ($drift === 'publication hash') {
+        $output = $resolution->output;
+        $output['publication']['body_sha256'] = str_repeat('0', 64);
+        DB::table('phase_runs')->where('id', $resolution->id)->update([
+            'output' => json_encode($output, JSON_THROW_ON_ERROR),
+        ]);
+    } else {
+        $failure = $this->delivery->fresh()->failure_details;
+
+        if ($drift === 'publication identity') {
+            $failure['publication']['comment_id'] = '99999999-8888-4777-8666-555555555555';
+        } else {
+            $failure['receipt_id']++;
+        }
+
+        DB::table('deliveries')->where('id', $this->delivery->id)->update([
+            'failure_details' => json_encode($failure, JSON_THROW_ON_ERROR),
+        ]);
+    }
+
+    expect(fn () => app(AdoptOrbitResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    ))->toThrow(OrbitResolutionAdoptionFailed::class, 'retained resolution adoption is inconsistent');
+
+    expect($this->resolutionTransitioner->calls)->toBe(0)
+        ->and($this->resolutionTransitioner->mutations)->toBe(0)
+        ->and($this->advanceIssues->state)->toBe('In Review')
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->count())->toBe(2);
+})->with(['publication hash', 'publication identity', 'receipt identity']);
+
+it('revalidates the automatic adoption budget before changing Linear', function () {
+    [$resolution, $resolver, $receipt] = preparePublishedResolutionAdoption($this);
+    exhaustResolutionAdoptionBudget($this, $resolution, $resolver, $receipt);
+
+    expect(fn () => app(AdoptOrbitResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    ))->toThrow(OrbitResolutionAdoptionFailed::class, 'retained resolution adoption is inconsistent');
+
+    expect($this->resolutionTransitioner->calls)->toBe(0)
+        ->and($this->advanceIssues->state)->toBe('In Review')
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->count())->toBe(2);
+});
+
+it('recovers a lost Linear adoption response without a second effective transition', function () {
+    [$resolution, $resolver, $receipt] = preparePublishedResolutionAdoption($this);
+    $this->resolutionTransitioner->loseNextResponse = true;
+    $job = new AdoptResolutionJob($this->delivery->id, $resolution->id);
+
+    expect(fn () => $job->handle(app(AdoptOrbitResolution::class)))
+        ->toThrow(OrbitResolutionAdoptionFailed::class, 'could not verify Linear In Progress');
+
+    expect($this->advanceIssues->state)->toBe('In Progress')
+        ->and($resolution->fresh()->current_block)->toBe('resolution_adoption')
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('resolution_adoption_ready')
+        ->and($this->resolutionTransitioner->calls)->toBe(1)
+        ->and($this->resolutionTransitioner->mutations)->toBe(1);
+
+    $job->failed(new RuntimeException('Resolution adoption retries exhausted.'));
+
+    expect($this->delivery->fresh()->failure_details)->toBe([
+        'code' => 'resolution_adoption_reconciliation_required',
+        'phase_run_id' => $resolution->id,
+        'dispatch_id' => $resolver->id,
+        'receipt_id' => $receipt->id,
+        'publication' => $resolution->fresh()->output['publication'],
+        'expected_resume_phase' => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
+        'requirements' => [],
+        'reason' => 'Eligible for automatic adoption into implementing; adoption is pending.',
+        'message' => 'Resolution adoption retries exhausted.',
+    ]);
+
+    $job->handle(app(AdoptOrbitResolution::class));
+
+    expect($this->resolutionTransitioner->calls)->toBe(2)
+        ->and($this->resolutionTransitioner->mutations)->toBe(1)
+        ->and($resolution->fresh()->current_block)->toBeNull()
+        ->and($resolution->fresh()->output['adopted'])->toBeTrue()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and(PhaseRun::query()
+            ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
+            ->where('attempt', 3)
+            ->count())->toBe(1)
+        ->and($job)->toBeInstanceOf(ShouldBeUniqueUntilProcessing::class)
+        ->and($job)->toBeInstanceOf(ShouldQueueAfterCommit::class)
+        ->and($job->uniqueId())->toBe("delivery:resolution-adopt:{$this->delivery->id}:{$resolution->id}")
+        ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
+        ->and(AdoptResolutionJob::LOCK_SECONDS)->toBeGreaterThan($job->timeout)
+        ->and($job->tries)->toBe(0)
+        ->and($job->retryUntil() > now())->toBeTrue();
 });
 
 it('recovers a resolution publication whose response was lost without creating a new intent', function () {

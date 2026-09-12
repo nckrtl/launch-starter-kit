@@ -68,10 +68,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                     ->orWhere(function (Builder $query): void {
                         $query->where('status', DeliveryStatus::Blocked)
                             ->where('current_phase', OrbitFeatureWorkflow::RESOLUTION_PHASE)
-                            ->where(
-                                'failure_details->code',
+                            ->whereIn('failure_details->code', [
                                 'resolution_publication_reconciliation_required',
-                            );
+                                'resolution_adoption_ready',
+                                'resolution_adoption_reconciliation_required',
+                            ]);
                     });
             })
             ->orderBy('deliveries.id')
@@ -86,12 +87,20 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
     {
         if ($delivery->status === DeliveryStatus::Blocked) {
             $phaseRunId = $delivery->failure_details['phase_run_id'] ?? null;
+            $failureCode = $delivery->failure_details['code'] ?? null;
 
             if ($delivery->current_phase === OrbitFeatureWorkflow::RESOLUTION_PHASE
-                && ($delivery->failure_details['code'] ?? null)
-                    === 'resolution_publication_reconciliation_required'
                 && is_int($phaseRunId)) {
-                AdvanceOrbitResolution::dispatch($delivery->id, $phaseRunId);
+                if ($failureCode === 'resolution_publication_reconciliation_required') {
+                    AdvanceOrbitResolution::dispatch($delivery->id, $phaseRunId);
+                }
+
+                if (in_array($failureCode, [
+                    'resolution_adoption_ready',
+                    'resolution_adoption_reconciliation_required',
+                ], true)) {
+                    AdoptOrbitResolution::dispatch($delivery->id, $phaseRunId);
+                }
             }
 
             return;

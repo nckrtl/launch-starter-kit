@@ -724,6 +724,35 @@ final readonly class DispatchOrbitImplementation
             );
         }
 
+        if ($this->isResolutionCorrection($phase)) {
+            $input = $phase->input;
+
+            if (! is_array($input)) {
+                throw new OrbitImplementationDispatchFailed(
+                    'The resolution correction has malformed adoption input.',
+                );
+            }
+
+            return $this->workflow->resolutionCorrectionPrompt(
+                (string) $delivery->external_issue_key,
+                (string) $delivery->worktree_path,
+                $delivery->id,
+                $phase->id,
+                $dispatch->id,
+                $this->receiptCommand($phase, $dispatch),
+                $sourceReceipt->payload,
+                $this->associativeArray(
+                    $input['resolution_receipt'] ?? null,
+                    'The resolution correction has malformed receipt input.',
+                ),
+                $this->associativeArray(
+                    $input['resolution_publication'] ?? null,
+                    'The resolution correction has malformed publication input.',
+                ),
+                $this->pullRequestInput($phase),
+            );
+        }
+
         return $this->workflow->implementationCorrectionPrompt(
             (string) $delivery->external_issue_key,
             (string) $delivery->worktree_path,
@@ -931,6 +960,7 @@ final readonly class DispatchOrbitImplementation
         $expectedPrompt = match (true) {
             $phase->attempt === 1 => 'orbit_implementation',
             $this->isPullRequestReviewCorrection($phase) => 'orbit_pr_review_correction',
+            $this->isResolutionCorrection($phase) => 'orbit_resolution_correction',
             default => 'orbit_implementation_correction',
         };
         $expectedVersion = $phase->attempt === 1
@@ -953,6 +983,13 @@ final readonly class DispatchOrbitImplementation
         return $phase->attempt > 1
             && is_array($phase->input)
             && array_key_exists('pr_review_receipt_id', $phase->input);
+    }
+
+    private function isResolutionCorrection(PhaseRun $phase): bool
+    {
+        return $phase->attempt > 1
+            && is_array($phase->input)
+            && array_key_exists('resolution_receipt_id', $phase->input);
     }
 
     /** @return array<string, mixed> */

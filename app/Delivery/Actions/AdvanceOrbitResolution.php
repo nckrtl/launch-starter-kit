@@ -18,6 +18,7 @@ use App\Delivery\IssueProviders\OrbitIssueSnapshotFactory;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPullRequestResolutionReceiptValidator;
 use App\Delivery\Workflow\OrbitResolutionAdoptionPolicy;
+use App\Jobs\AdoptOrbitResolution as AdoptOrbitResolutionJob;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
@@ -84,6 +85,10 @@ final readonly class AdvanceOrbitResolution
             $adoption->reason,
             $projectConfig,
         );
+
+        if ($adoption->adopt) {
+            AdoptOrbitResolutionJob::dispatch($delivery->id, $phase->id)->afterCommit();
+        }
     }
 
     /** @return array{Delivery, PhaseRun, AgentDispatch, Receipt, OrbitResolutionAdoption}|null */

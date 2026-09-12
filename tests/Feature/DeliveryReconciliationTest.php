@@ -14,6 +14,7 @@ use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Delivery\Exceptions\HerdrSettlementReconciliationFailed;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Jobs\AdoptOrbitResolution;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitResolution;
 use App\Jobs\ReconcileDeliveries;
@@ -131,7 +132,12 @@ function waitingReconciliationDelivery(string $status = 'working', int $sequence
 }
 
 it('queues per-delivery recovery only for enabled recoverable deliveries', function (): void {
-    Queue::fake([AdvanceDelivery::class, AdvanceOrbitResolution::class, ReconcileDelivery::class]);
+    Queue::fake([
+        AdvanceDelivery::class,
+        AdoptOrbitResolution::class,
+        AdvanceOrbitResolution::class,
+        ReconcileDelivery::class,
+    ]);
     $enabled = ProjectOrchestration::create([
         'manifest_project_id' => 'enabled-project',
         'config' => [],
@@ -189,6 +195,48 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
             'phase_run_id' => 314,
         ],
     ]);
+    $resolutionAdoptionReady = Delivery::create([
+        'project_orchestration_id' => $enabled->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'resolution-adoption-ready',
+        'external_issue_key' => 'ORB-315',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'failure_details' => [
+            'code' => 'resolution_adoption_ready',
+            'phase_run_id' => 315,
+        ],
+    ]);
+    $resolutionAdoptionRecovery = Delivery::create([
+        'project_orchestration_id' => $enabled->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'resolution-adoption-recovery',
+        'external_issue_key' => 'ORB-316',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'failure_details' => [
+            'code' => 'resolution_adoption_reconciliation_required',
+            'phase_run_id' => 316,
+        ],
+    ]);
+    $resolutionDecision = Delivery::create([
+        'project_orchestration_id' => $enabled->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => 'resolution-decision',
+        'external_issue_key' => 'ORB-317',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Blocked,
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'failure_details' => [
+            'code' => 'resolution_decision_required',
+            'phase_run_id' => 317,
+        ],
+    ]);
     $excluded = [
         $delivery($enabled, DeliveryStatus::Paused),
         $delivery($enabled, DeliveryStatus::Blocked),
@@ -206,6 +254,20 @@ it('queues per-delivery recovery only for enabled recoverable deliveries', funct
         AdvanceOrbitResolution::class,
         fn (AdvanceOrbitResolution $queued): bool => $queued->deliveryId === $resolutionPublication->id
             && $queued->phaseRunId === 314,
+    );
+    Queue::assertPushed(
+        AdoptOrbitResolution::class,
+        fn (AdoptOrbitResolution $queued): bool => $queued->deliveryId === $resolutionAdoptionReady->id
+            && $queued->phaseRunId === 315,
+    );
+    Queue::assertPushed(
+        AdoptOrbitResolution::class,
+        fn (AdoptOrbitResolution $queued): bool => $queued->deliveryId === $resolutionAdoptionRecovery->id
+            && $queued->phaseRunId === 316,
+    );
+    Queue::assertNotPushed(
+        AdoptOrbitResolution::class,
+        fn (AdoptOrbitResolution $queued): bool => $queued->deliveryId === $resolutionDecision->id,
     );
     Queue::assertNotPushed(ReconcileDelivery::class);
 

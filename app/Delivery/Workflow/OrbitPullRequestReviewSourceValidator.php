@@ -48,6 +48,9 @@ final readonly class OrbitPullRequestReviewSourceValidator
             $implementation !== null
                 && is_array($implementation->input)
                 && array_key_exists('pr_review_receipt_id', $implementation->input) => 'orbit_pr_review_correction',
+            $implementation !== null
+                && is_array($implementation->input)
+                && array_key_exists('resolution_receipt_id', $implementation->input) => 'orbit_resolution_correction',
             default => 'orbit_implementation_correction',
         };
 
@@ -119,10 +122,12 @@ final readonly class OrbitPullRequestReviewSourceValidator
         $reviewReceipts = $review->receipts()->get();
         $reviewReceipt = $reviewReceipts->first();
 
-        return $latest !== null && is_array($input)
-            && $reviewReceipts->count() === 1
-            && $reviewReceipt !== null
-            && $latest->delivery_id === $delivery->id
+        if ($latest === null || ! is_array($input)
+            || $reviewReceipts->count() !== 1 || $reviewReceipt === null) {
+            return false;
+        }
+
+        $common = $latest->delivery_id === $delivery->id
             && $latest->phase_name === OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             && $latest->attempt === $implementation->attempt + 1
             && $latest->status === PhaseRunStatus::Pending
@@ -133,19 +138,36 @@ final readonly class OrbitPullRequestReviewSourceValidator
             && $latest->failure_details === null
             && $latest->started_at === null
             && $latest->finished_at === null
-            && array_diff(array_keys($input), [
-                'pr_review_receipt_id',
-                'pr_review_receipt',
-                'implementation_receipt_id',
-                'implementation_receipt',
-                'pull_request',
-                'published_review',
-            ]) === []
-            && count($input) === 6
-            && ($input['pr_review_receipt_id'] ?? null) === $reviewReceipt->id
-            && ($input['pr_review_receipt'] ?? null) === $reviewReceipt->payload
             && ($input['implementation_receipt_id'] ?? null) === $source->id
             && ($input['implementation_receipt'] ?? null) === $source->payload;
+
+        if (! $common) {
+            return false;
+        }
+
+        if (array_keys($input) === [
+            'pr_review_receipt_id',
+            'pr_review_receipt',
+            'implementation_receipt_id',
+            'implementation_receipt',
+            'pull_request',
+            'published_review',
+        ]) {
+            return ($input['pr_review_receipt_id'] ?? null) === $reviewReceipt->id
+            && ($input['pr_review_receipt'] ?? null) === $reviewReceipt->payload
+                && $this->receipts->matchesInput($delivery, $latest);
+        }
+
+        return array_keys($input) === [
+            'resolution_phase_run_id',
+            'resolution_dispatch_id',
+            'resolution_receipt_id',
+            'resolution_receipt',
+            'resolution_publication',
+            'implementation_receipt_id',
+            'implementation_receipt',
+            'pull_request',
+        ] && $this->receipts->matchesInput($delivery, $latest);
     }
 
     private function matchesReceipt(
