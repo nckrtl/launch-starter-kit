@@ -617,6 +617,112 @@ it('waits for both the review receipt and Herdr settlement in either order', fun
     expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE);
 })->with(['receipt', 'settlement']);
 
+it('dispatches an initial planning blocker through the planning resolver', function () {
+    $planning = $this->planningReceipt->phaseRun;
+    $planner = $planning->agentDispatches()->sole();
+    DB::table('agent_dispatches')->where('phase_run_id', $this->review->id)->delete();
+    DB::table('phase_runs')->where('id', $this->review->id)->delete();
+    $payload = [
+        ...$this->planningPayload,
+        'result' => 'blocked',
+        'handoff' => 'Resolve the initial planning contract conflict.',
+        'artifact_sha' => null,
+        'plan_sha256' => null,
+    ];
+    DB::table('receipts')->where('id', $this->planningReceipt->id)->update([
+        'payload' => json_encode($payload, JSON_THROW_ON_ERROR),
+        'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+    ]);
+    $this->planningReceipt->refresh();
+    $planning->forceFill([
+        'status' => PhaseRunStatus::Completed,
+        'output' => ['receipt_id' => $this->planningReceipt->id, 'result' => 'blocked'],
+        'started_at' => now()->subMinute(),
+        'finished_at' => now(),
+    ])->save();
+    $planner->forceFill([
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $this->delivery->id,
+            OrbitFeatureWorkflow::INITIAL_PHASE,
+            1,
+            OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        )->value,
+        'prompt_version' => OrbitFeatureWorkflow::PLANNING_PROMPT_VERSION,
+        'dispatched_at' => now()->subMinute(),
+    ])->save();
+    $planningPrompt = app(OrbitFeatureWorkflow::class)->planningPrompt(
+        'ORB-234',
+        $this->worktree,
+        $this->delivery->id,
+        $planning->id,
+        $planner->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $planning->id,
+            $planner->id,
+        ),
+    );
+    $planner->forceFill(['prompt_hash' => hash('sha256', $planningPrompt)])->save();
+    $resolution = PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Pending,
+        'input' => [
+            'planning_receipt_id' => $this->planningReceipt->id,
+            'planning_receipt' => $payload,
+        ],
+    ]);
+    $resolver = AgentDispatch::query()->create([
+        'phase_run_id' => $resolution->id,
+        'agent_role' => OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $this->delivery->id,
+            OrbitFeatureWorkflow::RESOLUTION_PHASE,
+            1,
+            OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+        )->value,
+        'herdr_agent_name' => 'orb-234-loop-resolution-1',
+        'prompt_name' => 'orbit_resolution',
+        'prompt_version' => OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Pending,
+    ]);
+    $this->delivery->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::RESOLUTION_PHASE,
+        'candidate_sha' => str_repeat('b', 40),
+        'status' => DeliveryStatus::Queued,
+    ])->save();
+    $this->herdr->paneId = 'initial-resolver-pane';
+    $this->herdr->terminalId = 'initial-resolver-terminal';
+    $this->herdr->agentId = 'initial-resolver-agent';
+
+    expect(app(OrbitPlanResolutionReceiptValidator::class)->matchesSource(
+        $this->delivery->fresh('projectOrchestration'),
+        $resolution,
+        $resolver,
+    ))->toBeTrue();
+
+    $dispatched = app(DispatchOrbitPullRequestResolution::class)->handle(
+        $this->delivery->id,
+        $resolution->id,
+    );
+    $prompt = $this->herdr->prompts[array_key_last($this->herdr->prompts)];
+
+    expect($dispatched->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatched->herdr_pane_id)->toBe('initial-resolver-pane')
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->repository->verificationCount)->toBe(2)
+        ->and($this->herdr->calls)->toBe(['open', 'split', 'start', 'prompt'])
+        ->and($prompt)->toContain(
+            'planning or plan-review stop',
+            'Resolve the initial planning contract conflict.',
+            '"resume_phase":"planning"',
+        );
+});
+
 it('dispatches, captures, and publishes a blocked plan review through the planning resolver', function () {
     $reviewReceipt = capturedPlanReviewResult($this, 'blocked');
     app(AdvanceOrbitPlanReview::class)->handle($this->delivery->id);

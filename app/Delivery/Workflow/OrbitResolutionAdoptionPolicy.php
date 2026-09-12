@@ -19,7 +19,9 @@ final readonly class OrbitResolutionAdoptionPolicy
         $origin = is_array($input) && is_array($input['pr_review_receipt'] ?? null)
             ? ($input['pr_review_receipt']['phase'] ?? null)
             : null;
-        $planOrigin = is_array($input) && is_array($input['plan_review_receipt'] ?? null);
+        $planOrigin = is_array($input)
+            && (is_array($input['planning_receipt'] ?? null)
+                || is_array($input['plan_review_receipt'] ?? null));
         $expected = match (true) {
             $origin === OrbitFeatureWorkflow::PR_REVIEW_PHASE => OrbitFeatureWorkflow::IMPLEMENTATION_PHASE,
             $planOrigin => OrbitFeatureWorkflow::INITIAL_PHASE,

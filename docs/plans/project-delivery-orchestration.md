@@ -94,10 +94,13 @@ delivery, records the landing phase reference in `completion_details`, sets the
 completion time, and clears the delivery's active-issue key. Replays validate
 that exact terminal state and do not repeat landing mutations.
 
-An exact terminal `planning_blocked` receipt retains its delivery, worktree, and
-Linear evidence but no longer consumes project execution capacity. Like
-`resolution_decision_required`, it has no running agent or queued phase. Any
-future resume path must recheck capacity before it rearms work.
+An initial `planning_blocked` receipt completes its planning control-flow phase,
+retains the worktree and Linear evidence, and routes to one independent planning-
+resolution phase. Deployments recover the exact older terminal form by preserving
+its failed planning phase and appending that same intent only after locking the
+project and rechecking capacity. Malformed evidence stays blocked. Planning
+resolutions remain advisory and require an explicit decision; they are not adopted
+as issue, ADR, or flow changes automatically.
 
 Proof delivery remains disabled at `StartOrbitDelivery`: its prompts and
 repository checks still support only discovery. Before proof is enabled, move

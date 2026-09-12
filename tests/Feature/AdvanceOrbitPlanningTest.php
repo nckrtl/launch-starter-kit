@@ -23,7 +23,9 @@ use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\OrbitIssueContractChanged;
 use App\Delivery\Exceptions\OrbitPlanningAdvancementFailed;
 use App\Delivery\Exceptions\OrbitPlanReviewDispatchFailed;
+use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
 use App\Delivery\Workflow\OrbitPlanReviewReceiptValidator;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
@@ -31,6 +33,7 @@ use App\Models\PhaseRun;
 use App\Models\Receipt;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Queue;
 
@@ -181,14 +184,35 @@ beforeEach(function () {
     $this->planner = AgentDispatch::query()->create([
         'phase_run_id' => $this->phase->id,
         'agent_role' => OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
-        'idempotency_key' => 'planning-advance-planner',
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $this->delivery->id,
+            OrbitFeatureWorkflow::INITIAL_PHASE,
+            1,
+            OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        )->value,
         'herdr_agent_name' => 'orb-234-loop-builder',
         'prompt_name' => 'orbit_planning',
-        'prompt_version' => 1,
-        'prompt_hash' => str_repeat('8', 64),
+        'prompt_version' => OrbitFeatureWorkflow::PLANNING_PROMPT_VERSION,
+        'prompt_hash' => str_repeat('0', 64),
         'status' => AgentDispatchStatus::Settled,
+        'dispatched_at' => now(),
         'settled_at' => now(),
     ]);
+    $planningPrompt = app(OrbitFeatureWorkflow::class)->planningPrompt(
+        'ORB-234',
+        $this->worktree,
+        $this->delivery->id,
+        $this->phase->id,
+        $this->planner->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $this->phase->id,
+            $this->planner->id,
+        ),
+    );
+    $this->planner->forceFill(['prompt_hash' => hash('sha256', $planningPrompt)])->save();
     $this->repository = new PlanningAdvancementRepository;
     $this->repository->outcome = new VerifiedOrbitPlanningOutcome(
         $this->candidateSha,
@@ -406,7 +430,7 @@ it('waits harmlessly when settlement arrives before its receipt', function () {
     expect($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::PLAN_REVIEW_PHASE);
 });
 
-it('records a blocked planning handoff without creating a reviewer', function () {
+it('routes a blocked initial planning handoff to one independent resolution intent', function () {
     $receipt = capturePlanningAdvancementReceipt($this, 'blocked');
     $this->repository->outcome = new VerifiedOrbitPlanningOutcome(
         $this->candidateSha,
@@ -417,20 +441,79 @@ it('records a blocked planning handoff without creating a reviewer', function ()
 
     app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
     app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
+    expect(app(AdvanceOrbitPlanning::class)->handle($this->delivery->id))->toBeFalse();
 
-    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($this->delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE)
         ->and($this->delivery->fresh()->candidate_sha)->toBe($this->candidateSha)
-        ->and($this->delivery->fresh()->failure_details)->toMatchArray([
-            'code' => 'planning_blocked',
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->phase->fresh()->status)->toBe(PhaseRunStatus::Completed)
+        ->and($this->phase->fresh()->output)->toBe([
             'receipt_id' => $receipt->id,
-            'handoff' => 'Planning stopped on a missing product decision.',
+            'result' => 'blocked',
         ])
-        ->and($this->phase->fresh()->status)->toBe(PhaseRunStatus::Failed)
-        ->and($this->phase->fresh()->failure_code)->toBe('planning_blocked')
-        ->and(PhaseRun::count())->toBe(1)
-        ->and(AgentDispatch::count())->toBe(1)
+        ->and($resolution->input)->toBe([
+            'planning_receipt_id' => $receipt->id,
+            'planning_receipt' => $receipt->payload,
+        ])
+        ->and($resolver->agent_role)->toBe(OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE)
+        ->and($resolver->herdr_agent_name)->toBe('orb-234-loop-resolution-1')
+        ->and($resolver->prompt_name)->toBe('orbit_resolution')
+        ->and($resolver->status)->toBe(AgentDispatchStatus::Pending)
+        ->and(app(OrbitPlanResolutionReceiptValidator::class)->matchesSource(
+            $this->delivery->fresh('projectOrchestration'),
+            $resolution,
+            $resolver,
+        ))->toBeTrue()
+        ->and(PhaseRun::count())->toBe(2)
+        ->and(AgentDispatch::count())->toBe(2)
         ->and($this->repository->verifications)->toBe(1);
 });
+
+it('rejects corrupted initial planning resolution provenance', function (string $corruption) {
+    capturePlanningAdvancementReceipt($this, 'blocked');
+    $this->repository->outcome = new VerifiedOrbitPlanningOutcome(
+        $this->candidateSha,
+        $this->treeSha,
+        null,
+        null,
+    );
+    app(AdvanceOrbitPlanning::class)->handle($this->delivery->id);
+    $resolution = PhaseRun::query()
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+
+    match ($corruption) {
+        'input key' => $resolution->forceFill(['input' => [...$resolution->input, 'extra' => true]])->save(),
+        'receipt hash' => DB::table('receipts')->where('id', $resolution->input['planning_receipt_id'])
+            ->update(['payload_hash' => str_repeat('0', 64)]),
+        'phase output' => $this->phase->forceFill(['output' => ['receipt_id' => 999, 'result' => 'blocked']])->save(),
+        'phase status' => $this->phase->forceFill(['status' => PhaseRunStatus::Pending])->save(),
+        'dispatch identity' => $this->planner->forceFill(['prompt_name' => 'changed'])->save(),
+        'prompt hash' => $this->planner->forceFill(['prompt_hash' => str_repeat('1', 64)])->save(),
+        'candidate' => $this->delivery->forceFill(['candidate_sha' => str_repeat('2', 40)])->save(),
+    };
+
+    expect(app(OrbitPlanResolutionReceiptValidator::class)->matchesSource(
+        $this->delivery->fresh('projectOrchestration'),
+        $resolution->fresh(),
+        $resolver->fresh(),
+    ))->toBeFalse();
+})->with([
+    'input key',
+    'receipt hash',
+    'phase output',
+    'phase status',
+    'dispatch identity',
+    'prompt hash',
+    'candidate',
+]);
 
 it('routes a ready planning correction to plan review attempt two', function () {
     [$fixReceipt, $correction] = preparePlanningCorrectionAdvancement($this);
@@ -626,15 +709,26 @@ it('rejects a project config change during external verification', function () {
 });
 
 it('rejects inconsistent retained blocked evidence', function () {
-    capturePlanningAdvancementReceipt($this, 'blocked');
-    $this->repository->outcome = new VerifiedOrbitPlanningOutcome(
-        $this->candidateSha,
-        $this->treeSha,
-        null,
-        null,
-    );
+    $receipt = capturePlanningAdvancementReceipt($this, 'blocked');
+    $this->phase->forceFill([
+        'status' => PhaseRunStatus::Failed,
+        'output' => ['receipt_id' => $receipt->id, 'result' => 'blocked'],
+        'failure_code' => 'planning_blocked',
+        'failure_message' => $receipt->payload['handoff'],
+        'finished_at' => now(),
+    ])->save();
+    $this->delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'candidate_sha' => $this->candidateSha,
+        'failure_details' => [
+            'code' => 'planning_blocked',
+            'phase_run_id' => $this->phase->id,
+            'dispatch_id' => $this->planner->id,
+            'receipt_id' => $receipt->id,
+            'handoff' => $receipt->payload['handoff'],
+        ],
+    ])->save();
     $action = app(AdvanceDeliveryAction::class);
-    $action->handle($this->delivery->id);
     $failure = $this->delivery->fresh()->failure_details;
     $failure['handoff'] = 'Changed after the transition.';
     $this->delivery->forceFill(['failure_details' => $failure])->save();

@@ -7,6 +7,7 @@ use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
+use App\Delivery\Actions\RecoverInitialOrbitPlanningBlocker;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
@@ -19,6 +20,7 @@ use App\Delivery\Enums\ReceiptValidationStatus;
 use App\Delivery\Exceptions\HerdrSettlementReconciliationFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
 use App\Jobs\AdoptOrbitResolution;
 use App\Jobs\AdvanceDelivery;
 use App\Jobs\AdvanceOrbitPullRequestReview;
@@ -136,6 +138,116 @@ function waitingReconciliationDelivery(string $status = 'working', int $sequence
     app()->instance(HerdrRuntime::class, $herdr);
 
     return [$delivery, $phase, $dispatch];
+}
+
+/** @return array{Delivery, PhaseRun, AgentDispatch, Receipt} */
+function legacyInitialPlanningBlocker(ProjectOrchestration $project): array
+{
+    $candidate = str_repeat('b', 40);
+    $worktree = '/fast/worktrees/orbit/orb-91';
+    $delivery = Delivery::create([
+        'project_orchestration_id' => $project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => '11111111-2222-4333-8444-555555555555',
+        'external_issue_key' => 'ORB-91',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::Preparing,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'worktree_path' => $worktree,
+        'candidate_sha' => $candidate,
+    ]);
+    $planning = PhaseRun::create([
+        'delivery_id' => $delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Failed,
+        'input' => ['flow' => 'discovery'],
+        'started_at' => now()->subMinute(),
+        'finished_at' => now(),
+    ]);
+    $dispatch = AgentDispatch::create([
+        'phase_run_id' => $planning->id,
+        'agent_role' => OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        'idempotency_key' => IdempotencyKey::forDispatch(
+            $delivery->id,
+            OrbitFeatureWorkflow::INITIAL_PHASE,
+            1,
+            OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        )->value,
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'workspace-1',
+        'herdr_tab_id' => 'tab-1',
+        'herdr_pane_id' => 'pane-1',
+        'herdr_terminal_id' => 'terminal-1',
+        'herdr_agent_name' => 'orb-91-loop-builder',
+        'prompt_name' => 'orbit_planning',
+        'prompt_version' => OrbitFeatureWorkflow::PLANNING_PROMPT_VERSION,
+        'prompt_hash' => str_repeat('0', 64),
+        'status' => AgentDispatchStatus::Settled,
+        'state_change_seq' => 12,
+        'dispatched_at' => now()->subMinute(),
+        'settled_at' => now(),
+    ]);
+    $prompt = app(OrbitFeatureWorkflow::class)->planningPrompt(
+        'ORB-91',
+        $worktree,
+        $delivery->id,
+        $planning->id,
+        $dispatch->id,
+        sprintf(
+            '%s %s delivery:submit-orbit-receipt %d %d',
+            escapeshellarg(PHP_BINARY),
+            escapeshellarg(base_path('artisan')),
+            $planning->id,
+            $dispatch->id,
+        ),
+    );
+    $dispatch->forceFill(['prompt_hash' => hash('sha256', $prompt)])->save();
+    $payload = [
+        'kind' => 'orbit_planning',
+        'schema_version' => 1,
+        'delivery_id' => $delivery->id,
+        'dispatch_id' => $dispatch->id,
+        'issue_key' => 'ORB-91',
+        'phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+        'attempt' => 1,
+        'result' => 'blocked',
+        'worktree' => $worktree,
+        'candidate_sha' => $candidate,
+        'handoff_path' => '.loop/runtime/planning-handoff.md',
+        'handoff' => 'Planning stopped on an issue-contract conflict.',
+        'artifact_sha' => null,
+        'plan_sha256' => null,
+    ];
+    $receipt = Receipt::create([
+        'phase_run_id' => $planning->id,
+        'kind' => 'orbit_planning',
+        'schema_version' => 1,
+        'payload' => $payload,
+        'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+        'candidate_sha' => $candidate,
+        'validation_status' => ReceiptValidationStatus::Valid,
+        'captured_at' => now(),
+        'validated_at' => now(),
+    ]);
+    $planning->forceFill([
+        'output' => ['receipt_id' => $receipt->id, 'result' => 'blocked'],
+        'failure_code' => 'planning_blocked',
+        'failure_message' => $payload['handoff'],
+    ])->save();
+    $delivery->forceFill([
+        'status' => DeliveryStatus::Blocked,
+        'failure_details' => [
+            'code' => 'planning_blocked',
+            'phase_run_id' => $planning->id,
+            'dispatch_id' => $dispatch->id,
+            'receipt_id' => $receipt->id,
+            'handoff' => $payload['handoff'],
+        ],
+    ])->save();
+
+    return [$delivery, $planning, $dispatch, $receipt];
 }
 
 it('queues per-delivery recovery only for enabled recoverable deliveries', function (): void {
@@ -414,6 +526,99 @@ it('recovers an exhausted untouched planning correction only when project capaci
     Queue::assertPushed(
         AdvanceDelivery::class,
         fn (AdvanceDelivery $job): bool => $job->deliveryId === $delivery->id,
+    );
+});
+
+it('recovers an exact legacy initial planning blocker only after project capacity is free', function (): void {
+    Queue::fake([AdvanceDelivery::class]);
+    $project = ProjectOrchestration::create([
+        'manifest_project_id' => 'orbit',
+        'config' => [
+            'type' => 'orbit',
+            'repository' => '/home/nckrtl/orbit',
+            'worktreeRoot' => '/fast/worktrees/orbit',
+            'herdrSession' => 'orbit',
+            'concurrency' => 1,
+            'defaultFlow' => 'discovery',
+        ],
+        'state' => ProjectOrchestrationState::Enabled,
+    ]);
+    [$delivery, $planning, $planner, $receipt] = legacyInitialPlanningBlocker($project);
+    $originalPlanning = $planning->getRawOriginal();
+    $originalPlanner = $planner->getRawOriginal();
+    $originalReceipt = $receipt->getRawOriginal();
+    $occupying = Delivery::create([
+        'project_orchestration_id' => $project->id,
+        'external_issue_provider' => 'linear',
+        'external_issue_id' => '66666666-7777-4888-8999-000000000000',
+        'external_issue_key' => 'ORB-92',
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::WaitingForAgent,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+    ]);
+    $recover = app(RecoverInitialOrbitPlanningBlocker::class);
+    $job = new ReconcileDeliveries;
+
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+        initialPlanningBlockers: $recover,
+    );
+
+    expect($delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and(PhaseRun::query()->where('delivery_id', $delivery->id)->count())->toBe(1);
+    Queue::assertNotPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $queued): bool => $queued->deliveryId === $delivery->id,
+    );
+
+    $occupying->forceFill([
+        'status' => DeliveryStatus::Completed,
+        'completed_at' => now(),
+    ])->save();
+    $job->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+        initialPlanningBlockers: $recover,
+    );
+
+    $resolution = PhaseRun::query()
+        ->where('delivery_id', $delivery->id)
+        ->where('phase_name', OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->sole();
+    $resolver = $resolution->agentDispatches()->sole();
+
+    foreach ([
+        [$planning->fresh(), $originalPlanning],
+        [$planner->fresh(), $originalPlanner],
+        [$receipt->fresh(), $originalReceipt],
+    ] as [$current, $original]) {
+        foreach ($original as $attribute => $value) {
+            expect($current->getRawOriginal($attribute))->toBe($value);
+        }
+    }
+
+    expect($delivery->fresh()->status)->toBe(DeliveryStatus::Queued)
+        ->and($delivery->fresh()->current_phase)->toBe(OrbitFeatureWorkflow::RESOLUTION_PHASE)
+        ->and($delivery->fresh()->failure_details)->toBeNull()
+        ->and($resolution->input)->toBe([
+            'planning_receipt_id' => $receipt->id,
+            'planning_receipt' => $receipt->payload,
+        ])
+        ->and(app(OrbitPlanResolutionReceiptValidator::class)->matchesSource(
+            $delivery->fresh('projectOrchestration'),
+            $resolution,
+            $resolver,
+        ))->toBeTrue()
+        ->and($recover->handle($delivery->id))->toBeFalse()
+        ->and(PhaseRun::query()->where('delivery_id', $delivery->id)->count())->toBe(2)
+        ->and(AgentDispatch::query()->whereIn('phase_run_id', [$planning->id, $resolution->id])->count())->toBe(2);
+    Queue::assertPushed(
+        AdvanceDelivery::class,
+        fn (AdvanceDelivery $queued): bool => $queued->deliveryId === $delivery->id,
     );
 });
 

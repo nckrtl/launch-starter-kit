@@ -368,7 +368,7 @@ final readonly class DispatchOrbitPullRequestResolution
         $publishedReview = is_array($input) ? $this->map($input['published_review'] ?? null) : null;
         $pullRequestEvidence = is_array($input) ? ($input['pull_request'] ?? null) : null;
 
-        if ($implementation === null && $planReview !== null) {
+        if ($implementation === null && ($planning !== null || $planReview !== null)) {
             $this->verifyPlanResolution(
                 $delivery,
                 $config,
@@ -429,16 +429,21 @@ final readonly class DispatchOrbitPullRequestResolution
 
     /**
      * @param  array<string, mixed>|null  $planning
-     * @param  array<string, mixed>  $planReview
+     * @param  array<string, mixed>|null  $planReview
      */
     private function verifyPlanResolution(
         Delivery $delivery,
         OrbitProjectConfig $config,
         OrbitDeliveryPreparation $preparation,
         ?array $planning,
-        array $planReview,
+        ?array $planReview,
     ): void {
         $source = $planning ?? $planReview;
+
+        if ($source === null) {
+            throw new OrbitResolutionDispatchFailed('The planning resolution evidence is malformed.');
+        }
+
         $candidate = $this->sha($source, 'candidate_sha');
         $verified = $this->repository->verifyPlanningOutcome(
             $config,
@@ -449,7 +454,7 @@ final readonly class DispatchOrbitPullRequestResolution
         );
 
         if ($candidate !== $delivery->candidate_sha
-            || ($planReview['candidate_sha'] ?? null) !== $candidate
+            || ($planReview !== null && ($planReview['candidate_sha'] ?? null) !== $candidate)
             || $verified->candidateSha !== $candidate
             || $verified->artifactSha !== null
             || $verified->planContentsHash !== null) {
@@ -458,7 +463,7 @@ final readonly class DispatchOrbitPullRequestResolution
             );
         }
 
-        if (($planReview['result'] ?? null) !== 'fix') {
+        if ($planReview === null || ($planReview['result'] ?? null) !== 'fix') {
             return;
         }
 

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace App\Delivery\Workflow;
 
+use App\Delivery\Data\RetiredOrbitStaleWorktree;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ReceiptValidationStatus;
@@ -11,6 +12,7 @@ use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
 use App\Models\Receipt;
+use InvalidArgumentException;
 
 final readonly class OrbitPlanResolutionReceiptValidator
 {
@@ -32,6 +34,10 @@ final readonly class OrbitPlanResolutionReceiptValidator
         }
 
         $matchesSource = match (array_keys($input)) {
+            ['planning_receipt_id', 'planning_receipt'] => $this->matchesInitialPlanningSource(
+                $delivery,
+                $input,
+            ),
             ['plan_review_receipt_id', 'plan_review_receipt'] => $this->matchesReviewSource(
                 $delivery,
                 $input,
@@ -149,6 +155,99 @@ final readonly class OrbitPlanResolutionReceiptValidator
             )
             && $receipt->candidate_sha === ($receipt->payload['candidate_sha'] ?? null)
             && $this->matchesPayload($delivery, $phase, $dispatch, $receipt->payload);
+    }
+
+    /** @param array<string, mixed> $input */
+    private function matchesInitialPlanningSource(Delivery $delivery, array $input): bool
+    {
+        $receiptId = $input['planning_receipt_id'] ?? null;
+        $payload = $input['planning_receipt'] ?? null;
+
+        if (! is_int($receiptId) || ! is_array($payload) || array_is_list($payload)) {
+            return false;
+        }
+
+        $receipt = Receipt::query()->with(['phaseRun.agentDispatches'])->find($receiptId);
+        $planning = $receipt?->phaseRun;
+        $dispatches = $planning?->agentDispatches;
+        $dispatch = $dispatches?->first();
+        $handoff = $payload['handoff'] ?? null;
+
+        $newSource = $planning?->status === PhaseRunStatus::Completed
+            && $planning->failure_code === null
+            && $planning->failure_message === null
+            && $planning->failure_details === null;
+        $legacySource = $planning?->status === PhaseRunStatus::Failed
+            && $planning->failure_code === 'planning_blocked'
+            && $planning->failure_message === $handoff
+            && $planning->failure_details === null;
+
+        return $receipt !== null && $planning !== null && $dispatches !== null && $dispatch !== null
+            && is_string($handoff)
+            && $planning->delivery_id === $delivery->id
+            && $planning->phase_name === OrbitFeatureWorkflow::INITIAL_PHASE
+            && $planning->attempt === 1
+            && ($newSource || $legacySource)
+            && $planning->current_block === null
+            && $planning->output === ['receipt_id' => $receipt->id, 'result' => 'blocked']
+            && $planning->started_at !== null
+            && $planning->finished_at !== null
+            && $dispatches->count() === 1
+            && $dispatch->agent_role === OrbitFeatureWorkflow::PLANNING_AGENT_ROLE
+            && $dispatch->idempotency_key === IdempotencyKey::forDispatch(
+                $delivery->id,
+                OrbitFeatureWorkflow::INITIAL_PHASE,
+                1,
+                OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+            )->value
+            && $dispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-builder'
+            && $dispatch->prompt_name === 'orbit_planning'
+            && $dispatch->prompt_version === OrbitFeatureWorkflow::PLANNING_PROMPT_VERSION
+            && $this->matchesInitialPlanningPrompt($delivery, $planning, $dispatch)
+            && $dispatch->status === AgentDispatchStatus::Settled
+            && $dispatch->dispatched_at !== null
+            && $dispatch->settled_at !== null
+            && $receipt->kind === 'orbit_planning'
+            && $receipt->schema_version === 1
+            && $receipt->validation_status === ReceiptValidationStatus::Valid
+            && $receipt->payload === $payload
+            && ($payload['result'] ?? null) === 'blocked'
+            && ($payload['candidate_sha'] ?? null) === $delivery->candidate_sha
+            && $this->planningReceipts->matches($delivery, $planning, $dispatch, $receipt);
+    }
+
+    private function matchesInitialPlanningPrompt(
+        Delivery $delivery,
+        PhaseRun $planning,
+        AgentDispatch $dispatch,
+    ): bool {
+        $input = $this->associativeArray($planning->input);
+        $retiredValue = is_array($input) ? ($input['retired_stale_worktree'] ?? null) : null;
+
+        try {
+            $retired = is_array($retiredValue)
+                ? RetiredOrbitStaleWorktree::fromArray($retiredValue)
+                : null;
+        } catch (InvalidArgumentException) {
+            return false;
+        }
+
+        if (($retiredValue !== null && $retired === null)
+            || ($retired !== null && $retired->issueKey !== $delivery->external_issue_key)) {
+            return false;
+        }
+
+        $expected = $this->workflow->planningPrompt(
+            (string) $delivery->external_issue_key,
+            (string) $delivery->worktree_path,
+            $delivery->id,
+            $planning->id,
+            $dispatch->id,
+            $this->planningReceiptCommand($planning, $dispatch),
+            $retired,
+        );
+
+        return hash_equals($dispatch->prompt_hash, hash('sha256', $expected));
     }
 
     /** @param array<string, mixed> $input */

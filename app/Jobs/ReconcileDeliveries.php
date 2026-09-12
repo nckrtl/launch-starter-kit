@@ -8,6 +8,7 @@ use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\DispatchOrbitPullRequestReview as DispatchOrbitPullRequestReviewAction;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
+use App\Delivery\Actions\RecoverInitialOrbitPlanningBlocker;
 use App\Delivery\Actions\RecoverOrbitPullRequestReviewTransition;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
@@ -64,9 +65,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
         ?DispatchOrbitPullRequestReviewAction $reviewDispatches = null,
         ?RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries = null,
+        ?RecoverInitialOrbitPlanningBlocker $initialPlanningBlockers = null,
     ): void {
         $reviewDispatches ??= app(DispatchOrbitPullRequestReviewAction::class);
         $reviewTransitionRecoveries ??= app(RecoverOrbitPullRequestReviewTransition::class);
+        $initialPlanningBlockers ??= app(RecoverInitialOrbitPlanningBlocker::class);
 
         Delivery::query()
             ->select([
@@ -89,6 +92,11 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $query->where('status', DeliveryStatus::Failed)
                             ->where('current_phase', OrbitFeatureWorkflow::RESOLUTION_PHASE)
                             ->where('failure_details->code', 'resolution_dispatch_exhausted');
+                    })
+                    ->orWhere(function (Builder $query): void {
+                        $query->where('status', DeliveryStatus::Blocked)
+                            ->where('current_phase', OrbitFeatureWorkflow::INITIAL_PHASE)
+                            ->where('failure_details->code', 'planning_blocked');
                     })
                     ->orWhere(function (Builder $query): void {
                         $query->where('status', DeliveryStatus::Blocked)
@@ -126,6 +134,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 $reviewPublications,
                 $reviewDispatches,
                 $reviewTransitionRecoveries,
+                $initialPlanningBlockers,
             ): void {
                 foreach ($deliveries as $delivery) {
                     $this->dispatchRecovery(
@@ -135,6 +144,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                         $reviewPublications,
                         $reviewDispatches,
                         $reviewTransitionRecoveries,
+                        $initialPlanningBlockers,
                     );
                 }
             }, 'deliveries.id', 'id');
@@ -147,6 +157,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         BindOrbitPullRequestReviewPublicationRecovery $reviewPublications,
         DispatchOrbitPullRequestReviewAction $reviewDispatches,
         RecoverOrbitPullRequestReviewTransition $reviewTransitionRecoveries,
+        RecoverInitialOrbitPlanningBlocker $initialPlanningBlockers,
     ): void {
         if ($delivery->status === DeliveryStatus::Failed) {
             if ($planningCorrections->handle($delivery->id)
@@ -160,6 +171,15 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         if ($delivery->status === DeliveryStatus::Blocked) {
             $phaseRunId = $delivery->failure_details['phase_run_id'] ?? null;
             $failureCode = $delivery->failure_details['code'] ?? null;
+
+            if ($delivery->current_phase === OrbitFeatureWorkflow::INITIAL_PHASE
+                && $failureCode === 'planning_blocked') {
+                if ($initialPlanningBlockers->handle($delivery->id)) {
+                    AdvanceDelivery::dispatch($delivery->id);
+                }
+
+                return;
+            }
 
             if ($delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE
                 && $failureCode === 'pr_review_publication_reconciliation_required') {

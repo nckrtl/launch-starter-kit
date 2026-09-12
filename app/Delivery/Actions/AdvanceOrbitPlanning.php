@@ -20,6 +20,7 @@ use App\Delivery\Exceptions\OrbitPlanningAdvancementFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Delivery\Workflow\OrbitPlanningReceiptValidator;
+use App\Delivery\Workflow\OrbitPlanResolutionReceiptValidator;
 use App\Delivery\Workflow\OrbitPlanReviewReceiptValidator;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -36,6 +37,7 @@ final readonly class AdvanceOrbitPlanning
         private OrbitRepository $repository,
         private OrbitIssueProvider $issues,
         private OrbitPlanningReceiptValidator $planningReceipts,
+        private OrbitPlanResolutionReceiptValidator $resolutionReceipts,
         private OrbitPlanReviewReceiptValidator $reviewReceipts,
         private OrbitFeatureWorkflow $workflow,
     ) {}
@@ -161,7 +163,15 @@ final readonly class AdvanceOrbitPlanning
                 ->latest('attempt')
                 ->first()
             : null;
-        $attempt = $isBlocked ? 1 : ($isResolution ? 2 : $review?->attempt);
+        $resolutionInput = $resolution?->input;
+        $resolutionPlanning = is_array($resolutionInput)
+            ? ($resolutionInput['planning_receipt'] ?? null)
+            : null;
+        $attempt = $isBlocked
+            ? 1
+            : ($isResolution && is_array($resolutionPlanning)
+                ? ($resolutionPlanning['attempt'] ?? null)
+                : $review?->attempt);
 
         if (! in_array($attempt, [1, 2], true)) {
             throw new OrbitPlanningAdvancementFailed('The retained planning transition has an invalid attempt.');
@@ -226,7 +236,7 @@ final readonly class AdvanceOrbitPlanning
         if ($isResolution) {
             $resolutionDispatches = $resolution->agentDispatches()->get();
             $resolutionDispatch = $resolutionDispatches->first();
-            $expectedInput = $this->correctionResolutionInput($planning, $receipt);
+            $expectedInput = $this->resolutionInput($planning, $receipt);
             $expectedKey = IdempotencyKey::forDispatch(
                 $delivery->id,
                 OrbitFeatureWorkflow::RESOLUTION_PHASE,
@@ -234,8 +244,28 @@ final readonly class AdvanceOrbitPlanning
                 OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
             )->value;
 
+            $handoff = $receipt->payload['handoff'] ?? null;
+            $hasInitialSource = $planning->attempt !== 1
+                || ($planning->status === PhaseRunStatus::Completed
+                    && $planning->failure_code === null
+                    && $planning->failure_message === null
+                    && $planning->failure_details === null)
+                || ($planning->status === PhaseRunStatus::Failed
+                    && is_string($handoff)
+                    && $planning->failure_code === 'planning_blocked'
+                    && $planning->failure_message === $handoff
+                    && $planning->failure_details === null);
+
             if ($result !== 'blocked'
-                || $planning->status !== PhaseRunStatus::Completed
+                || ($planning->attempt === 2 && $planning->status !== PhaseRunStatus::Completed)
+                || ! $hasInitialSource
+                || ($planning->attempt === 1
+                    && (! ($resolutionDispatch instanceof AgentDispatch)
+                        || ! $this->resolutionReceipts->matchesSource(
+                            $delivery,
+                            $resolution,
+                            $resolutionDispatch,
+                        )))
                 || $resolution->status !== PhaseRunStatus::Pending
                 || $resolution->input !== $expectedInput
                 || $resolutionDispatches->count() !== 1
@@ -246,7 +276,7 @@ final readonly class AdvanceOrbitPlanning
                 || $resolutionDispatch->prompt_name !== 'orbit_resolution'
                 || $resolutionDispatch->prompt_version !== 1
                 || $resolutionDispatch->prompt_hash !== str_repeat('0', 64)) {
-                throw new OrbitPlanningAdvancementFailed('The retained correction-resolution transition is inconsistent.');
+                throw new OrbitPlanningAdvancementFailed('The retained planning-resolution transition is inconsistent.');
             }
 
             return true;
@@ -417,24 +447,6 @@ final readonly class AdvanceOrbitPlanning
                 if (! is_string($handoff) || trim($handoff) === '') {
                     throw new OrbitPlanningAdvancementFailed('The blocked planning receipt has no actionable handoff.');
                 }
-
-                $phase->status = PhaseRunStatus::Failed;
-                $phase->failure_code = 'planning_blocked';
-                $phase->failure_message = $handoff;
-                $phase->save();
-
-                $delivery->status = DeliveryStatus::Blocked;
-                $delivery->candidate_sha = $verified->candidateSha;
-                $delivery->failure_details = [
-                    'code' => 'planning_blocked',
-                    'phase_run_id' => $phase->id,
-                    'dispatch_id' => $dispatch->id,
-                    'receipt_id' => $receipt->id,
-                    'handoff' => $handoff,
-                ];
-                $delivery->save();
-
-                return false;
             }
 
             if (! in_array($result, ['ready', 'blocked'], true)
@@ -461,7 +473,7 @@ final readonly class AdvanceOrbitPlanning
                 );
             $nextPrompt = $isResolution ? 'orbit_resolution' : 'orbit_plan_review';
             $nextInput = $isResolution
-                ? $this->correctionResolutionInput($phase, $receipt)
+                ? $this->resolutionInput($phase, $receipt)
                 : [
                     'planning_receipt_id' => $receipt->id,
                     'planning_receipt' => $receipt->payload,
@@ -499,6 +511,8 @@ final readonly class AdvanceOrbitPlanning
                 ],
             );
 
+            $delivery->candidate_sha = $verified->candidateSha;
+
             if ($next->status !== PhaseRunStatus::Pending
                 || $next->input !== $nextInput
                 || $nextDispatch->idempotency_key !== $idempotencyKey
@@ -507,12 +521,17 @@ final readonly class AdvanceOrbitPlanning
                 || $nextDispatch->prompt_version !== 1
                 || $nextDispatch->prompt_hash !== str_repeat('0', 64)
                 || $next->agentDispatches()->count() !== 1
-                || $nextDispatch->status !== AgentDispatchStatus::Pending) {
+                || $nextDispatch->status !== AgentDispatchStatus::Pending
+                || ($isResolution && $phase->attempt === 1
+                    && ! $this->resolutionReceipts->matchesSource(
+                        $delivery,
+                        $next,
+                        $nextDispatch,
+                    ))) {
                 throw new OrbitPlanningAdvancementFailed('The retained post-planning intent is inconsistent.');
             }
 
             $delivery->current_phase = $nextPhase;
-            $delivery->candidate_sha = $verified->candidateSha;
             $delivery->status = DeliveryStatus::Queued;
             $delivery->failure_details = null;
             $delivery->save();
@@ -522,8 +541,15 @@ final readonly class AdvanceOrbitPlanning
     }
 
     /** @return array<string, mixed> */
-    private function correctionResolutionInput(PhaseRun $phase, Receipt $receipt): array
+    private function resolutionInput(PhaseRun $phase, Receipt $receipt): array
     {
+        if ($phase->attempt === 1) {
+            return [
+                'planning_receipt_id' => $receipt->id,
+                'planning_receipt' => $receipt->payload,
+            ];
+        }
+
         $input = $phase->input;
         $reviewReceiptId = is_array($input) ? ($input['plan_review_receipt_id'] ?? null) : null;
         $reviewReceipt = is_array($input) ? ($input['plan_review_receipt'] ?? null) : null;
