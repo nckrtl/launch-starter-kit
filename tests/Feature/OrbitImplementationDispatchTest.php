@@ -6,6 +6,7 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitImplementation;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
@@ -153,15 +154,25 @@ final class ImplementationDispatchRepository implements OrbitRepository
     }
 }
 
-final class ImplementationDispatchIssueProvider implements OrbitIssueProvider
+final class ImplementationDispatchIssueProvider implements OrbitActiveIssueProvider, OrbitIssueProvider
 {
     public int $calls = 0;
+
+    public int $activeCalls = 0;
 
     public function __construct(public OrbitIssueSnapshot $snapshot) {}
 
     public function fetch(string $issueId, string $issueKey): OrbitIssueSnapshot
     {
         $this->calls++;
+
+        return $this->snapshot;
+    }
+
+    public function fetchActive(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        $this->calls++;
+        $this->activeCalls++;
 
         return $this->snapshot;
     }
@@ -450,6 +461,7 @@ beforeEach(function () {
     app()->instance(OrbitRepository::class, $this->repository);
     app()->instance(OrbitImplementationRepository::class, $this->implementationVerifier);
     app()->instance(OrbitIssueProvider::class, $this->issues);
+    app()->instance(OrbitActiveIssueProvider::class, $this->issues);
     app()->instance(OrbitIssueTransitioner::class, $this->issueTransitioner);
     app()->instance(HerdrRuntime::class, $this->herdr);
     Queue::fake();
@@ -658,6 +670,7 @@ function promoteImplementationToMergeConflictCorrection(object $test): void
     ])->save();
     $test->repository->calls = [];
     $test->issues->calls = 0;
+    $test->issues->activeCalls = 0;
     $test->herdr->calls = [];
     $test->herdr->prompts = [];
     $test->implementationVerifier->calls = 0;
@@ -861,6 +874,7 @@ function promoteImplementationToPullRequestReviewCorrection(object $test): void
     );
     $test->repository->calls = [];
     $test->issues->calls = 0;
+    $test->issues->activeCalls = 0;
     $test->issueTransitioner->calls = 0;
     $test->herdr->calls = [];
     $test->herdr->prompts = [];
@@ -889,6 +903,7 @@ it('prompts the exact retained Builder with the immutable passing review', funct
             'reserve', 'verify-candidate', 'verify-artifact', 'verify-candidate', 'verify-artifact',
         ])
         ->and($this->issues->calls)->toBe(2)
+        ->and($this->issues->activeCalls)->toBe(0)
         ->and($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
         ->and($dispatch->herdr_pane_id)->toBe($this->builder->herdr_pane_id)
         ->and($dispatch->herdr_agent_id)->toBe($this->builder->herdr_agent_id)
@@ -968,6 +983,7 @@ it('returns Linear to In Progress and prompts the retained Builder with immutabl
 
     expect($this->issueTransitioner->calls)->toBe(1)
         ->and($this->issues->calls)->toBe(2)
+        ->and($this->issues->activeCalls)->toBe(1)
         ->and($this->issues->snapshot->payload['state']['name'])->toBe('In Progress')
         ->and($this->herdr->calls)->toBe(['get', 'prompt'])
         ->and($this->implementationVerifier->calls)->toBe(2)

@@ -6,6 +6,7 @@ namespace App\Delivery\Actions;
 
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\HerdrRuntime;
+use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitIssueProvider;
 use App\Delivery\Contracts\OrbitIssueTransitioner;
@@ -42,6 +43,7 @@ final readonly class DispatchOrbitImplementation
         private OrbitRepository $repository,
         private OrbitImplementationRepository $implementations,
         private OrbitIssueProvider $issues,
+        private OrbitActiveIssueProvider $activeIssues,
         private OrbitIssueTransitioner $transitions,
         private HerdrRuntime $herdr,
         private OrbitFeatureWorkflow $workflow,
@@ -320,12 +322,15 @@ final readonly class DispatchOrbitImplementation
         Receipt $sourceReceipt,
         bool $allowPullRequestReviewState = false,
     ): OrbitIssueSnapshot {
-        $issue = $this->issues->fetch($preparation->snapshot->issueId, $preparation->snapshot->issueKey);
+        $allowActiveState = $allowPullRequestReviewState && $phase->attempt === 2;
+        $issue = $allowActiveState
+            ? $this->activeIssues->fetchActive($preparation->snapshot->issueId, $preparation->snapshot->issueKey)
+            : $this->issues->fetch($preparation->snapshot->issueId, $preparation->snapshot->issueKey);
         $this->assertCurrentIssue(
             $delivery,
             $preparation,
             $issue,
-            $allowPullRequestReviewState && $phase->attempt === 2,
+            $allowActiveState,
         );
 
         if ($sourceReceipt->kind === 'orbit_implementation') {
