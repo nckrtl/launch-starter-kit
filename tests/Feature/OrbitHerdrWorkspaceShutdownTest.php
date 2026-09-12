@@ -184,6 +184,7 @@ it('exits owned agents, verifies idle shells, and closes only the recorded works
 
     $state = $this->phase->fresh()->output['workspace_shutdown'];
     expect($state['exit_attempted']['orb-234-loop-builder']['command'])->toBe('/quit')
+        ->and($state['exit_attempted']['orb-234-loop-builder']['attempt_count'])->toBe(1)
         ->and($state['exit_submitted']['orb-234-loop-builder']['command'])->toBe('/quit')
         ->and($state['workspace_close_attempted_at'])->toBeString()
         ->and($state['closed'])->toMatchArray([
@@ -283,21 +284,105 @@ it('rejects another failed dispatch without a runtime identity', function () {
         ->toThrow(OrbitLandingAdvancementFailed::class, 'incomplete Herdr dispatch identity');
 });
 
-it('waits without replaying exit input while an owned agent remains', function () {
+it('retries a swallowed exit command twice and then waits without replaying it', function () {
     $snapshot = shutdownSnapshot($this->repository, $this->worktree, agentStatus: 'idle');
     $this->herdr->snapshots = [$snapshot];
     $this->herdr->agentOutput = 'Agent is idle. No command is waiting.';
 
     expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeFalse()
-        ->and($this->herdr->sentKeys)->toBe([[
-            'name' => 'orb-234-loop-builder',
-            'keys' => ['/', 'q', 'u', 'i', 't', 'enter'],
-        ]])
+        ->and($this->herdr->sentKeys)->toBe([
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['ctrl+c', '/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['ctrl+c', '/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+        ])
         ->and($this->herdr->closedWorkspaces)->toBeEmpty();
     Sleep::assertSleptTimes(10);
 
     expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeFalse()
-        ->and($this->herdr->sentKeys)->toHaveCount(1);
+        ->and($this->herdr->sentKeys)->toHaveCount(3);
+
+    $attempt = $this->phase->fresh()->output['workspace_shutdown']['exit_attempted']['orb-234-loop-builder'];
+    expect($attempt['attempt_count'])->toBe(3)
+        ->and($attempt['last_attempted_at'])->toBeString();
+});
+
+it('stops retrying as soon as the owned agent exits', function () {
+    $withAgent = shutdownSnapshot($this->repository, $this->worktree, agentStatus: 'idle');
+    $withoutAgent = shutdownSnapshot($this->repository, $this->worktree);
+    $closed = shutdownSnapshot($this->repository, $this->worktree, includeTarget: false);
+    $this->herdr->snapshots = [$withAgent, $withAgent, $withoutAgent, $withoutAgent, $closed];
+    $this->herdr->agentOutput = 'Agent is idle. No command is waiting.';
+
+    expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeTrue()
+        ->and($this->herdr->sentKeys)->toBe([
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['ctrl+c', '/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+        ])
+        ->and($this->herdr->closedWorkspaces)->toBe(['issue-workspace']);
+});
+
+it('resumes a retained exit intent created before attempt counts were recorded', function () {
+    $snapshot = shutdownSnapshot($this->repository, $this->worktree, agentStatus: 'idle');
+    $this->herdr->snapshots = [$snapshot];
+    $this->herdr->agentOutput = 'Agent is idle. No command is waiting.';
+
+    expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeFalse();
+
+    $phase = $this->phase->fresh();
+    $output = $phase->output;
+    unset(
+        $output['workspace_shutdown']['exit_attempted']['orb-234-loop-builder']['attempt_count'],
+        $output['workspace_shutdown']['exit_attempted']['orb-234-loop-builder']['last_attempted_at'],
+    );
+    $phase->output = $output;
+    $phase->save();
+    $this->herdr->sentKeys = [];
+
+    expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeFalse()
+        ->and($this->herdr->sentKeys)->toBe([
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['ctrl+c', '/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['ctrl+c', '/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+        ])
+        ->and($this->phase->fresh()->output['workspace_shutdown']['exit_attempted']['orb-234-loop-builder']['attempt_count'])
+        ->toBe(3);
+});
+
+it('rejects a retained retry count without its retry timestamp', function () {
+    $snapshot = shutdownSnapshot($this->repository, $this->worktree, agentStatus: 'idle');
+    $this->herdr->snapshots = [$snapshot];
+    $this->herdr->agentOutput = 'Agent is idle. No command is waiting.';
+
+    expect($this->action->handle($this->config, $this->delivery->id, $this->phase->id))->toBeFalse();
+
+    $phase = $this->phase->fresh();
+    $output = $phase->output;
+    unset($output['workspace_shutdown']['exit_attempted']['orb-234-loop-builder']['last_attempted_at']);
+    $phase->output = $output;
+    $phase->save();
+
+    expect(fn () => $this->action->handle($this->config, $this->delivery->id, $this->phase->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'exit intent is inconsistent');
 });
 
 it('uses the Claude exit command for an owned Claude agent', function () {

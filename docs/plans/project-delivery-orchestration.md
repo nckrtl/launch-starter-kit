@@ -55,7 +55,11 @@ ID recorded by the delivery, accepts only ledger-owned idle or done agents,
 records exit and close intent before sending input, verifies idle shells, and
 checks that no unrelated Herdr workspace, agent, or pane disappeared. It supports
 the installed protocol 20 close request and sends the explicit `close_group:
-false` guard on protocol 22 and newer.
+false` guard on protocol 22 and newer. When an owned idle agent consumes an exit
+command without showing it at the prompt, Commander clears that idle input and
+retries the same provider-specific command at most twice. The attempt count is
+persisted before each retry, so reconciliation never becomes an unbounded input
+loop.
 
 Worktree cleanup is also a persistent landing stage. The first attempt requires
 the exact clean worktree and candidate branch. Commander persists successful

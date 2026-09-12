@@ -31,6 +31,8 @@ final readonly class ShutdownOrbitHerdrWorkspace
 
     private const int AGENT_EXIT_ATTEMPTS = 11;
 
+    private const int AGENT_EXIT_COMMAND_ATTEMPTS = 3;
+
     private const int SHELL_READY_ATTEMPTS = 21;
 
     private const int POLL_MICROSECONDS = 100_000;
@@ -472,6 +474,7 @@ final readonly class ShutdownOrbitHerdrWorkspace
                     $next = $state;
                     $exitAttempted[$name] = [
                         'command' => $command,
+                        'attempt_count' => 1,
                         'attempted_at' => now()->toISOString(),
                     ];
                     ksort($exitAttempted, SORT_STRING);
@@ -482,17 +485,17 @@ final readonly class ShutdownOrbitHerdrWorkspace
                     continue;
                 }
 
-                if (! is_array($attempted) || ($attempted['command'] ?? null) !== $command) {
-                    throw new OrbitLandingAdvancementFailed(
-                        'The retained Orbit Herdr agent exit intent is inconsistent.',
-                    );
-                }
+                $exitAttempt = $this->exitAttempt($attempted, $command);
+                $attemptCount = $exitAttempt['attempt_count'];
 
                 if ($submitted === null) {
                     $output = $this->herdr->readAgent($name);
 
-                    if ($this->matchesAgentOutput($agent, $output)
-                        && $this->showsExactExitCommand($output->text, $command)) {
+                    if (! $this->matchesAgentOutput($agent, $output)) {
+                        continue;
+                    }
+
+                    if ($this->showsExactExitCommand($output->text, $command)) {
                         $next = $state;
                         $exitSubmitted[$name] = [
                             'command' => $command,
@@ -502,6 +505,20 @@ final readonly class ShutdownOrbitHerdrWorkspace
                         $next['exit_submitted'] = $exitSubmitted;
                         $state = $this->persistState($deliveryId, $phaseId, $state, $next);
                         $this->herdr->sendAgentKeys($name, ['enter']);
+                    } elseif ($attemptCount < self::AGENT_EXIT_COMMAND_ATTEMPTS) {
+                        $next = $state;
+                        $exitAttempted[$name] = [
+                            ...$exitAttempt,
+                            'attempt_count' => $attemptCount + 1,
+                            'last_attempted_at' => now()->toISOString(),
+                        ];
+                        ksort($exitAttempted, SORT_STRING);
+                        $next['exit_attempted'] = $exitAttempted;
+                        $state = $this->persistState($deliveryId, $phaseId, $state, $next);
+                        $this->herdr->sendAgentKeys(
+                            $name,
+                            ['ctrl+c', ...str_split($command), 'enter'],
+                        );
                     }
                 } elseif (! is_array($submitted) || ($submitted['command'] ?? null) !== $command) {
                     throw new OrbitLandingAdvancementFailed(
@@ -528,6 +545,39 @@ final readonly class ShutdownOrbitHerdrWorkspace
         }
 
         return [$snapshot, $state];
+    }
+
+    /** @return array{command: string, attempt_count: int, attempted_at: string, last_attempted_at?: string} */
+    private function exitAttempt(mixed $attempted, string $command): array
+    {
+        $attemptCount = is_array($attempted) ? ($attempted['attempt_count'] ?? 1) : null;
+        $attemptedAt = is_array($attempted) ? ($attempted['attempted_at'] ?? null) : null;
+        $lastAttemptedAt = is_array($attempted) ? ($attempted['last_attempted_at'] ?? null) : null;
+
+        if (! is_array($attempted) || array_is_list($attempted)
+            || ($attempted['command'] ?? null) !== $command
+            || ! is_int($attemptCount) || $attemptCount < 1
+            || $attemptCount > self::AGENT_EXIT_COMMAND_ATTEMPTS
+            || ! is_string($attemptedAt) || $attemptedAt === ''
+            || ($attemptCount > 1 && $lastAttemptedAt === null)
+            || ($lastAttemptedAt !== null
+                && (! is_string($lastAttemptedAt) || $lastAttemptedAt === ''))) {
+            throw new OrbitLandingAdvancementFailed(
+                'The retained Orbit Herdr agent exit intent is inconsistent.',
+            );
+        }
+
+        $exitAttempt = [
+            'command' => $command,
+            'attempt_count' => $attemptCount,
+            'attempted_at' => $attemptedAt,
+        ];
+
+        if (is_string($lastAttemptedAt)) {
+            $exitAttempt['last_attempted_at'] = $lastAttemptedAt;
+        }
+
+        return $exitAttempt;
     }
 
     private function awaitIdleShell(HerdrSnapshotPane $pane): void

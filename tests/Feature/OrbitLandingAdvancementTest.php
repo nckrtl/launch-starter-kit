@@ -1998,14 +1998,27 @@ it('retains the merge reservation while Commander waits for owned Herdr agents t
         ->and($this->gateway->releaseCalls)->toBe(0)
         ->and($this->primaryCheckout->calls)->toBe(1)
         ->and($this->herdrWorkspace->closeCalls)->toBe(0)
-        ->and($this->herdrWorkspace->sentKeys)->toHaveCount(1)
+        ->and($this->herdrWorkspace->sentKeys)->toBe([
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['ctrl+c', '/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+            [
+                'name' => 'orb-234-loop-builder',
+                'keys' => ['ctrl+c', '/', 'q', 'u', 'i', 't', 'enter'],
+            ],
+        ])
         ->and(MaintenanceRun::count())->toBe(1);
 
     expect(app(AdvanceOrbitLanding::class)->handle($this->delivery->id, $this->landing->id))
         ->toBe(AdvanceOrbitLanding::RETRY_SECONDS)
         ->and($this->gateway->releaseCalls)->toBe(0)
         ->and($this->primaryCheckout->calls)->toBe(1)
-        ->and($this->herdrWorkspace->sentKeys)->toHaveCount(1);
+        ->and($this->herdrWorkspace->sentKeys)->toHaveCount(3);
 });
 
 it('lands the exact candidate approved by the second pull request review', function () {
