@@ -418,7 +418,12 @@ it('correlates retained Builder completion to the correction dispatch', function
 
     $event = app(CaptureHerdrEvent::class)->handle([
         'event' => 'pane.agent_status_changed',
-        'data' => ['pane_id' => 'builder-pane', 'workspace_id' => 'workspace-1', 'agent_status' => 'done'],
+        'data' => [
+            'pane_id' => 'builder-pane',
+            'workspace_id' => 'workspace-1',
+            'agent_status' => 'done',
+            'state_change_seq' => $this->dispatch->fresh()->state_change_seq + 1,
+        ],
     ]);
 
     expect($event?->agent_dispatch_id)->toBe($this->dispatch->id)
@@ -533,7 +538,12 @@ it('preserves settlement while the correction prompt returns', function () {
     $this->herdr->beforePromptReturn = function (): void {
         app(CaptureHerdrEvent::class)->handle([
             'event' => 'pane.agent_status_changed',
-            'data' => ['pane_id' => 'builder-pane', 'workspace_id' => 'workspace-1', 'agent_status' => 'done'],
+            'data' => [
+                'pane_id' => 'builder-pane',
+                'workspace_id' => 'workspace-1',
+                'agent_status' => 'done',
+                'state_change_seq' => $this->dispatch->fresh()->state_change_seq + 1,
+            ],
         ]);
     };
 

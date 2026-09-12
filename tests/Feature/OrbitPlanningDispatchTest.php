@@ -717,6 +717,7 @@ it('settles live planning events and queues the unified advancement job', functi
             'pane_id' => $dispatch->herdr_pane_id,
             'workspace_id' => $dispatch->herdr_workspace_id,
             'agent_status' => 'done',
+            'state_change_seq' => 43,
         ],
     ]);
 
@@ -724,6 +725,35 @@ it('settles live planning events and queues the unified advancement job', functi
         ->and(ExternalEvent::sole()->delivery_id)->toBe($this->delivery->id)
         ->and(ExternalEvent::sole()->processed_at)->not->toBeNull();
     Queue::assertPushed(AdvanceDelivery::class, 1);
+});
+
+it('does not settle an unsequenced startup event while the planning prompt is in flight', function () {
+    config()->set('herdr.orchestration.enabled', true);
+    config()->set('herdr.session', 'orbit');
+    $event = null;
+    $this->herdr->beforePromptReturn = function () use (&$event): void {
+        $dispatch = AgentDispatch::sole();
+
+        $event = app(CaptureHerdrEvent::class)->handle([
+            'event' => 'pane.agent_status_changed',
+            'data' => [
+                'pane_id' => $dispatch->herdr_pane_id,
+                'workspace_id' => $dispatch->herdr_workspace_id,
+                'agent_status' => 'idle',
+            ],
+        ]);
+    };
+
+    $dispatch = app(DispatchOrbitPlanning::class)->handle($this->delivery->id);
+
+    expect($dispatch->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($dispatch->settled_at)->toBeNull()
+        ->and($event?->delivery_id)->toBe($this->delivery->id)
+        ->and($event?->agent_dispatch_id)->toBe($dispatch->id)
+        ->and($event?->failure_message)->toBe('unsequenced_dispatch_event')
+        ->and($event?->processed_at)->not->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent);
+    Queue::assertNothingPushed();
 });
 
 it('does not overwrite a plan-review transition committed before the prompt call returns', function () {
@@ -738,6 +768,7 @@ it('does not overwrite a plan-review transition committed before the prompt call
                 'pane_id' => $dispatch->herdr_pane_id,
                 'workspace_id' => $dispatch->herdr_workspace_id,
                 'agent_status' => 'done',
+                'state_change_seq' => $dispatch->state_change_seq + 1,
             ],
         ]);
 

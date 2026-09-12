@@ -877,6 +877,7 @@ it('preserves receipt and settlement races while the reviewer prompt returns', f
                 'pane_id' => $dispatch->herdr_pane_id,
                 'workspace_id' => $dispatch->herdr_workspace_id,
                 'agent_status' => 'done',
+                'state_change_seq' => $dispatch->state_change_seq + 1,
             ],
         ]);
         app(CaptureOrbitPlanReviewReceipt::class)->handle(

@@ -213,15 +213,25 @@ final readonly class CaptureHerdrEvent
                 return false;
             }
 
+            if ($stateChangeSeq === null
+                || $locked->state_change_seq === null
+                || $stateChangeSeq <= $locked->state_change_seq) {
+                $event->delivery_id = $phaseRun->delivery_id;
+                $event->agent_dispatch_id = $locked->id;
+                $event->failure_message = $stateChangeSeq === null
+                    ? 'unsequenced_dispatch_event'
+                    : 'stale_dispatch_event';
+                $event->save();
+
+                return false;
+            }
+
             if ($locked->status !== AgentDispatchStatus::Settled) {
                 $locked->status = AgentDispatchStatus::Settled;
                 $locked->settled_at = now();
             }
 
-            if ($stateChangeSeq !== null
-                && ($locked->state_change_seq === null || $stateChangeSeq > $locked->state_change_seq)) {
-                $locked->state_change_seq = $stateChangeSeq;
-            }
+            $locked->state_change_seq = $stateChangeSeq;
 
             $locked->save();
 

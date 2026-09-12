@@ -177,6 +177,7 @@ it('starts each phase once and advances two phases idempotently from repeated ev
             'pane_id' => $dispatch->herdr_pane_id,
             'workspace_id' => $dispatch->herdr_workspace_id,
             'agent_status' => 'idle',
+            'state_change_seq' => $dispatch->state_change_seq + 1,
         ],
     ];
     app(CaptureHerdrEvent::class)->handle($envelope);
@@ -205,6 +206,7 @@ it('starts each phase once and advances two phases idempotently from repeated ev
             'pane_id' => $secondDispatch->herdr_pane_id,
             'workspace_id' => $secondDispatch->herdr_workspace_id,
             'agent_status' => 'done',
+            'state_change_seq' => $secondDispatch->state_change_seq + 1,
         ],
     ]);
     app(CaptureHarmlessReceipt::class)->handle($second, workflowReceipt($second));
@@ -251,6 +253,7 @@ it('correlates a reused Herdr pane to its current active dispatch', function () 
         'prompt_version' => 1,
         'prompt_hash' => str_repeat('1', 64),
         'status' => AgentDispatchStatus::Waiting,
+        'state_change_seq' => $first->state_change_seq,
         'dispatched_at' => now(),
     ]);
     $this->delivery->forceFill([
@@ -265,6 +268,7 @@ it('correlates a reused Herdr pane to its current active dispatch', function () 
             'pane_id' => $first->herdr_pane_id,
             'workspace_id' => $first->herdr_workspace_id,
             'agent_status' => 'done',
+            'state_change_seq' => $second->state_change_seq + 1,
         ],
     ]);
 
