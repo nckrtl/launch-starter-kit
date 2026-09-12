@@ -4,7 +4,10 @@ declare(strict_types=1);
 
 namespace App\Jobs;
 
+use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
+use App\Delivery\Exceptions\HerdrSettlementObservationFailed;
+use App\Delivery\Exceptions\HerdrSettlementReconciliationFailed;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
@@ -28,14 +31,22 @@ final class ReconcileDelivery implements ShouldBeUniqueUntilProcessing, ShouldQu
 
     private CarbonImmutable $retryDeadline;
 
-    public function __construct(public readonly int $deliveryId)
-    {
+    public function __construct(
+        public readonly int $deliveryId,
+        public readonly int $phaseRunId,
+        public readonly int $dispatchId,
+    ) {
         $this->retryDeadline = now()->addMinutes(5)->toImmutable();
     }
 
     public function uniqueId(): string
     {
-        return "commander-delivery-reconciliation:{$this->deliveryId}";
+        return implode(':', [
+            'commander-delivery-reconciliation',
+            $this->deliveryId,
+            $this->phaseRunId,
+            $this->dispatchId,
+        ]);
     }
 
     public function retryUntil(): DateTimeInterface
@@ -43,9 +54,17 @@ final class ReconcileDelivery implements ShouldBeUniqueUntilProcessing, ShouldQu
         return $this->retryDeadline;
     }
 
-    public function handle(ReconcileWaitingHerdrSettlement $settlements): void
-    {
-        $lock = Cache::lock("delivery:reconcile:{$this->deliveryId}", 60);
+    public function handle(
+        ReconcileWaitingHerdrSettlement $settlements,
+        ReconcileOrbitPullRequestReviewWait $pullRequestReviews,
+    ): void {
+        $lock = Cache::lock(implode(':', [
+            'delivery',
+            'reconcile',
+            $this->deliveryId,
+            $this->phaseRunId,
+            $this->dispatchId,
+        ]), 60);
 
         if (! $lock->get()) {
             $this->release(1);
@@ -54,18 +73,63 @@ final class ReconcileDelivery implements ShouldBeUniqueUntilProcessing, ShouldQu
         }
 
         try {
-            $settled = $settlements->handle($this->deliveryId);
+            try {
+                $observation = $settlements->handle(
+                    $this->deliveryId,
+                    $this->phaseRunId,
+                    $this->dispatchId,
+                );
+            } catch (HerdrSettlementObservationFailed $exception) {
+                if (! $pullRequestReviews->waitIsOverdue(
+                    $this->deliveryId,
+                    $this->phaseRunId,
+                    $this->dispatchId,
+                )) {
+                    return;
+                }
+
+                throw $exception;
+            } catch (HerdrSettlementReconciliationFailed $exception) {
+                if (! $pullRequestReviews->isActiveReview(
+                    $this->deliveryId,
+                    $this->phaseRunId,
+                    $this->dispatchId,
+                )) {
+                    throw $exception;
+                }
+
+                $pullRequestReviews->blockIdentityFailure(
+                    $this->deliveryId,
+                    $this->phaseRunId,
+                    $this->dispatchId,
+                    $exception,
+                );
+
+                return;
+            }
+
+            $pullRequestReviews->handle(
+                $this->deliveryId,
+                $this->phaseRunId,
+                $this->dispatchId,
+                $observation,
+            );
         } finally {
             $lock->release();
-        }
-
-        if (! $settled) {
-            AdvanceDelivery::dispatch($this->deliveryId)->afterCommit();
         }
     }
 
     public function failed(?Throwable $exception): void
     {
+        if ($exception instanceof HerdrSettlementObservationFailed) {
+            app(ReconcileOrbitPullRequestReviewWait::class)->blockObservationFailure(
+                $this->deliveryId,
+                $this->phaseRunId,
+                $this->dispatchId,
+                $exception,
+            );
+        }
+
         if ($exception !== null) {
             report($exception);
         }

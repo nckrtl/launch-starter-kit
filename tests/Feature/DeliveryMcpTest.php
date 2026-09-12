@@ -4,7 +4,9 @@ use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\StartShadowDelivery;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Enums\AgentDispatchStatus;
+use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Mcp\Servers\CommanderServer;
 use App\Mcp\Tools\GetDelivery;
 use App\Mcp\Tools\GetDeliveryTimeline;
@@ -110,6 +112,63 @@ it('returns the current phase and Herdr wait reason', function () {
             ->etc());
 
     expect($dispatch->exists)->toBeTrue();
+});
+
+it('returns Orbit pull request review wait and receipt deadlines', function () {
+    $this->delivery->forceFill([
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'status' => DeliveryStatus::WaitingForAgent,
+        'current_phase' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+    ])->save();
+    $phase = PhaseRun::query()->create([
+        'delivery_id' => $this->delivery->id,
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'attempt' => 1,
+        'status' => PhaseRunStatus::Running,
+        'started_at' => now()->subHour(),
+    ]);
+    $dispatch = AgentDispatch::query()->create([
+        'phase_run_id' => $phase->id,
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'idempotency_key' => 'delivery-mcp-pr-review',
+        'herdr_agent_name' => 'orb-234-pr-reviewer',
+        'prompt_name' => 'orbit_pr_review',
+        'prompt_version' => 1,
+        'prompt_hash' => str_repeat('c', 64),
+        'status' => AgentDispatchStatus::Waiting,
+        'dispatched_at' => now()->subHour(),
+    ]);
+
+    CommanderServer::tool(GetDelivery::class, ['delivery_id' => $this->delivery->id])
+        ->assertOk()
+        ->assertStructuredContent(fn ($json) => $json
+            ->where('wait.reason', 'herdr_agent')
+            ->where('wait.details', [
+                'agent_name' => 'orb-234-pr-reviewer',
+                'dispatch_id' => $dispatch->id,
+                'dispatched_at' => '2026-09-10T11:00:00.000000Z',
+                'wait_deadline_at' => '2026-09-10T12:00:00.000000Z',
+                'overdue' => true,
+            ])
+            ->etc());
+
+    $dispatch->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now()->subMinutes(5),
+    ])->save();
+
+    CommanderServer::tool(GetDelivery::class, ['delivery_id' => $this->delivery->id])
+        ->assertOk()
+        ->assertStructuredContent(fn ($json) => $json
+            ->where('wait.reason', 'receipt')
+            ->where('wait.details', [
+                'dispatch_id' => $dispatch->id,
+                'settled_at' => '2026-09-10T11:55:00.000000Z',
+                'receipt_deadline_at' => '2026-09-10T12:00:00.000000Z',
+                'overdue' => true,
+            ])
+            ->etc());
 });
 
 it('returns empty and populated deterministic timelines', function () {

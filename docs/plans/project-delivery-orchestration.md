@@ -123,6 +123,18 @@ advancement path. A working agent, stale observation, disabled capture, or
 transient Herdr read failure remains unchanged. This recovers a missed terminal
 webhook without re-prompting, replacing, or killing an agent.
 
+Orbit pull request review reconciliation is also time-bounded. Each job carries
+the exact delivery, phase-run, and dispatch IDs. A reviewer gets one hour from
+its recorded dispatch time, and a settled reviewer gets five minutes to submit
+its receipt. A newer exact `idle` or `done` observation settles through the
+normal event path before timeout is considered. Exact non-terminal observations
+at the boundary block with retained evidence; Herdr observation failures retry
+before they become a separate explicit failure. Receipt and event capture use
+the same ordered ledger locks, so whichever exact transition commits first wins.
+A timed-out dispatch remains truthfully `waiting`; pre-merge cleanup accepts only
+that exact failed review dispatch and still requires the real agent to be idle or
+done before shutting down its workspace.
+
 Live canaries use the `controller:commander` Linear label as an explicit
 ownership handoff. Commander requires a complete, valid label page before
 preparation, rejects a concurrent `maintenance:monorepo` label, and checks the

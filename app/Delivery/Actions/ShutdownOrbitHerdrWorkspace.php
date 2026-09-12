@@ -192,7 +192,13 @@ final readonly class ShutdownOrbitHerdrWorkspace
         $terminalIds = [];
 
         foreach ($dispatches as $dispatch) {
-            if ($dispatch->status !== AgentDispatchStatus::Settled
+            $retainedWaitingReviewer = $this->isRetainedWaitingReviewer(
+                $delivery,
+                $phase,
+                $dispatch,
+            );
+
+            if (($dispatch->status !== AgentDispatchStatus::Settled && ! $retainedWaitingReviewer)
                 || ! is_string($dispatch->herdr_session) || $dispatch->herdr_session === ''
                 || ! is_string($dispatch->herdr_workspace_id) || $dispatch->herdr_workspace_id === ''
                 || ! is_string($dispatch->herdr_pane_id) || $dispatch->herdr_pane_id === ''
@@ -248,6 +254,44 @@ final readonly class ShutdownOrbitHerdrWorkspace
             'pane_ids' => $paneIds,
             'terminal_ids' => $terminalIds,
         ]];
+    }
+
+    private function isRetainedWaitingReviewer(
+        Delivery $delivery,
+        PhaseRun $cleanup,
+        AgentDispatch $dispatch,
+    ): bool {
+        if ($dispatch->status !== AgentDispatchStatus::Waiting
+            || ! $this->isCleanupLedger($delivery, $cleanup)) {
+            return false;
+        }
+
+        $input = $cleanup->input;
+        $source = is_array($input) ? ($input['source'] ?? null) : null;
+        $sourceFailure = is_array($source) ? ($source['failure_details'] ?? null) : null;
+        $deliveryFailure = is_array($source) ? ($source['delivery_failure_details'] ?? null) : null;
+        $sourcePhase = PhaseRun::query()->find($dispatch->phase_run_id);
+        $code = is_array($source) ? ($source['failure_code'] ?? null) : null;
+
+        return is_array($source)
+            && is_array($sourceFailure)
+            && is_array($deliveryFailure)
+            && in_array($code, ['pr_review_wait_timeout', 'pr_review_identity_changed'], true)
+            && ($source['phase_run_id'] ?? null) === $dispatch->phase_run_id
+            && ($source['phase_name'] ?? null) === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            && ($source['current_phase'] ?? null) === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            && ($sourceFailure['code'] ?? null) === $code
+            && ($sourceFailure['phase_run_id'] ?? null) === $dispatch->phase_run_id
+            && ($sourceFailure['dispatch_id'] ?? null) === $dispatch->id
+            && $deliveryFailure === $sourceFailure
+            && $delivery->failure_details === $deliveryFailure
+            && $sourcePhase !== null
+            && $sourcePhase->delivery_id === $delivery->id
+            && $sourcePhase->phase_name === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+            && $sourcePhase->status === PhaseRunStatus::Failed
+            && $sourcePhase->failure_code === $code
+            && $sourcePhase->failure_details === $sourceFailure
+            && $sourcePhase->finished_at !== null;
     }
 
     /**

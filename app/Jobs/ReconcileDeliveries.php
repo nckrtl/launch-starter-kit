@@ -5,8 +5,11 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Enums\PhaseRunStatus;
 use App\Delivery\Enums\ProjectOrchestrationState;
+use App\Models\AgentDispatch;
 use App\Models\Delivery;
+use App\Models\PhaseRun;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
@@ -50,7 +53,7 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
     public function handle(): void
     {
         Delivery::query()
-            ->select('deliveries.id')
+            ->select(['deliveries.id', 'deliveries.status', 'deliveries.current_phase'])
             ->whereHas('projectOrchestration', function (Builder $query): void {
                 $query->where('state', ProjectOrchestrationState::Enabled->value);
             })
@@ -58,9 +61,44 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
             ->orderBy('deliveries.id')
             ->chunkById(self::CHUNK_SIZE, function ($deliveries): void {
                 foreach ($deliveries as $delivery) {
-                    ReconcileDelivery::dispatch($delivery->id);
+                    $this->dispatchRecovery($delivery);
                 }
             }, 'deliveries.id', 'id');
+    }
+
+    private function dispatchRecovery(Delivery $delivery): void
+    {
+        if ($delivery->status !== DeliveryStatus::WaitingForAgent) {
+            AdvanceDelivery::dispatch($delivery->id);
+
+            return;
+        }
+
+        $phase = PhaseRun::query()
+            ->where('delivery_id', $delivery->id)
+            ->where('phase_name', $delivery->current_phase)
+            ->latest('attempt')
+            ->first();
+        $dispatches = $phase === null
+            ? collect()
+            : AgentDispatch::query()
+                ->where('phase_run_id', $phase->id)
+                ->orderBy('id')
+                ->get();
+
+        if ($phase === null
+            || $phase->status !== PhaseRunStatus::Running
+            || $dispatches->count() !== 1) {
+            AdvanceDelivery::dispatch($delivery->id);
+
+            return;
+        }
+
+        ReconcileDelivery::dispatch(
+            $delivery->id,
+            $phase->id,
+            $dispatches->firstOrFail()->id,
+        );
     }
 
     public function failed(?Throwable $exception): void

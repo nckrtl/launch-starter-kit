@@ -9,6 +9,8 @@ use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
+use App\Delivery\Enums\ProjectOrchestrationState;
+use App\Delivery\Exceptions\HerdrSettlementObservationFailed;
 use App\Delivery\Exceptions\HerdrSettlementReconciliationFailed;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
@@ -22,26 +24,38 @@ final readonly class ReconcileWaitingHerdrSettlement
         private CaptureHerdrEvent $events,
     ) {}
 
-    public function handle(int $deliveryId): bool
-    {
+    public function handle(
+        int $deliveryId,
+        int $phaseRunId,
+        int $dispatchId,
+    ): ?HerdrAgentIdentifiers {
         if (! config('herdr.orchestration.enabled', false)) {
-            return false;
+            return null;
         }
 
-        $delivery = Delivery::query()->find($deliveryId);
+        $delivery = Delivery::query()->with('projectOrchestration')->find($deliveryId);
 
-        if ($delivery === null || $delivery->status !== DeliveryStatus::WaitingForAgent) {
-            return false;
+        if ($delivery === null
+            || $delivery->projectOrchestration->state !== ProjectOrchestrationState::Enabled
+            || $delivery->status !== DeliveryStatus::WaitingForAgent) {
+            return null;
         }
 
         $phase = PhaseRun::query()
+            ->whereKey($phaseRunId)
+            ->where('delivery_id', $deliveryId)
+            ->first();
+
+        $latestPhaseId = PhaseRun::query()
             ->where('delivery_id', $delivery->id)
             ->where('phase_name', $delivery->current_phase)
             ->latest('attempt')
-            ->first();
+            ->value('id');
 
-        if ($phase === null || $phase->status !== PhaseRunStatus::Running) {
-            return false;
+        if ($phase === null || $latestPhaseId !== $phase->id
+            || $phase->phase_name !== $delivery->current_phase
+            || $phase->status !== PhaseRunStatus::Running) {
+            return null;
         }
 
         $dispatches = AgentDispatch::query()
@@ -57,8 +71,8 @@ final readonly class ReconcileWaitingHerdrSettlement
 
         $dispatch = $dispatches->firstOrFail();
 
-        if ($dispatch->status !== AgentDispatchStatus::Waiting) {
-            return false;
+        if ($dispatch->id !== $dispatchId || $dispatch->status !== AgentDispatchStatus::Waiting) {
+            return null;
         }
 
         if ($dispatch->herdr_session !== config('herdr.session')
@@ -68,7 +82,8 @@ final readonly class ReconcileWaitingHerdrSettlement
             || $dispatch->herdr_terminal_id === null
             || $dispatch->herdr_agent_id === null
             || $dispatch->herdr_agent_name === null
-            || $dispatch->state_change_seq === null) {
+            || $dispatch->state_change_seq === null
+            || $dispatch->dispatched_at === null) {
             throw new HerdrSettlementReconciliationFailed(
                 'The waiting agent dispatch does not retain complete Herdr identity.',
             );
@@ -76,8 +91,11 @@ final readonly class ReconcileWaitingHerdrSettlement
 
         try {
             $agent = $this->herdr->getAgent($dispatch->herdr_agent_name);
-        } catch (Throwable) {
-            return false;
+        } catch (Throwable $exception) {
+            throw new HerdrSettlementObservationFailed(
+                'Commander could not observe the retained Herdr reviewer.',
+                previous: $exception,
+            );
         }
 
         if (! $this->sameAgent($delivery, $dispatch, $agent)) {
@@ -89,14 +107,20 @@ final readonly class ReconcileWaitingHerdrSettlement
         if (! in_array($agent->agentStatus, ['idle', 'done'], true)
             || $agent->stateChangeSeq === null
             || $agent->stateChangeSeq <= $dispatch->state_change_seq) {
-            return false;
+            return $agent;
         }
 
         $event = $this->events->reconcile($dispatch, $agent);
         $reconciled = AgentDispatch::query()->findOrFail($dispatch->id);
 
-        return $event?->agent_dispatch_id === $dispatch->id
-            && $reconciled->status === AgentDispatchStatus::Settled;
+        if ($event?->agent_dispatch_id !== $dispatch->id
+            || $reconciled->status !== AgentDispatchStatus::Settled) {
+            throw new HerdrSettlementReconciliationFailed(
+                'The terminal Herdr reviewer observation did not settle the retained dispatch.',
+            );
+        }
+
+        return $agent;
     }
 
     private function sameAgent(

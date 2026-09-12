@@ -6,12 +6,16 @@ namespace App\Delivery\Queries;
 
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
+use App\Delivery\Workflow\OrbitFeatureWorkflow;
+use App\Delivery\Workflow\OrbitPullRequestReviewWaitPolicy;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
 
 final readonly class DeliveryDetails
 {
+    public function __construct(private OrbitPullRequestReviewWaitPolicy $reviewWaits) {}
+
     /**
      * @return array{
      *   delivery: array<string, mixed>,
@@ -76,13 +80,45 @@ final readonly class DeliveryDetails
         }
 
         if ($dispatch?->status === AgentDispatchStatus::Waiting) {
-            return ['reason' => 'herdr_agent', 'details' => ['agent_name' => $dispatch->herdr_agent_name]];
+            $details = ['agent_name' => $dispatch->herdr_agent_name];
+
+            if ($this->isOrbitPullRequestReview($delivery) && $dispatch->dispatched_at !== null) {
+                $deadline = $this->reviewWaits->waitDeadline($dispatch->dispatched_at);
+                $details = [
+                    ...$details,
+                    'dispatch_id' => $dispatch->id,
+                    'dispatched_at' => $dispatch->dispatched_at->toISOString(),
+                    'wait_deadline_at' => $deadline->toISOString(),
+                    'overdue' => $this->reviewWaits->isOverdue($deadline),
+                ];
+            }
+
+            return ['reason' => 'herdr_agent', 'details' => $details];
         }
 
         if ($dispatch?->status === AgentDispatchStatus::Settled) {
-            return ['reason' => 'receipt', 'details' => ['dispatch_id' => $dispatch->id]];
+            $details = ['dispatch_id' => $dispatch->id];
+
+            if ($this->isOrbitPullRequestReview($delivery) && $dispatch->settled_at !== null) {
+                $deadline = $this->reviewWaits->receiptDeadline($dispatch->settled_at);
+                $details = [
+                    ...$details,
+                    'settled_at' => $dispatch->settled_at->toISOString(),
+                    'receipt_deadline_at' => $deadline->toISOString(),
+                    'overdue' => $this->reviewWaits->isOverdue($deadline),
+                ];
+            }
+
+            return ['reason' => 'receipt', 'details' => $details];
         }
 
         return null;
+    }
+
+    private function isOrbitPullRequestReview(Delivery $delivery): bool
+    {
+        return $delivery->workflow_type === OrbitFeatureWorkflow::TYPE
+            && $delivery->workflow_version === OrbitFeatureWorkflow::VERSION
+            && $delivery->current_phase === OrbitFeatureWorkflow::PR_REVIEW_PHASE;
     }
 }

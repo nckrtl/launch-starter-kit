@@ -8,11 +8,13 @@ use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Enums\AgentDispatchStatus;
 use App\Delivery\Enums\DeliveryStatus;
 use App\Delivery\Enums\PhaseRunStatus;
+use App\Delivery\Enums\ProjectOrchestrationState;
 use App\Jobs\AdvanceDelivery;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\ExternalEvent;
 use App\Models\PhaseRun;
+use App\Models\Receipt;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Str;
 
@@ -158,18 +160,42 @@ final readonly class CaptureHerdrEvent
 
         $shouldAdvance = DB::transaction(function () use ($event, $dispatch, $deliveryId, $stateChangeSeq): bool {
             $delivery = Delivery::query()->whereKey($deliveryId)->lockForUpdate()->firstOrFail();
-            $phaseRun = PhaseRun::query()
-                ->whereKey($dispatch->phase_run_id)
+            $project = $delivery->projectOrchestration()->lockForUpdate()->first();
+            $phases = PhaseRun::query()
                 ->where('delivery_id', $delivery->id)
+                ->orderBy('id')
                 ->lockForUpdate()
-                ->first();
-            $locked = AgentDispatch::query()
-                ->whereKey($dispatch->id)
-                ->where('phase_run_id', $dispatch->phase_run_id)
+                ->get();
+            $dispatches = AgentDispatch::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
                 ->lockForUpdate()
+                ->get();
+            Receipt::query()
+                ->whereIn('phase_run_id', $phases->modelKeys())
+                ->orderBy('id')
+                ->lockForUpdate()
+                ->get();
+            $phaseRun = $phases->firstWhere('id', $dispatch->phase_run_id);
+            $locked = $dispatches->firstWhere('id', $dispatch->id);
+            $latestPhase = $phases
+                ->where('phase_name', $delivery->current_phase)
+                ->sortByDesc('attempt')
                 ->first();
+            $phaseDispatches = $dispatches->where('phase_run_id', $dispatch->phase_run_id);
 
-            if ($phaseRun === null || $locked === null) {
+            if ($project === null
+                || $project->state !== ProjectOrchestrationState::Enabled
+                || $phaseRun === null
+                || $locked === null
+                || $latestPhase?->id !== $phaseRun->id
+                || $phaseRun->delivery_id !== $delivery->id
+                || $phaseRun->phase_name !== $delivery->current_phase
+                || $phaseRun->status !== PhaseRunStatus::Running
+                || $phaseRun->finished_at !== null
+                || $phaseDispatches->count() !== 1
+                || $phaseDispatches->first()?->id !== $locked->id
+                || ! in_array($delivery->status, [DeliveryStatus::Preparing, DeliveryStatus::WaitingForAgent], true)) {
                 $event->failure_message = 'unmatched_dispatch';
                 $event->save();
 

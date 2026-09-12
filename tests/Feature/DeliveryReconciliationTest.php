@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 
+use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Contracts\HerdrRuntime;
 use App\Delivery\Data\HerdrAgentIdentifiers;
@@ -127,8 +128,8 @@ function waitingReconciliationDelivery(string $status = 'working', int $sequence
     return [$delivery, $phase, $dispatch];
 }
 
-it('queues per-delivery reconciliation only for enabled recoverable deliveries', function (): void {
-    Queue::fake([ReconcileDelivery::class]);
+it('queues per-delivery recovery only for enabled recoverable deliveries', function (): void {
+    Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
     $enabled = ProjectOrchestration::create([
         'manifest_project_id' => 'enabled-project',
         'config' => [],
@@ -184,19 +185,20 @@ it('queues per-delivery reconciliation only for enabled recoverable deliveries',
     $job = new ReconcileDeliveries;
     $job->handle();
 
-    Queue::assertPushed(ReconcileDelivery::class, count($recoverable));
+    Queue::assertPushed(AdvanceDelivery::class, count($recoverable));
+    Queue::assertNotPushed(ReconcileDelivery::class);
 
     foreach ($recoverable as $candidate) {
         Queue::assertPushed(
-            ReconcileDelivery::class,
-            fn (ReconcileDelivery $queued): bool => $queued->deliveryId === $candidate->id,
+            AdvanceDelivery::class,
+            fn (AdvanceDelivery $queued): bool => $queued->deliveryId === $candidate->id,
         );
     }
 
     foreach ($excluded as $candidate) {
         Queue::assertNotPushed(
-            ReconcileDelivery::class,
-            fn (ReconcileDelivery $queued): bool => $queued->deliveryId === $candidate->id,
+            AdvanceDelivery::class,
+            fn (AdvanceDelivery $queued): bool => $queued->deliveryId === $candidate->id,
         );
     }
 
@@ -212,9 +214,13 @@ it('recovers one missed terminal Herdr event from the exact later agent state', 
     config()->set('herdr.orchestration.enabled', true);
     [$delivery, , $dispatch] = waitingReconciliationDelivery('idle', 11);
     Queue::fake([AdvanceDelivery::class]);
-    $job = new ReconcileDelivery($delivery->id);
+    $phase = $dispatch->phaseRun;
+    $job = new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id);
 
-    $job->handle(app(ReconcileWaitingHerdrSettlement::class));
+    $job->handle(
+        app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitPullRequestReviewWait::class),
+    );
     $event = ExternalEvent::sole();
 
     expect($dispatch->fresh()->status)->toBe(AgentDispatchStatus::Settled)
@@ -225,10 +231,13 @@ it('recovers one missed terminal Herdr event from the exact later agent state', 
         ->and($event->processed_at)->not->toBeNull();
     Queue::assertPushed(AdvanceDelivery::class, 1);
 
-    $job->handle(app(ReconcileWaitingHerdrSettlement::class));
+    $job->handle(
+        app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitPullRequestReviewWait::class),
+    );
 
     expect(ExternalEvent::count())->toBe(1);
-    Queue::assertPushed(AdvanceDelivery::class, 2);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('keeps a current or non-terminal Herdr agent waiting', function (string $status, int $sequence): void {
@@ -236,13 +245,17 @@ it('keeps a current or non-terminal Herdr agent waiting', function (string $stat
     config()->set('herdr.orchestration.enabled', true);
     [$delivery, , $dispatch] = waitingReconciliationDelivery($status, $sequence);
     Queue::fake([AdvanceDelivery::class]);
-    $job = new ReconcileDelivery($delivery->id);
+    $phase = $dispatch->phaseRun;
+    $job = new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id);
 
-    $job->handle(app(ReconcileWaitingHerdrSettlement::class));
+    $job->handle(
+        app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitPullRequestReviewWait::class),
+    );
 
     expect($dispatch->fresh()->status)->toBe(AgentDispatchStatus::Waiting)
         ->and(ExternalEvent::count())->toBe(0);
-    Queue::assertPushed(AdvanceDelivery::class, 1);
+    Queue::assertNothingPushed();
 })->with([
     'still working' => ['working', 11],
     'stale terminal observation' => ['done', 10],
@@ -272,8 +285,11 @@ it('refuses a terminal observation outside the exact dispatch identity', functio
     );
     Queue::fake([AdvanceDelivery::class]);
 
-    expect(fn () => (new ReconcileDelivery($delivery->id))->handle(
+    $phase = $dispatch->phaseRun;
+
+    expect(fn () => (new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id))->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitPullRequestReviewWait::class),
     ))->toThrow(
         HerdrSettlementReconciliationFailed::class,
         'Herdr returned an agent outside the waiting dispatch identity.',
@@ -283,10 +299,10 @@ it('refuses a terminal observation outside the exact dispatch identity', functio
 })->with(['workspace', 'tab', 'pane', 'terminal', 'agent', 'name', 'worktree']);
 
 it('uses a bounded unique job for each delivery reconciliation', function (): void {
-    $job = new ReconcileDelivery(42);
+    $job = new ReconcileDelivery(42, 84, 126);
 
     expect($job)->toBeInstanceOf(ShouldBeUniqueUntilProcessing::class)
-        ->and($job->uniqueId())->toBe('commander-delivery-reconciliation:42')
+        ->and($job->uniqueId())->toBe('commander-delivery-reconciliation:42:84:126')
         ->and($job->timeout)->toBeLessThan((int) config('queue.connections.database.retry_after'))
         ->and($job->tries)->toBe(0)
         ->and($job->retryUntil() > now())->toBeTrue();

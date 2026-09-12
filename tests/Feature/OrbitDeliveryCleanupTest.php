@@ -15,6 +15,7 @@ use App\Delivery\Data\HerdrPaneProcessInfo;
 use App\Delivery\Data\HerdrSessionSnapshot;
 use App\Delivery\Data\HerdrSnapshotAgent;
 use App\Delivery\Data\HerdrSnapshotPane;
+use App\Delivery\Data\HerdrSnapshotWorkspace;
 use App\Delivery\Data\OrbitProjectConfig;
 use App\Delivery\Data\PreparedOrbitAbandonedWorktreeCleanup;
 use App\Delivery\Enums\AgentDispatchStatus;
@@ -36,6 +37,41 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Queue;
 
 uses(RefreshDatabase::class);
+
+/** @return array<string, mixed> */
+function retainWaitingReviewCleanupFailure(
+    Delivery $delivery,
+    PhaseRun $source,
+    AgentDispatch $dispatch,
+    Receipt $receipt,
+    string $code,
+): array {
+    DB::table('receipts')->where('id', $receipt->id)->delete();
+    $dispatch->forceFill([
+        'agent_role' => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+        'prompt_name' => 'orbit_pr_review',
+        'status' => AgentDispatchStatus::Waiting,
+        'settled_at' => null,
+    ])->save();
+    $details = [
+        'code' => $code,
+        'phase_run_id' => $source->id,
+        'dispatch_id' => $dispatch->id,
+        'dispatch_status' => AgentDispatchStatus::Waiting->value,
+    ];
+    $source->forceFill([
+        'phase_name' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'failure_code' => $code,
+        'failure_message' => 'The retained reviewer did not settle safely.',
+        'failure_details' => $details,
+    ])->save();
+    $delivery->forceFill([
+        'current_phase' => OrbitFeatureWorkflow::PR_REVIEW_PHASE,
+        'failure_details' => $details,
+    ])->save();
+
+    return $details;
+}
 
 final class AbsentCleanupHerdrRuntime implements HerdrWorkspaceRuntime
 {
@@ -299,6 +335,100 @@ it('records already-absent cleanup honestly and terminalizes the blocked deliver
 
     expect($advance->handle($this->delivery->id, $phase->id))->toBeNull()
         ->and($worktrees->cleanups)->toBe(1);
+});
+
+it('cleans only the exact retained waiting reviewer after an allowed review failure', function (string $code) {
+    $original = retainWaitingReviewCleanupFailure(
+        $this->delivery,
+        $this->source,
+        $this->dispatch,
+        $this->receipt,
+        $code,
+    );
+    $phase = app(StartOrbitDeliveryCleanup::class)->handle($this->delivery->id);
+    $advance = new AdvanceOrbitCleanup(
+        app(ProjectConfigRegistry::class),
+        new ShutdownOrbitHerdrWorkspace(new AbsentCleanupHerdrRuntime),
+        new AbsentOrbitWorktreeCleaner,
+    );
+
+    expect($advance->handle($this->delivery->id, $phase->id))->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Failed)
+        ->and($this->delivery->fresh()->failure_details['original']['delivery_failure_details'])
+        ->toBe($original)
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($this->source->fresh()->status)->toBe(PhaseRunStatus::Failed)
+        ->and($this->source->fresh()->failure_details)->toBe($original);
+})->with(['pr_review_wait_timeout', 'pr_review_identity_changed']);
+
+it('keeps the exact timed-out reviewer workspace while its real agent is active', function () {
+    retainWaitingReviewCleanupFailure(
+        $this->delivery,
+        $this->source,
+        $this->dispatch,
+        $this->receipt,
+        'pr_review_wait_timeout',
+    );
+    $phase = app(StartOrbitDeliveryCleanup::class)->handle($this->delivery->id);
+    $snapshot = new HerdrSessionSnapshot(
+        '0.9.0',
+        22,
+        [new HerdrSnapshotWorkspace(
+            'w2H',
+            $this->config->repository,
+            $this->delivery->worktree_path,
+            true,
+        )],
+        [new HerdrSnapshotPane(
+            'w2H',
+            'w2H:t1',
+            'w2H:p2',
+            'term_cleanup_source',
+            $this->delivery->worktree_path,
+        )],
+        [new HerdrSnapshotAgent(
+            'w2H',
+            'w2H:t1',
+            'w2H:p2',
+            'term_cleanup_source',
+            'codex',
+            'orb-240-loop-builder',
+            'working',
+            $this->delivery->worktree_path,
+        )],
+    );
+    $worktrees = new AbsentOrbitWorktreeCleaner;
+    $advance = new AdvanceOrbitCleanup(
+        app(ProjectConfigRegistry::class),
+        new ShutdownOrbitHerdrWorkspace(new AbsentCleanupHerdrRuntime($snapshot)),
+        $worktrees,
+    );
+
+    expect(fn () => $advance->handle($this->delivery->id, $phase->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'unknown, active, or displaced')
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Waiting)
+        ->and($worktrees->preparations)->toBe(0)
+        ->and($worktrees->cleanups)->toBe(0);
+});
+
+it('rejects an unrelated waiting dispatch during cleanup', function () {
+    retainWaitingReviewCleanupFailure(
+        $this->delivery,
+        $this->source,
+        $this->dispatch,
+        $this->receipt,
+        'other_review_failure',
+    );
+    $phase = app(StartOrbitDeliveryCleanup::class)->handle($this->delivery->id);
+    $advance = new AdvanceOrbitCleanup(
+        app(ProjectConfigRegistry::class),
+        new ShutdownOrbitHerdrWorkspace(new AbsentCleanupHerdrRuntime),
+        new AbsentOrbitWorktreeCleaner,
+    );
+
+    expect(fn () => $advance->handle($this->delivery->id, $phase->id))
+        ->toThrow(OrbitLandingAdvancementFailed::class, 'incomplete Herdr dispatch identity')
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Waiting);
 });
 
 it('refuses already-absent reconciliation while a retained Herdr identity remains', function (string $identity) {
