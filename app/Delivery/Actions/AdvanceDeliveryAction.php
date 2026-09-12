@@ -23,6 +23,7 @@ use App\Jobs\AdvanceOrbitImplementation as AdvanceOrbitImplementationJob;
 use App\Jobs\AdvanceOrbitLanding as AdvanceOrbitLandingJob;
 use App\Jobs\AdvanceOrbitPlanReview as AdvanceOrbitPlanReviewJob;
 use App\Jobs\AdvanceOrbitPullRequestReview as AdvanceOrbitPullRequestReviewJob;
+use App\Jobs\AdvanceOrbitResolution as AdvanceOrbitResolutionJob;
 use App\Jobs\DispatchOrbitImplementation;
 use App\Jobs\DispatchOrbitPlanning as DispatchOrbitPlanningJob;
 use App\Jobs\DispatchOrbitPlanningCorrection;
@@ -153,6 +154,14 @@ final readonly class AdvanceDeliveryAction
 
             if ($resolution?->attempt === 1 && $delivery->status === DeliveryStatus::WaitingForAgent) {
                 $this->advanceOrbitResolution($deliveryId, $resolution->id);
+                $delivery->refresh();
+                $resolution->refresh();
+            }
+
+            if ($resolution?->attempt === 1
+                && $delivery->status === DeliveryStatus::Blocked
+                && ($delivery->failure_details['code'] ?? null) === 'resolution_proposal_ready') {
+                AdvanceOrbitResolutionJob::dispatch($deliveryId, $resolution->id)->afterCommit();
             }
 
             $landing = $delivery->current_phase === OrbitFeatureWorkflow::LANDING_PHASE

@@ -2,6 +2,7 @@
 
 use App\Delivery\Actions\AdvanceDeliveryAction;
 use App\Delivery\Actions\AdvanceOrbitPullRequestReview;
+use App\Delivery\Actions\AdvanceOrbitResolution;
 use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPullRequestResolution;
@@ -13,6 +14,7 @@ use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Contracts\OrbitPullRequestInspector;
 use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitResolutionPublisher;
 use App\Delivery\Data\CandidateCheck;
 use App\Delivery\Data\HerdrAgentIdentifiers;
 use App\Delivery\Data\HerdrAgentLaunch;
@@ -24,6 +26,7 @@ use App\Delivery\Data\PreparedIssueSnapshot;
 use App\Delivery\Data\PreparedWorktree;
 use App\Delivery\Data\PublishedOrbitPullRequest;
 use App\Delivery\Data\PublishedOrbitPullRequestReview;
+use App\Delivery\Data\PublishedOrbitResolution;
 use App\Delivery\Data\VerifiedOrbitImplementationOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
@@ -336,6 +339,37 @@ final class PullRequestReviewAdvancePublisher implements OrbitPullRequestReviewP
     }
 }
 
+final class PullRequestResolutionPublisher implements OrbitResolutionPublisher
+{
+    public int $transactionLevel = 0;
+
+    public int $calls = 0;
+
+    public ?bool $lastAdopted = null;
+
+    public function publish(
+        OrbitIssueSnapshot $issue,
+        int $dispatchId,
+        string $handoff,
+        bool $adopted,
+        string $resumePhase,
+    ): PublishedOrbitResolution {
+        expect(DB::transactionLevel())->toBe($this->transactionLevel)
+            ->and($issue->issueKey)->toBe('ORB-234')
+            ->and($dispatchId)->toBeGreaterThan(0)
+            ->and($handoff)->not->toBeEmpty()
+            ->and($resumePhase)->toBe('implementing');
+        $this->calls++;
+        $this->lastAdopted = $adopted;
+
+        return new PublishedOrbitResolution(
+            commentId: '22222222-3333-4444-8555-666666666666',
+            marker: "ORBIT-LOOP-RESOLUTION:{$dispatchId}",
+            bodyHash: str_repeat('9', 64),
+        );
+    }
+}
+
 final class PullRequestResolutionHerdr implements HerdrRuntime
 {
     /** @var list<string> */
@@ -642,17 +676,20 @@ beforeEach(function () {
     $this->reviewPublisher = new PullRequestReviewAdvancePublisher;
     $this->reviewPublisher->approvedBody = $this->approvedBody;
     $this->reviewPublisher->submittedBody = $this->submittedBody;
+    $this->resolutionPublisher = new PullRequestResolutionPublisher;
     $transactionLevel = DB::transactionLevel();
     $this->repository->transactionLevel = $transactionLevel;
     $this->pullRequests->transactionLevel = $transactionLevel;
     $this->advanceRepository->transactionLevel = $transactionLevel;
     $this->advanceIssues->transactionLevel = $transactionLevel;
     $this->reviewPublisher->transactionLevel = $transactionLevel;
+    $this->resolutionPublisher->transactionLevel = $transactionLevel;
     app()->instance(OrbitImplementationRepository::class, $this->repository);
     app()->instance(OrbitPullRequestInspector::class, $this->pullRequests);
     app()->instance(OrbitRepository::class, $this->advanceRepository);
     app()->instance(OrbitActiveIssueProvider::class, $this->advanceIssues);
     app()->instance(OrbitPullRequestReviewPublisher::class, $this->reviewPublisher);
+    app()->instance(OrbitResolutionPublisher::class, $this->resolutionPublisher);
 
     chdir($this->worktreePath);
     Queue::fake();
@@ -660,6 +697,47 @@ beforeEach(function () {
         ? Process::result(output: $this->candidateSha."\n")
         : throw new RuntimeException('Unexpected pull request review receipt command.'))
         ->preventStrayProcesses();
+});
+
+it('publishes a plan-changing proposal as an explicit decision stop', function () {
+    [$resolution, $resolver] = activatePullRequestResolution($this);
+    $handoff = 'Restart planning with an expanded runtime boundary.';
+    $proposal = [
+        'schema' => 1,
+        'resume_phase' => 'planning',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => ['Clarify loaded runtime state.'],
+        'plan_changes' => ['Add a loaded-state attestation.'],
+    ];
+    File::put($this->worktreePath.'/.loop/runtime/resolution-handoff.md', $handoff."\n");
+    File::put(
+        $this->worktreePath.'/.loop/runtime/resolution.json',
+        json_encode($proposal, JSON_THROW_ON_ERROR)."\n",
+    );
+    $this->artisan('delivery:submit-orbit-resolution-receipt', [
+        'phase-run' => (string) $resolution->id,
+        'dispatch' => (string) $resolver->id,
+        '--result' => 'proposal',
+        '--handoff' => '.loop/runtime/resolution-handoff.md',
+        '--resolution' => '.loop/runtime/resolution.json',
+    ])->assertSuccessful();
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now(),
+    ])->save();
+
+    app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
+    app(AdvanceOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
+
+    expect($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('resolution_decision_required')
+        ->and($this->delivery->fresh()->failure_details['requirements'])->toBe([
+            'issue_changes: Clarify loaded runtime state.',
+            'plan_changes: Add a loaded-state attestation.',
+        ])
+        ->and($resolution->fresh()->output['automatic_adoption_eligible'])->toBeFalse()
+        ->and($this->resolutionPublisher->lastAdopted)->toBeFalse();
 });
 
 afterEach(function () {
@@ -1743,7 +1821,7 @@ it('dispatches one independent advisory resolver with the legacy proposal contra
         ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
 });
 
-it('captures one immutable structured resolution proposal and reaches its owned stop', function () {
+it('publishes and classifies one immutable structured resolution proposal', function () {
     [$resolution, $resolver] = activatePullRequestResolution($this);
     $handoff = 'Use the loaded worker configuration as the health authority.';
     $proposal = [
@@ -1790,19 +1868,26 @@ it('captures one immutable structured resolution proposal and reaches its owned 
         'settled_at' => now(),
     ])->save();
     app(AdvanceDeliveryAction::class)->handle($this->delivery->id);
+    app(AdvanceOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
 
     expect($resolution->fresh()->status)->toBe(PhaseRunStatus::Completed)
-        ->and($resolution->fresh()->output)->toBe([
-            'receipt_id' => $receipt->id,
-            'result' => 'proposal',
+        ->and($resolution->fresh()->output['receipt_id'])->toBe($receipt->id)
+        ->and($resolution->fresh()->output['result'])->toBe('proposal')
+        ->and($resolution->fresh()->output['publication'])->toBe([
+            'comment_id' => '22222222-3333-4444-8555-666666666666',
+            'marker' => "ORBIT-LOOP-RESOLUTION:{$resolver->id}",
+            'body_sha256' => str_repeat('9', 64),
         ])
+        ->and($resolution->fresh()->output['adopted'])->toBeFalse()
+        ->and($resolution->fresh()->output['automatic_adoption_eligible'])->toBeTrue()
         ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
-        ->and($this->delivery->fresh()->failure_details)->toBe([
-            'code' => 'resolution_proposal_ready',
-            'phase_run_id' => $resolution->id,
-            'dispatch_id' => $resolver->id,
-            'receipt_id' => $receipt->id,
-        ]);
+        ->and($this->delivery->fresh()->failure_details['code'])->toBe('resolution_adoption_ready')
+        ->and($this->resolutionPublisher->calls)->toBe(1)
+        ->and($this->resolutionPublisher->lastAdopted)->toBeFalse();
+
+    app(AdvanceOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
+
+    expect($this->resolutionPublisher->calls)->toBe(1);
 });
 
 it('rejects a malformed structured resolution proposal', function (array $proposal) {

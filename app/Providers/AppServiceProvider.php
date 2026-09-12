@@ -25,12 +25,14 @@ use App\Delivery\Contracts\OrbitPullRequestLandingGateway;
 use App\Delivery\Contracts\OrbitPullRequestPublisher;
 use App\Delivery\Contracts\OrbitPullRequestReviewPublisher;
 use App\Delivery\Contracts\OrbitRepository;
+use App\Delivery\Contracts\OrbitResolutionPublisher;
 use App\Delivery\Contracts\OrbitReviewIssueTransitioner;
 use App\Delivery\Contracts\OrbitStaleWorktreeRetirer;
 use App\Delivery\Contracts\OrbitWorktreeCleaner;
 use App\Delivery\IssueProviders\SshOrbitIssueOwnershipClaimer;
 use App\Delivery\IssueProviders\SshOrbitIssueProvider;
 use App\Delivery\IssueProviders\SshOrbitIssueTransitioner;
+use App\Delivery\IssueProviders\SshOrbitResolutionPublisher;
 use App\Delivery\PullRequests\SshOrbitPullRequestLandingGateway;
 use App\Delivery\PullRequests\SshOrbitPullRequestPublisher;
 use App\Delivery\PullRequests\SshOrbitPullRequestReviewPublisher;
@@ -74,6 +76,7 @@ class AppServiceProvider extends ServiceProvider
         $this->app->bind(OrbitPullRequestLandingGateway::class, SshOrbitPullRequestLandingGateway::class);
         $this->app->bind(OrbitPullRequestPublisher::class, SshOrbitPullRequestPublisher::class);
         $this->app->bind(OrbitPullRequestReviewPublisher::class, SshOrbitPullRequestReviewPublisher::class);
+        $this->app->bind(OrbitResolutionPublisher::class, SshOrbitResolutionPublisher::class);
 
         $this->app->bind(HerdrRuntime::class, function (): SocketHerdrRuntime {
             $path = config('herdr.socket');
