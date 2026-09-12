@@ -19,6 +19,7 @@ use App\Delivery\Workflow\OrbitFeatureWorkflow;
 use App\Models\AgentDispatch;
 use App\Models\Delivery;
 use App\Models\PhaseRun;
+use App\Models\Receipt;
 use Carbon\CarbonImmutable;
 use DateTimeInterface;
 use Illuminate\Contracts\Queue\ShouldBeUniqueUntilProcessing;
@@ -77,6 +78,8 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 'deliveries.status',
                 'deliveries.current_phase',
                 'deliveries.failure_details',
+                'deliveries.workflow_type',
+                'deliveries.workflow_version',
             ])
             ->whereHas('projectOrchestration', function (Builder $query): void {
                 $query->where('state', ProjectOrchestrationState::Enabled->value);
@@ -261,11 +264,25 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
         }
 
         $dispatch = $dispatches->firstOrFail();
+        $phaseReceipts = $phase->receipts()->get();
+        $validReceipts = $phaseReceipts->filter(
+            static fn (Receipt $receipt): bool => $receipt->validation_status === ReceiptValidationStatus::Valid,
+        );
+        $hasValidReceipt = $validReceipts->isNotEmpty();
+
+        if ($delivery->workflow_type === OrbitFeatureWorkflow::TYPE
+            && $delivery->workflow_version === OrbitFeatureWorkflow::VERSION) {
+            $expectedReceiptKind = $this->expectedOrbitReceiptKind($phase->phase_name);
+            $expectedAgentRole = $this->expectedOrbitAgentRole($phase->phase_name);
+            $hasValidReceipt = $expectedReceiptKind !== null
+                && $dispatch->agent_role === $expectedAgentRole
+                && $validReceipts->where('kind', $expectedReceiptKind)->count() === 1
+                && ($phase->phase_name === OrbitFeatureWorkflow::PR_REVIEW_PHASE
+                    || $phaseReceipts->count() === 1);
+        }
 
         if ($dispatch->status === AgentDispatchStatus::Settled
-            && $phase->receipts()
-                ->where('validation_status', ReceiptValidationStatus::Valid)
-                ->exists()) {
+            && $hasValidReceipt) {
             AdvanceDelivery::dispatch($delivery->id);
 
             return;
@@ -302,5 +319,29 @@ final class ReconcileDeliveries implements ShouldBeUniqueUntilProcessing, Should
                 DeliveryStatus::Cleaning,
             ],
         );
+    }
+
+    private function expectedOrbitReceiptKind(string $phaseName): ?string
+    {
+        return match ($phaseName) {
+            OrbitFeatureWorkflow::INITIAL_PHASE => 'orbit_planning',
+            OrbitFeatureWorkflow::PLAN_REVIEW_PHASE => 'orbit_plan_review',
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE => 'orbit_implementation',
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE => 'orbit_pr_review',
+            OrbitFeatureWorkflow::RESOLUTION_PHASE => 'orbit_resolution',
+            default => null,
+        };
+    }
+
+    private function expectedOrbitAgentRole(string $phaseName): ?string
+    {
+        return match ($phaseName) {
+            OrbitFeatureWorkflow::INITIAL_PHASE => OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+            OrbitFeatureWorkflow::PLAN_REVIEW_PHASE => OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE,
+            OrbitFeatureWorkflow::IMPLEMENTATION_PHASE => OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+            OrbitFeatureWorkflow::PR_REVIEW_PHASE => OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE,
+            OrbitFeatureWorkflow::RESOLUTION_PHASE => OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE,
+            default => null,
+        };
     }
 }

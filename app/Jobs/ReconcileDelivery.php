@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Jobs;
 
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
+use App\Delivery\Actions\ReconcileOrbitSettledReceiptWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Exceptions\HerdrSettlementObservationFailed;
 use App\Delivery\Exceptions\HerdrSettlementReconciliationFailed;
@@ -56,6 +57,7 @@ final class ReconcileDelivery implements ShouldBeUniqueUntilProcessing, ShouldQu
 
     public function handle(
         ReconcileWaitingHerdrSettlement $settlements,
+        ReconcileOrbitSettledReceiptWait $settledReceipts,
         ReconcileOrbitPullRequestReviewWait $pullRequestReviews,
     ): void {
         $lock = Cache::lock(implode(':', [
@@ -105,6 +107,14 @@ final class ReconcileDelivery implements ShouldBeUniqueUntilProcessing, ShouldQu
                     $exception,
                 );
 
+                return;
+            }
+
+            if ($settledReceipts->handle(
+                $this->deliveryId,
+                $this->phaseRunId,
+                $this->dispatchId,
+            )) {
                 return;
             }
 

@@ -10,6 +10,7 @@ use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ConfigureProjectOrchestration;
 use App\Delivery\Actions\DispatchOrbitPullRequestResolution;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
+use App\Delivery\Actions\ReconcileOrbitSettledReceiptWait;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
 use App\Delivery\Actions\StartOrbitDelivery;
@@ -1823,6 +1824,50 @@ it('routes review three to resolution two with exact identity and publication re
             ->where('phase_run_id', $resolution->id)
             ->where('kind', 'orbit_resolution')
             ->count())->toBe(1);
+});
+
+it('recovers an exact resolution receipt submitted after the receipt grace timeout', function () {
+    [$resolution, $resolver] = activatePullRequestResolution($this);
+    $handoff = 'Resume implementation from the exact retained resolution.';
+    $proposal = [
+        'schema' => 1,
+        'resume_phase' => 'implementing',
+        'required_adrs' => [],
+        'human_decisions' => [],
+        'issue_changes' => [],
+        'plan_changes' => [],
+    ];
+    File::put($this->worktreePath.'/.loop/runtime/resolution-handoff.md', $handoff."\n");
+    File::put(
+        $this->worktreePath.'/.loop/runtime/resolution.json',
+        json_encode($proposal, JSON_THROW_ON_ERROR)."\n",
+    );
+    $resolver->forceFill([
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now()->subMinutes(5),
+    ])->save();
+    $waits = app(ReconcileOrbitSettledReceiptWait::class);
+
+    expect($waits->handle($this->delivery->id, $resolution->id, $resolver->id))->toBeTrue()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($resolution->fresh()->status)->toBe(PhaseRunStatus::Failed);
+
+    $this->artisan('delivery:submit-orbit-resolution-receipt', [
+        'phase-run' => (string) $resolution->id,
+        'dispatch' => (string) $resolver->id,
+        '--result' => 'proposal',
+        '--handoff' => '.loop/runtime/resolution-handoff.md',
+        '--resolution' => '.loop/runtime/resolution.json',
+    ])->assertSuccessful();
+
+    expect($resolution->receipts()->where('kind', 'orbit_resolution')->count())->toBe(1)
+        ->and($resolution->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($resolution->fresh()->failure_code)->toBeNull()
+        ->and($resolution->fresh()->finished_at)->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($resolver->fresh()->status)->toBe(AgentDispatchStatus::Settled);
+    Queue::assertPushed(AdvanceDelivery::class);
 });
 
 it('rejects attempt-one identity or receipt evidence from resolution attempt two', function (string $drift) {

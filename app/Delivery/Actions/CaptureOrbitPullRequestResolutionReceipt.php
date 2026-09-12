@@ -22,7 +22,10 @@ use Illuminate\Support\Facades\DB;
 
 final readonly class CaptureOrbitPullRequestResolutionReceipt
 {
-    public function __construct(private OrbitResolutionReceiptValidator $receipts) {}
+    public function __construct(
+        private OrbitResolutionReceiptValidator $receipts,
+        private ReconcileOrbitSettledReceiptWait $settledReceipts,
+    ) {}
 
     /** @param array<string, mixed> $payload */
     public function handle(
@@ -64,9 +67,19 @@ final readonly class CaptureOrbitPullRequestResolutionReceipt
                 ->sortByDesc('attempt')
                 ->first();
             $phaseDispatches = $dispatches->where('phase_run_id', $lockedPhase?->id);
-            $resolutionReceipts = $storedReceipts
-                ->where('phase_run_id', $lockedPhase?->id)
+            $phaseReceipts = $storedReceipts->where('phase_run_id', $lockedPhase?->id);
+            $resolutionReceipts = $phaseReceipts
                 ->where('kind', 'orbit_resolution');
+            $recovering = $delivery !== null && $project !== null
+                && $lockedPhase !== null && $lockedDispatch !== null
+                && $this->settledReceipts->canRecoverLateReceipt(
+                    $delivery,
+                    $project,
+                    $lockedPhase,
+                    $lockedDispatch,
+                    $phaseDispatches->count(),
+                    $phaseReceipts->count(),
+                );
 
             if ($delivery !== null && $project !== null) {
                 $delivery->setRelation('projectOrchestration', $project);
@@ -79,15 +92,15 @@ final readonly class CaptureOrbitPullRequestResolutionReceipt
                 || $delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
                 || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
                 || $delivery->current_phase !== OrbitFeatureWorkflow::RESOLUTION_PHASE
-                || ($delivery->status !== DeliveryStatus::WaitingForAgent
+                || (! $recovering && $delivery->status !== DeliveryStatus::WaitingForAgent
                     && ! ($delivery->status === DeliveryStatus::Preparing
                         && $lockedDispatch->status === AgentDispatchStatus::Starting
                         && $lockedDispatch->error_code === 'herdr_prompt_attempted'))
                 || $lockedPhase->delivery_id !== $delivery->id
                 || $lockedPhase->phase_name !== OrbitFeatureWorkflow::RESOLUTION_PHASE
                 || $lockedPhase->attempt < 1
-                || $lockedPhase->status !== PhaseRunStatus::Running
-                || $lockedPhase->finished_at !== null
+                || (! $recovering && $lockedPhase->status !== PhaseRunStatus::Running)
+                || (! $recovering && $lockedPhase->finished_at !== null)
                 || $phaseDispatches->count() !== 1
                 || $lockedDispatch->phase_run_id !== $lockedPhase->id
                 || $lockedDispatch->agent_role !== OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
@@ -112,7 +125,7 @@ final readonly class CaptureOrbitPullRequestResolutionReceipt
                 return $existing;
             }
 
-            return Receipt::query()->create([
+            $receipt = Receipt::query()->create([
                 'phase_run_id' => $lockedPhase->id,
                 'kind' => 'orbit_resolution',
                 'schema_version' => 1,
@@ -124,6 +137,12 @@ final readonly class CaptureOrbitPullRequestResolutionReceipt
                 'captured_at' => now(),
                 'validated_at' => now(),
             ]);
+
+            if ($recovering) {
+                $this->settledReceipts->restoreAfterLateReceipt($delivery, $lockedPhase);
+            }
+
+            return $receipt;
         });
 
         $freshDispatch = $dispatch->fresh();

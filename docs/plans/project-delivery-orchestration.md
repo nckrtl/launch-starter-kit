@@ -176,6 +176,15 @@ A timed-out dispatch remains truthfully `waiting`; pre-merge cleanup accepts onl
 that exact failed review dispatch and still requires the real agent to be idle or
 done before shutting down its workspace.
 
+Settled planning, plan-review, implementation, and resolution agents use a
+separate five-minute receipt grace. At the boundary, reconciliation blocks the
+same phase with exact dispatch identity and `orbit_receipt_missing` evidence; it
+does not create a replacement attempt or agent. A late receipt can reopen only
+that exact phase when the project is enabled and all retained timeout evidence
+still matches, after which the normal `AdvanceDelivery` path resumes. Unexpected
+or invalid retained receipt evidence blocks as an explicit settlement
+inconsistency instead of suppressing the missing-receipt check.
+
 An ambiguous Linear transition into pull request review is recovered by its own
 bounded job under the same per-phase dispatch lock. The scheduler first binds
 the exact untouched local ledger. The job then reads Linear authoritatively,

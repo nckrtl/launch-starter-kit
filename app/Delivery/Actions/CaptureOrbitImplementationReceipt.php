@@ -20,7 +20,10 @@ use Illuminate\Support\Facades\DB;
 
 final readonly class CaptureOrbitImplementationReceipt
 {
-    public function __construct(private OrbitImplementationReceiptValidator $receipts) {}
+    public function __construct(
+        private OrbitImplementationReceiptValidator $receipts,
+        private ReconcileOrbitSettledReceiptWait $settledReceipts,
+    ) {}
 
     /** @param array<string, mixed> $payload */
     public function handle(PhaseRun $phaseRun, AgentDispatch $dispatch, array $payload): Receipt
@@ -29,32 +32,51 @@ final readonly class CaptureOrbitImplementationReceipt
 
         $receipt = DB::transaction(function () use ($phaseRun, $dispatch, $payload, $hash): Receipt {
             $delivery = Delivery::query()->whereKey($phaseRun->delivery_id)->lockForUpdate()->first();
+            $project = $delivery?->projectOrchestration()->lockForUpdate()->first();
             $lockedPhase = PhaseRun::query()->whereKey($phaseRun->id)->lockForUpdate()->first();
             $lockedDispatch = AgentDispatch::query()
                 ->whereKey($dispatch->id)
                 ->where('phase_run_id', $phaseRun->id)
                 ->lockForUpdate()
                 ->first();
+            $phaseDispatches = AgentDispatch::query()
+                ->where('phase_run_id', $phaseRun->id)
+                ->lockForUpdate()
+                ->get();
+            $phaseReceipts = Receipt::query()
+                ->where('phase_run_id', $phaseRun->id)
+                ->lockForUpdate()
+                ->get();
             $latestImplementationId = PhaseRun::query()
                 ->where('delivery_id', $phaseRun->delivery_id)
                 ->where('phase_name', OrbitFeatureWorkflow::IMPLEMENTATION_PHASE)
                 ->latest('attempt')
                 ->value('id');
+            $recovering = $delivery !== null && $project !== null
+                && $lockedPhase !== null && $lockedDispatch !== null
+                && $this->settledReceipts->canRecoverLateReceipt(
+                    $delivery,
+                    $project,
+                    $lockedPhase,
+                    $lockedDispatch,
+                    $phaseDispatches->count(),
+                    $phaseReceipts->count(),
+                );
 
             if ($delivery === null || $lockedPhase === null || $lockedDispatch === null
                 || $latestImplementationId !== $lockedPhase->id
                 || $delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
                 || $delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
                 || $delivery->current_phase !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-                || ($delivery->status !== DeliveryStatus::WaitingForAgent
+                || (! $recovering && $delivery->status !== DeliveryStatus::WaitingForAgent
                     && ! ($delivery->status === DeliveryStatus::Preparing
                         && $lockedDispatch->status === AgentDispatchStatus::Starting
                         && $lockedDispatch->error_code === 'herdr_prompt_attempted'))
                 || $lockedPhase->delivery_id !== $delivery->id
                 || $lockedPhase->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
                 || $lockedPhase->attempt < 1
-                || $lockedPhase->status !== PhaseRunStatus::Running
-                || $lockedPhase->agentDispatches()->count() !== 1
+                || (! $recovering && $lockedPhase->status !== PhaseRunStatus::Running)
+                || $phaseDispatches->count() !== 1
                 || $lockedDispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
                 || (! ($lockedDispatch->status === AgentDispatchStatus::Starting
                     && $lockedDispatch->error_code === 'herdr_prompt_attempted')
@@ -66,11 +88,7 @@ final readonly class CaptureOrbitImplementationReceipt
                 );
             }
 
-            $existing = Receipt::query()
-                ->where('phase_run_id', $lockedPhase->id)
-                ->where('kind', 'orbit_implementation')
-                ->lockForUpdate()
-                ->first();
+            $existing = $phaseReceipts->firstWhere('kind', 'orbit_implementation');
 
             if ($existing !== null) {
                 if (! hash_equals($existing->payload_hash, $hash)) {
@@ -82,7 +100,7 @@ final readonly class CaptureOrbitImplementationReceipt
                 return $existing;
             }
 
-            return Receipt::query()->create([
+            $receipt = Receipt::query()->create([
                 'phase_run_id' => $lockedPhase->id,
                 'kind' => 'orbit_implementation',
                 'schema_version' => 1,
@@ -94,6 +112,12 @@ final readonly class CaptureOrbitImplementationReceipt
                 'captured_at' => now(),
                 'validated_at' => now(),
             ]);
+
+            if ($recovering) {
+                $this->settledReceipts->restoreAfterLateReceipt($delivery, $lockedPhase);
+            }
+
+            return $receipt;
         });
 
         AdvanceDelivery::dispatch($phaseRun->delivery_id)->afterCommit();

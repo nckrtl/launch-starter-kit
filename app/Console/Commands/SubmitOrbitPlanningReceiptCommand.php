@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Delivery\Actions\CaptureOrbitPlanningReceipt;
+use App\Delivery\Actions\ReconcileOrbitSettledReceiptWait;
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitRepository;
 use App\Delivery\Data\OrbitProjectConfig;
@@ -36,6 +37,7 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
         ProjectConfigRegistry $configs,
         OrbitRepository $repository,
         CaptureOrbitPlanningReceipt $capture,
+        ReconcileOrbitSettledReceiptWait $settledReceipts,
     ): int {
         $phaseRunId = $this->positiveIntegerArgument('phase-run');
         $dispatchId = $this->positiveIntegerArgument('dispatch');
@@ -50,13 +52,22 @@ final class SubmitOrbitPlanningReceiptCommand extends Command
             ->with(['delivery.projectOrchestration', 'agentDispatches'])
             ->find($phaseRunId);
         $dispatch = $phaseRun?->agentDispatches->firstWhere('id', $dispatchId);
+        $recovering = $phaseRun !== null && $dispatch !== null
+            && $settledReceipts->canRecoverLateReceipt(
+                $phaseRun->delivery,
+                $phaseRun->delivery->projectOrchestration,
+                $phaseRun,
+                $dispatch,
+                $phaseRun->agentDispatches->count(),
+                $phaseRun->receipts()->count(),
+            );
 
         if ($phaseRun === null || $dispatch === null || $phaseRun->agentDispatches->count() !== 1
             || $phaseRun->delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
             || $phaseRun->delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::INITIAL_PHASE
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::INITIAL_PHASE
-            || $phaseRun->status !== PhaseRunStatus::Running
+            || (! $recovering && $phaseRun->status !== PhaseRunStatus::Running)
             || (! ($dispatch->status === AgentDispatchStatus::Starting
                 && $dispatch->error_code === 'herdr_prompt_attempted')
                 && ! in_array($dispatch->status, [AgentDispatchStatus::Waiting, AgentDispatchStatus::Settled], true))) {

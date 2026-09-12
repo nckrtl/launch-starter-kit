@@ -6,6 +6,7 @@ use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\CaptureHerdrEvent;
 use App\Delivery\Actions\CaptureOrbitPullRequestReviewReceipt;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
+use App\Delivery\Actions\ReconcileOrbitSettledReceiptWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
@@ -161,6 +162,7 @@ function runReviewWaitJob(Delivery $delivery, PhaseRun $phase, AgentDispatch $di
 {
     (new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id))->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
         app(ReconcileOrbitPullRequestReviewWait::class),
     );
 }
@@ -530,6 +532,7 @@ it('retries an overdue observation failure and blocks only the exact job on exha
 
     expect(fn () => $job->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
         app(ReconcileOrbitPullRequestReviewWait::class),
     ))->toThrow(HerdrSettlementObservationFailed::class);
 

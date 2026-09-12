@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use App\Delivery\Actions\BindOrbitPullRequestReviewPublicationRecovery;
 use App\Delivery\Actions\ReconcileOrbitPullRequestReviewWait;
+use App\Delivery\Actions\ReconcileOrbitSettledReceiptWait;
 use App\Delivery\Actions\ReconcileWaitingHerdrSettlement;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanningCorrection;
 use App\Delivery\Actions\RecoverExhaustedOrbitPlanResolution;
@@ -632,6 +633,7 @@ it('recovers one missed terminal Herdr event from the exact later agent state', 
 
     $job->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
         app(ReconcileOrbitPullRequestReviewWait::class),
     );
     $event = ExternalEvent::sole();
@@ -646,6 +648,7 @@ it('recovers one missed terminal Herdr event from the exact later agent state', 
 
     $job->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
         app(ReconcileOrbitPullRequestReviewWait::class),
     );
 
@@ -658,6 +661,7 @@ it('requeues advancement when a current valid receipt outlives its settled-event
     int $attempt,
     string $receiptKind,
     bool $orbit,
+    ?string $agentRole,
 ): void {
     [$delivery, $phase, $dispatch] = waitingReconciliationDelivery('done', 11);
     $delivery->forceFill([
@@ -670,6 +674,7 @@ it('requeues advancement when a current valid receipt outlives its settled-event
         'attempt' => $attempt,
     ])->save();
     $dispatch->forceFill([
+        'agent_role' => $agentRole ?? $dispatch->agent_role,
         'status' => AgentDispatchStatus::Settled,
         'settled_at' => now(),
     ])->save();
@@ -699,16 +704,16 @@ it('requeues advancement when a current valid receipt outlives its settled-event
     );
     Queue::assertNotPushed(ReconcileDelivery::class);
 })->with([
-    'shadow phase one' => ['herdr_test', 1, 'herdr_test', false],
-    'shadow phase two' => ['herdr_confirm', 1, 'herdr_test', false],
-    'Orbit initial planning' => [OrbitFeatureWorkflow::INITIAL_PHASE, 1, 'orbit_planning', true],
-    'Orbit corrected planning' => [OrbitFeatureWorkflow::INITIAL_PHASE, 2, 'orbit_planning', true],
-    'Orbit plan review' => [OrbitFeatureWorkflow::PLAN_REVIEW_PHASE, 1, 'orbit_plan_review', true],
-    'Orbit corrected plan review' => [OrbitFeatureWorkflow::PLAN_REVIEW_PHASE, 2, 'orbit_plan_review', true],
-    'Orbit implementation' => [OrbitFeatureWorkflow::IMPLEMENTATION_PHASE, 1, 'orbit_implementation', true],
-    'Orbit implementation correction' => [OrbitFeatureWorkflow::IMPLEMENTATION_PHASE, 2, 'orbit_implementation', true],
-    'Orbit pull request review' => [OrbitFeatureWorkflow::PR_REVIEW_PHASE, 1, 'orbit_pr_review', true],
-    'Orbit resolution' => [OrbitFeatureWorkflow::RESOLUTION_PHASE, 1, 'orbit_resolution', true],
+    'shadow phase one' => ['herdr_test', 1, 'herdr_test', false, null],
+    'shadow phase two' => ['herdr_confirm', 1, 'herdr_test', false, null],
+    'Orbit initial planning' => [OrbitFeatureWorkflow::INITIAL_PHASE, 1, 'orbit_planning', true, OrbitFeatureWorkflow::PLANNING_AGENT_ROLE],
+    'Orbit corrected planning' => [OrbitFeatureWorkflow::INITIAL_PHASE, 2, 'orbit_planning', true, OrbitFeatureWorkflow::PLANNING_AGENT_ROLE],
+    'Orbit plan review' => [OrbitFeatureWorkflow::PLAN_REVIEW_PHASE, 1, 'orbit_plan_review', true, OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE],
+    'Orbit corrected plan review' => [OrbitFeatureWorkflow::PLAN_REVIEW_PHASE, 2, 'orbit_plan_review', true, OrbitFeatureWorkflow::PLAN_REVIEW_AGENT_ROLE],
+    'Orbit implementation' => [OrbitFeatureWorkflow::IMPLEMENTATION_PHASE, 1, 'orbit_implementation', true, OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE],
+    'Orbit implementation correction' => [OrbitFeatureWorkflow::IMPLEMENTATION_PHASE, 2, 'orbit_implementation', true, OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE],
+    'Orbit pull request review' => [OrbitFeatureWorkflow::PR_REVIEW_PHASE, 1, 'orbit_pr_review', true, OrbitFeatureWorkflow::PR_REVIEW_AGENT_ROLE],
+    'Orbit resolution' => [OrbitFeatureWorkflow::RESOLUTION_PHASE, 1, 'orbit_resolution', true, OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE],
 ]);
 
 it('keeps settlement reconciliation until both settlement and a valid receipt exist', function (
@@ -755,6 +760,133 @@ it('keeps settlement reconciliation until both settlement and a valid receipt ex
     'settled with pending receipt' => [AgentDispatchStatus::Settled, ReceiptValidationStatus::Pending],
     'settled with invalid receipt' => [AgentDispatchStatus::Settled, ReceiptValidationStatus::Invalid],
 ]);
+
+it('routes inconsistent settled Orbit receipt evidence into reconciliation', function (
+    array $receiptEvidence,
+): void {
+    [$delivery, $phase, $dispatch] = waitingReconciliationDelivery('done', 11);
+    $delivery->forceFill([
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+    ])->save();
+    $phase->forceFill([
+        'phase_name' => OrbitFeatureWorkflow::INITIAL_PHASE,
+    ])->save();
+    $dispatch->forceFill([
+        'agent_role' => OrbitFeatureWorkflow::PLANNING_AGENT_ROLE,
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now()->subMinutes(5),
+    ])->save();
+    foreach ($receiptEvidence as $index => [$kind, $validationStatus]) {
+        $payload = [
+            'kind' => $kind,
+            'delivery_id' => $delivery->id,
+            'evidence_index' => $index,
+        ];
+        Receipt::create([
+            'phase_run_id' => $phase->id,
+            'kind' => $kind,
+            'schema_version' => 1,
+            'payload' => $payload,
+            'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+            'validation_status' => $validationStatus,
+            'captured_at' => now(),
+            'validated_at' => now(),
+        ]);
+    }
+    Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
+
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    Queue::assertNotPushed(AdvanceDelivery::class);
+    Queue::assertPushed(
+        ReconcileDelivery::class,
+        fn (ReconcileDelivery $job): bool => $job->deliveryId === $delivery->id
+            && $job->phaseRunId === $phase->id
+            && $job->dispatchId === $dispatch->id,
+    );
+
+    (new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id))->handle(
+        app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
+        app(ReconcileOrbitPullRequestReviewWait::class),
+    );
+
+    expect($delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($phase->fresh()->status)->toBe(PhaseRunStatus::Failed)
+        ->and($phase->fresh()->failure_code)->toBe('orbit_receipt_settlement_inconsistent');
+})->with([
+    'wrong-kind valid receipt' => [[
+        ['orbit_resolution', ReceiptValidationStatus::Valid],
+    ]],
+    'expected valid receipt plus extra receipt' => [[
+        ['orbit_planning', ReceiptValidationStatus::Valid],
+        ['orbit_resolution', ReceiptValidationStatus::Valid],
+    ]],
+    'expected-kind invalid receipt' => [[
+        ['orbit_planning', ReceiptValidationStatus::Invalid],
+    ]],
+]);
+
+it('blocks a settled Orbit phase whose retained dispatch has the wrong role', function (): void {
+    [$delivery, $phase, $dispatch] = waitingReconciliationDelivery('done', 11);
+    $delivery->forceFill([
+        'workflow_type' => OrbitFeatureWorkflow::TYPE,
+        'workflow_version' => OrbitFeatureWorkflow::VERSION,
+        'current_phase' => OrbitFeatureWorkflow::INITIAL_PHASE,
+    ])->save();
+    $phase->forceFill(['phase_name' => OrbitFeatureWorkflow::INITIAL_PHASE])->save();
+    $dispatch->forceFill([
+        'agent_role' => OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE,
+        'status' => AgentDispatchStatus::Settled,
+        'settled_at' => now()->subMinutes(5),
+    ])->save();
+    $payload = ['kind' => 'orbit_planning', 'delivery_id' => $delivery->id];
+    Receipt::create([
+        'phase_run_id' => $phase->id,
+        'kind' => 'orbit_planning',
+        'schema_version' => 1,
+        'payload' => $payload,
+        'payload_hash' => hash('sha256', json_encode($payload, JSON_THROW_ON_ERROR)),
+        'validation_status' => ReceiptValidationStatus::Valid,
+        'captured_at' => now(),
+        'validated_at' => now(),
+    ]);
+    Queue::fake([AdvanceDelivery::class, ReconcileDelivery::class]);
+
+    (new ReconcileDeliveries)->handle(
+        app(RecoverExhaustedOrbitPlanningCorrection::class),
+        app(RecoverExhaustedOrbitPlanResolution::class),
+        app(BindOrbitPullRequestReviewPublicationRecovery::class),
+    );
+
+    Queue::assertNotPushed(AdvanceDelivery::class);
+    Queue::assertPushed(
+        ReconcileDelivery::class,
+        fn (ReconcileDelivery $job): bool => $job->deliveryId === $delivery->id
+            && $job->phaseRunId === $phase->id
+            && $job->dispatchId === $dispatch->id,
+    );
+
+    (new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id))->handle(
+        app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
+        app(ReconcileOrbitPullRequestReviewWait::class),
+    );
+
+    expect($delivery->fresh()->status)->toBe(DeliveryStatus::Blocked)
+        ->and($phase->fresh()->status)->toBe(PhaseRunStatus::Failed)
+        ->and($phase->fresh()->failure_code)->toBe('orbit_receipt_settlement_inconsistent')
+        ->and($phase->fresh()->failure_details['agent_role'])
+        ->toBe(OrbitFeatureWorkflow::PLANNING_AGENT_ROLE)
+        ->and($phase->fresh()->failure_details['dispatch_agent_role'])
+        ->toBe(OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE);
+});
 
 it('ignores a valid receipt retained by an older phase', function (): void {
     [$delivery, $current, $dispatch] = waitingReconciliationDelivery('done', 11);
@@ -823,6 +955,7 @@ it('recovers a missed terminal Herdr event without protocol agent ids', function
 
     (new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id))->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
         app(ReconcileOrbitPullRequestReviewWait::class),
     );
 
@@ -841,6 +974,7 @@ it('keeps a current or non-terminal Herdr agent waiting', function (string $stat
 
     $job->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
         app(ReconcileOrbitPullRequestReviewWait::class),
     );
 
@@ -880,6 +1014,7 @@ it('refuses a terminal observation outside the exact dispatch identity', functio
 
     expect(fn () => (new ReconcileDelivery($delivery->id, $phase->id, $dispatch->id))->handle(
         app(ReconcileWaitingHerdrSettlement::class),
+        app(ReconcileOrbitSettledReceiptWait::class),
         app(ReconcileOrbitPullRequestReviewWait::class),
     ))->toThrow(
         HerdrSettlementReconciliationFailed::class,

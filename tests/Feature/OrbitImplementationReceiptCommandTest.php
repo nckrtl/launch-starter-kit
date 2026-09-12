@@ -1,6 +1,7 @@
 <?php
 
 use App\Delivery\Actions\ConfigureProjectOrchestration;
+use App\Delivery\Actions\ReconcileOrbitSettledReceiptWait;
 use App\Delivery\Actions\StartOrbitDelivery;
 use App\Delivery\Contracts\OrbitImplementationRepository;
 use App\Delivery\Data\CandidateCheck;
@@ -513,6 +514,37 @@ it('captures one immutable idempotent ready implementation receipt', function ()
     expect(Receipt::where('kind', 'orbit_implementation')->count())->toBe(1)
         ->and($this->repository->verificationCount)->toBe(2);
     Queue::assertPushed(AdvanceDelivery::class, 2);
+});
+
+it('recovers an exact implementation receipt submitted after the receipt grace timeout', function () {
+    $this->dispatch->forceFill([
+        'herdr_session' => 'orbit',
+        'herdr_workspace_id' => 'implementation-workspace',
+        'herdr_tab_id' => 'implementation-tab',
+        'herdr_pane_id' => 'implementation-pane',
+        'herdr_terminal_id' => 'implementation-terminal',
+        'herdr_agent_id' => null,
+        'status' => AgentDispatchStatus::Settled,
+        'state_change_seq' => 33,
+        'dispatched_at' => now()->subHour(),
+        'settled_at' => now()->subMinutes(5),
+    ])->save();
+    $waits = app(ReconcileOrbitSettledReceiptWait::class);
+
+    expect($waits->handle($this->delivery->id, $this->phaseRun->id, $this->dispatch->id))->toBeTrue();
+
+    $this->artisan('delivery:submit-orbit-implementation-receipt', $this->arguments)->assertSuccessful();
+
+    expect(Receipt::query()->where('phase_run_id', $this->phaseRun->id)->count())->toBe(1)
+        ->and($this->phaseRun->fresh()->status)->toBe(PhaseRunStatus::Running)
+        ->and($this->phaseRun->fresh()->failure_code)->toBeNull()
+        ->and($this->phaseRun->fresh()->finished_at)->toBeNull()
+        ->and($this->delivery->fresh()->status)->toBe(DeliveryStatus::WaitingForAgent)
+        ->and($this->delivery->fresh()->failure_details)->toBeNull()
+        ->and($this->dispatch->fresh()->status)->toBe(AgentDispatchStatus::Settled)
+        ->and($this->dispatch->fresh()->state_change_seq)->toBe(33)
+        ->and($this->repository->verificationCount)->toBe(1);
+    Queue::assertPushed(AdvanceDelivery::class, 1);
 });
 
 it('captures a corrected implementation receipt from an exact merge-conflict transition', function () {

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace App\Console\Commands;
 
 use App\Delivery\Actions\CaptureOrbitImplementationReceipt;
+use App\Delivery\Actions\ReconcileOrbitSettledReceiptWait;
 use App\Delivery\Actions\ResolveOrbitDeliveryPreparation;
 use App\Delivery\Config\ProjectConfigRegistry;
 use App\Delivery\Contracts\OrbitImplementationRepository;
@@ -41,6 +42,7 @@ final class SubmitOrbitImplementationReceiptCommand extends Command
         ResolveOrbitDeliveryPreparation $preparations,
         OrbitImplementationRepository $repository,
         CaptureOrbitImplementationReceipt $capture,
+        ReconcileOrbitSettledReceiptWait $settledReceipts,
     ): int {
         $phaseRunId = $this->positiveIntegerArgument('phase-run');
         $dispatchId = $this->positiveIntegerArgument('dispatch');
@@ -55,6 +57,15 @@ final class SubmitOrbitImplementationReceiptCommand extends Command
             ->with(['delivery.projectOrchestration', 'agentDispatches'])
             ->find($phaseRunId);
         $dispatch = $phaseRun?->agentDispatches->firstWhere('id', $dispatchId);
+        $recovering = $phaseRun !== null && $dispatch !== null
+            && $settledReceipts->canRecoverLateReceipt(
+                $phaseRun->delivery,
+                $phaseRun->delivery->projectOrchestration,
+                $phaseRun,
+                $dispatch,
+                $phaseRun->agentDispatches->count(),
+                $phaseRun->receipts()->count(),
+            );
         $latestImplementationId = $phaseRun === null
             ? null
             : PhaseRun::query()
@@ -68,13 +79,13 @@ final class SubmitOrbitImplementationReceiptCommand extends Command
             || $phaseRun->delivery->workflow_type !== OrbitFeatureWorkflow::TYPE
             || $phaseRun->delivery->workflow_version !== OrbitFeatureWorkflow::VERSION
             || $phaseRun->delivery->current_phase !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
-            || ($phaseRun->delivery->status !== DeliveryStatus::WaitingForAgent
+            || (! $recovering && $phaseRun->delivery->status !== DeliveryStatus::WaitingForAgent
                 && ! ($phaseRun->delivery->status === DeliveryStatus::Preparing
                     && $dispatch->status === AgentDispatchStatus::Starting
                     && $dispatch->error_code === 'herdr_prompt_attempted'))
             || $phaseRun->phase_name !== OrbitFeatureWorkflow::IMPLEMENTATION_PHASE
             || $phaseRun->attempt < 1
-            || $phaseRun->status !== PhaseRunStatus::Running
+            || (! $recovering && $phaseRun->status !== PhaseRunStatus::Running)
             || $dispatch->agent_role !== OrbitFeatureWorkflow::IMPLEMENTATION_AGENT_ROLE
             || (! ($dispatch->status === AgentDispatchStatus::Starting
                 && $dispatch->error_code === 'herdr_prompt_attempted')
