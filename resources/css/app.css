@@ -15,3 +15,28 @@
    Tailwind's automatic source detection scans any non-gitignored bundle in
    there and regenerates a utility for every class it contains. */
 @source not '../../public';
+
+/* Shared page rhythm from Hauzer's user application shell. */
+.commander-content > main {
+    padding: 1.25rem 1rem;
+}
+.commander-content h1 {
+    font-size: 27px;
+    line-height: 1.15;
+    letter-spacing: -0.02em;
+    font-weight: 600;
+}
+.commander-content h1 + p {
+    margin-top: 0.375rem;
+    font-size: 13px;
+}
+@media (min-width: 640px) {
+    .commander-content > main {
+        padding-inline: 1.5rem;
+    }
+}
+@media (min-width: 1024px) {
+    .commander-content > main {
+        padding: 1.75rem 2rem;
+    }
+}

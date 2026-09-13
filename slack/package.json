@@ -1,0 +1,9 @@
+{
+    "name": "commander-slack-cli",
+    "version": "1.0.0",
+    "private": true,
+    "description": "Slack CLI manifest for Commander",
+    "devDependencies": {
+        "@slack/cli-hooks": "^2.0.0"
+    }
+}
