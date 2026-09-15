@@ -8,16 +8,16 @@ it('ships a bounded restartable Commander delivery worker', function (): void {
     $unit = File::get(base_path('ops/systemd/commander-delivery-worker.service'));
 
     expect($unit)
-        ->toContain('WorkingDirectory=/fast/apps/commander')
+        ->toContain('WorkingDirectory=/home/nckrtl/apps/commander/main')
         ->toContain('UnsetEnvironment=SSH_AUTH_SOCK')
-        ->toContain('ExecStart=/usr/bin/php /fast/apps/commander/artisan queue:work database')
+        ->toContain('ExecStart=/usr/bin/php /home/nckrtl/apps/commander/main/artisan queue:work database')
         ->toContain('--name=commander-delivery')
         ->toContain('--queue=default')
         ->toContain('--tries=0')
         ->toContain('--timeout=540')
         ->toContain('--max-time=3600')
         ->toContain('--no-interaction')
-        ->toContain('ExecReload=/usr/bin/php /fast/apps/commander/artisan queue:restart')
+        ->toContain('ExecReload=/usr/bin/php /home/nckrtl/apps/commander/main/artisan queue:restart')
         ->toContain('Restart=always')
         ->toContain('TimeoutStopSec=600')
         ->toContain('KillMode=mixed')
@@ -32,8 +32,8 @@ it('ships a persistent one-minute Laravel scheduler timer', function (): void {
 
     expect($service)
         ->toContain('Type=oneshot')
-        ->toContain('WorkingDirectory=/fast/apps/commander')
-        ->toContain('ExecStart=/usr/bin/php /fast/apps/commander/artisan schedule:run --no-interaction')
+        ->toContain('WorkingDirectory=/home/nckrtl/apps/commander/main')
+        ->toContain('ExecStart=/usr/bin/php /home/nckrtl/apps/commander/main/artisan schedule:run --no-interaction')
         ->toContain('TimeoutStartSec=55')
         ->not->toContain('--force');
     expect($timer)

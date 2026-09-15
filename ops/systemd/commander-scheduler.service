@@ -5,6 +5,6 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/fast/apps/commander
-ExecStart=/usr/bin/php /fast/apps/commander/artisan schedule:run --no-interaction
+WorkingDirectory=/home/nckrtl/apps/commander/main
+ExecStart=/usr/bin/php /home/nckrtl/apps/commander/main/artisan schedule:run --no-interaction
 TimeoutStartSec=55

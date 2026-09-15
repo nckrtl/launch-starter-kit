@@ -5,10 +5,10 @@ After=network-online.target herdr-orbit.service
 
 [Service]
 Type=simple
-WorkingDirectory=/fast/apps/commander
+WorkingDirectory=/home/nckrtl/apps/commander/main
 UnsetEnvironment=SSH_AUTH_SOCK
-ExecStart=/usr/bin/php /fast/apps/commander/artisan queue:work database --name=commander-delivery --queue=default --sleep=1 --rest=1 --tries=0 --timeout=540 --max-time=3600 --memory=256 --no-interaction
-ExecReload=/usr/bin/php /fast/apps/commander/artisan queue:restart
+ExecStart=/usr/bin/php /home/nckrtl/apps/commander/main/artisan queue:work database --name=commander-delivery --queue=default --sleep=1 --rest=1 --tries=0 --timeout=540 --max-time=3600 --memory=256 --no-interaction
+ExecReload=/usr/bin/php /home/nckrtl/apps/commander/main/artisan queue:restart
 Restart=always
 RestartSec=5
 TimeoutStopSec=600

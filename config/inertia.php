@@ -20,7 +20,7 @@ return [
 
         'ensure_runtime_exists' => (bool) env('INERTIA_SSR_ENSURE_RUNTIME_EXISTS', false),
 
-        'url' => env('INERTIA_SSR_URL', file_exists('/.dockerenv') ? 'http://host.docker.internal:13729' : 'http://127.0.0.1:13729'),
+        'url' => env('INERTIA_SSR_URL', (file_exists('/.dockerenv') ? 'http://host.docker.internal:' : 'http://127.0.0.1:').env('INERTIA_SSR_PORT', 13719)),
 
         'hot_url' => env('INERTIA_SSR_HOT_URL'),
 
