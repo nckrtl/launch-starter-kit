@@ -485,7 +485,7 @@ final readonly class AdvanceOrbitImplementation
                 'idempotency_key' => $idempotencyKey,
                 'herdr_agent_name' => $agent,
                 'prompt_name' => $prompt,
-                'prompt_version' => 1,
+                'prompt_version' => OrbitFeatureWorkflow::nextPromptVersion($prompt),
                 'prompt_hash' => str_repeat('0', 64),
                 'status' => AgentDispatchStatus::Pending,
             ],
@@ -497,7 +497,7 @@ final readonly class AdvanceOrbitImplementation
             || $nextDispatch->idempotency_key !== $idempotencyKey
             || $nextDispatch->herdr_agent_name !== $agent
             || $nextDispatch->prompt_name !== $prompt
-            || $nextDispatch->prompt_version !== 1
+            || ! OrbitFeatureWorkflow::supportsPromptVersion($nextDispatch->prompt_name, $nextDispatch->prompt_version)
             || $nextDispatch->prompt_hash !== str_repeat('0', 64)
             || $nextDispatch->status !== AgentDispatchStatus::Pending) {
             throw new OrbitImplementationAdvancementFailed('The retained post-implementation intent is inconsistent.');
@@ -639,7 +639,7 @@ final readonly class AdvanceOrbitImplementation
             )->value
             || $nextDispatch->herdr_agent_name !== $expectedAgent
             || $nextDispatch->prompt_name !== $expectedPrompt
-            || $nextDispatch->prompt_version !== 1
+            || ! OrbitFeatureWorkflow::supportsPromptVersion($nextDispatch->prompt_name, $nextDispatch->prompt_version)
             || $nextDispatch->prompt_hash !== str_repeat('0', 64)
             || $nextDispatch->status !== AgentDispatchStatus::Pending) {
             throw new OrbitImplementationAdvancementFailed('The retained post-implementation intent is inconsistent.');

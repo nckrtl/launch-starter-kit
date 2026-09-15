@@ -274,7 +274,7 @@ final readonly class AdvanceOrbitPlanning
                 || $resolutionDispatch->idempotency_key !== $expectedKey
                 || $resolutionDispatch->herdr_agent_name !== strtolower((string) $delivery->external_issue_key).'-loop-resolution-1'
                 || $resolutionDispatch->prompt_name !== 'orbit_resolution'
-                || $resolutionDispatch->prompt_version !== 1
+                || ! OrbitFeatureWorkflow::supportsPromptVersion($resolutionDispatch->prompt_name, $resolutionDispatch->prompt_version)
                 || $resolutionDispatch->prompt_hash !== str_repeat('0', 64)) {
                 throw new OrbitPlanningAdvancementFailed('The retained planning-resolution transition is inconsistent.');
             }
@@ -505,7 +505,7 @@ final readonly class AdvanceOrbitPlanning
                     'idempotency_key' => $idempotencyKey,
                     'herdr_agent_name' => $nextAgent,
                     'prompt_name' => $nextPrompt,
-                    'prompt_version' => 1,
+                    'prompt_version' => OrbitFeatureWorkflow::nextPromptVersion($nextPrompt),
                     'prompt_hash' => str_repeat('0', 64),
                     'status' => AgentDispatchStatus::Pending,
                 ],
@@ -518,7 +518,7 @@ final readonly class AdvanceOrbitPlanning
                 || $nextDispatch->idempotency_key !== $idempotencyKey
                 || $nextDispatch->herdr_agent_name !== $nextAgent
                 || $nextDispatch->prompt_name !== $nextPrompt
-                || $nextDispatch->prompt_version !== 1
+                || ! OrbitFeatureWorkflow::supportsPromptVersion($nextDispatch->prompt_name, $nextDispatch->prompt_version)
                 || $nextDispatch->prompt_hash !== str_repeat('0', 64)
                 || $next->agentDispatches()->count() !== 1
                 || $nextDispatch->status !== AgentDispatchStatus::Pending

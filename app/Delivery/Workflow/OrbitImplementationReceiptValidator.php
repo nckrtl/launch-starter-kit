@@ -246,6 +246,7 @@ final readonly class OrbitImplementationReceiptValidator
         $repository = $delivery->projectOrchestration->config['repository'] ?? null;
         $expectedPrompt = is_string($repository) && is_array($resolutionInput)
             && $resolutionDispatch !== null
+            && OrbitFeatureWorkflow::supportsPromptVersion('orbit_resolution', $resolutionDispatch->prompt_version)
             ? $this->workflow->pullRequestResolutionPrompt(
                 (string) $delivery->external_issue_key,
                 $repository,
@@ -261,6 +262,7 @@ final readonly class OrbitImplementationReceiptValidator
                     $resolutionDispatch->id,
                 ),
                 $resolutionInput,
+                $resolutionDispatch->prompt_version,
             )
             : null;
         $marker = "ORBIT-LOOP-RESOLUTION:{$dispatchId}";
@@ -295,7 +297,7 @@ final readonly class OrbitImplementationReceiptValidator
             )->value
             && $resolutionDispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$resolution->attempt
             && $resolutionDispatch->prompt_name === 'orbit_resolution'
-            && $resolutionDispatch->prompt_version === OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION
+            && OrbitFeatureWorkflow::supportsPromptVersion('orbit_resolution', $resolutionDispatch->prompt_version)
             && is_string($expectedPrompt)
             && hash_equals($resolutionDispatch->prompt_hash, hash('sha256', $expectedPrompt))
             && $resolutionReceipts->count() === 1

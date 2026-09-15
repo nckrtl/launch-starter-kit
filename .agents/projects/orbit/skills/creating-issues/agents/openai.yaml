@@ -1,0 +1,4 @@
+interface:
+  display_name: "Creating Issues"
+  short_description: "Turn defined Orbit work into Linear issues"
+  default_prompt: "Use $creating-issues to draft and publish these requirements as a Linear issue."

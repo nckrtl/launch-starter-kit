@@ -48,7 +48,26 @@ final readonly class OrbitFeatureWorkflow
 
     public const int RESOLUTION_CORRECTION_PROMPT_VERSION = 1;
 
-    public const int RESOLUTION_PROMPT_VERSION = 1;
+    public const int RESOLUTION_PROMPT_VERSION = 2;
+
+    public static function nextPromptVersion(string $prompt): int
+    {
+        return $prompt === 'orbit_resolution' ? self::RESOLUTION_PROMPT_VERSION : 1;
+    }
+
+    public static function supportsPromptVersion(string $prompt, int $version): bool
+    {
+        return $prompt === 'orbit_resolution' ? in_array($version, [1, self::RESOLUTION_PROMPT_VERSION], true) : $version === 1;
+    }
+
+    private function resolutionSkill(string $repository, int $version): string
+    {
+        return match ($version) {
+            1 => $repository.'/.agents/skills/resolve-pipeline-issues/SKILL.md',
+            self::RESOLUTION_PROMPT_VERSION => base_path('.agents/projects/orbit/skills/resolve-pipeline-issues/SKILL.md'),
+            default => throw new \InvalidArgumentException('Unsupported Orbit resolution prompt version.'),
+        };
+    }
 
     public function planReviewAgentName(string $issueKey, int $attempt): string
     {
@@ -619,7 +638,9 @@ PROMPT;
         int $dispatchId,
         string $receiptCommand,
         array $resolutionInput,
+        int $promptVersion = self::RESOLUTION_PROMPT_VERSION,
     ): string {
+        $skill = $this->resolutionSkill($repository, $promptVersion);
         $evidence = json_encode(
             $resolutionInput,
             JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
@@ -635,7 +656,7 @@ Flow: discovery
 Delivery: {$deliveryId}
 Phase run: {$phaseRunId}
 Dispatch: {$dispatchId}
-Current process skill: {$repository}/.agents/skills/resolve-pipeline-issues/SKILL.md
+Current process skill: {$skill}
 
 Use that skill in delegated advisory mode for this exact issue and stop. Inspect the live issue,
 its comments and relations, current origin/main, accepted ADRs, maintained documentation, the
@@ -684,7 +705,9 @@ PROMPT;
         int $dispatchId,
         string $receiptCommand,
         array $resolutionInput,
+        int $promptVersion = self::RESOLUTION_PROMPT_VERSION,
     ): string {
+        $skill = $this->resolutionSkill($repository, $promptVersion);
         $evidence = json_encode(
             $resolutionInput,
             JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES,
@@ -700,7 +723,7 @@ Flow: discovery
 Delivery: {$deliveryId}
 Phase run: {$phaseRunId}
 Dispatch: {$dispatchId}
-Current process skill: {$repository}/.agents/skills/resolve-pipeline-issues/SKILL.md
+Current process skill: {$skill}
 
 Use that skill in delegated advisory mode for this exact issue and stop. Inspect the live issue,
 its comments and relations, current origin/main, accepted ADRs, maintained documentation, the

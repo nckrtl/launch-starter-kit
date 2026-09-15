@@ -67,7 +67,7 @@ final readonly class OrbitPlanResolutionReceiptValidator
             && $dispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key)
                 .'-loop-resolution-'.$resolution->attempt
             && $dispatch->prompt_name === 'orbit_resolution'
-            && $dispatch->prompt_version === OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION;
+            && OrbitFeatureWorkflow::supportsPromptVersion('orbit_resolution', $dispatch->prompt_version);
     }
 
     public function matchesInput(
@@ -92,6 +92,7 @@ final readonly class OrbitPlanResolutionReceiptValidator
             $dispatch->id,
             $this->receiptCommand($resolution, $dispatch),
             $input,
+            $dispatch->prompt_version,
         );
 
         return hash_equals($dispatch->prompt_hash, hash('sha256', $expectedPrompt));

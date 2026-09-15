@@ -50,6 +50,7 @@ use App\Delivery\Exceptions\OrbitIssueTransitionFailed;
 use App\Delivery\Exceptions\OrbitPullRequestReviewAdvancementFailed;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
 use App\Delivery\Exceptions\OrbitResolutionAdoptionFailed;
+use App\Delivery\Exceptions\OrbitResolutionDispatchFailed;
 use App\Delivery\Exceptions\OrbitResolutionPublicationFailed;
 use App\Delivery\Workflow\IdempotencyKey;
 use App\Delivery\Workflow\OrbitFeatureWorkflow;
@@ -1318,7 +1319,7 @@ function promotePullRequestReviewReceiptToResolution(object $test): array
 }
 
 /** @return array{PhaseRun, AgentDispatch} */
-function activatePullRequestResolution(object $test): array
+function activatePullRequestResolution(object $test, int $promptVersion = OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION): array
 {
     [$resolution, $resolver] = promotePullRequestReviewReceiptToResolution($test);
     $resolution->forceFill([
@@ -1326,6 +1327,7 @@ function activatePullRequestResolution(object $test): array
         'started_at' => now(),
     ])->save();
     $resolver->forceFill([
+        'prompt_version' => $promptVersion,
         'herdr_session' => 'orbit',
         'herdr_workspace_id' => 'resolution-workspace',
         'herdr_tab_id' => 'resolution-tab',
@@ -1351,6 +1353,7 @@ function activatePullRequestResolution(object $test): array
             $resolver->id,
         ),
         $resolution->input,
+        $promptVersion,
     );
     $resolver->forceFill(['prompt_hash' => hash('sha256', $prompt)])->save();
     $test->delivery->refresh()->forceFill([
@@ -1418,9 +1421,9 @@ function activateSecondPullRequestResolution(object $test): array
 }
 
 /** @return array{PhaseRun, AgentDispatch, Receipt} */
-function prepareResolutionProposalForPublication(object $test): array
+function prepareResolutionProposalForPublication(object $test, int $promptVersion = OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION): array
 {
-    [$resolution, $resolver] = activatePullRequestResolution($test);
+    [$resolution, $resolver] = activatePullRequestResolution($test, $promptVersion);
     $handoff = 'Use the loaded worker configuration as the health authority.';
     $proposal = [
         'schema' => 1,
@@ -1456,9 +1459,9 @@ function prepareResolutionProposalForPublication(object $test): array
 }
 
 /** @return array{PhaseRun, AgentDispatch, Receipt} */
-function preparePublishedResolutionAdoption(object $test): array
+function preparePublishedResolutionAdoption(object $test, int $promptVersion = OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION): array
 {
-    [$resolution, $resolver, $receipt] = prepareResolutionProposalForPublication($test);
+    [$resolution, $resolver, $receipt] = prepareResolutionProposalForPublication($test, $promptVersion);
     app(AdvanceOrbitResolution::class)->handle($test->delivery->id, $resolution->id);
 
     return [$resolution->fresh(), $resolver->fresh(), $receipt->fresh()];
@@ -2768,8 +2771,10 @@ it('queues the exact retained pull request resolution dispatch', function () {
     );
 });
 
-it('dispatches one independent advisory resolver with the legacy proposal contract', function () {
+it('dispatches and resumes the recorded resolver prompt version', function (int $version) {
     [$resolution, $resolver] = promotePullRequestReviewReceiptToResolution($this);
+    expect($resolver->prompt_version)->toBe(OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION);
+    $resolver->forceFill(['prompt_version' => $version])->save();
     config()->set('herdr.session', 'orbit');
     $herdr = new PullRequestResolutionHerdr;
     app()->instance(HerdrRuntime::class, $herdr);
@@ -2799,7 +2804,9 @@ it('dispatches one independent advisory resolver with the legacy proposal contra
         )
         ->and($herdr->prompts)->toHaveCount(1)
         ->and($herdr->prompts[0])->toContain(
-            $this->repositoryPath.'/.agents/skills/resolve-pipeline-issues/SKILL.md',
+            $version === 1
+                ? $this->repositoryPath.'/.agents/skills/resolve-pipeline-issues/SKILL.md'
+                : base_path('.agents/projects/orbit/skills/resolve-pipeline-issues/SKILL.md'),
             'This is advisory resolution only.',
             '--result=proposal',
             '--resolution=.loop/runtime/resolution.json',
@@ -2810,6 +2817,23 @@ it('dispatches one independent advisory resolver with the legacy proposal contra
         ->and($this->pullRequests->calls)->toBe(2)
         ->and($this->advanceIssues->calls)->toBe(2)
         ->and($this->advanceRepository->reservationIsHeld())->toBeFalse();
+
+    $replayed = app(DispatchOrbitPullRequestResolution::class)->handle($this->delivery->id, $resolution->id);
+    expect($replayed->id)->toBe($result->id)
+        ->and($herdr->prompts)->toHaveCount(1)
+        ->and($replayed->prompt_hash)->toBe(hash('sha256', $herdr->prompts[0]));
+})->with([1, 2]);
+
+it('keeps the Orbit project resolver out of another registered project', function () {
+    [$resolution] = promotePullRequestReviewReceiptToResolution($this);
+    $this->delivery->projectOrchestration->forceFill(['manifest_project_id' => 'another-project'])->save();
+    config()->set('herdr.session', 'orbit');
+    $herdr = new PullRequestResolutionHerdr;
+    app()->instance(HerdrRuntime::class, $herdr);
+
+    expect(fn () => app(DispatchOrbitPullRequestResolution::class)->handle($this->delivery->id, $resolution->id))
+        ->toThrow(OrbitResolutionDispatchFailed::class, 'resolution intent is inconsistent');
+    expect($herdr->calls)->toBe([]);
 });
 
 it('publishes and classifies one immutable structured resolution proposal', function () {
@@ -2968,8 +2992,8 @@ it('adopts one requirement-free resolution into one exact Builder correction and
     );
 });
 
-it('dispatches an adopted resolution with its distinct exact correction prompt', function () {
-    [$resolution] = preparePublishedResolutionAdoption($this);
+it('dispatches an adopted resolution with its distinct exact correction prompt', function (int $promptVersion) {
+    [$resolution] = preparePublishedResolutionAdoption($this, $promptVersion);
     app(AdoptOrbitResolution::class)->handle($this->delivery->id, $resolution->id);
     normalizeResolutionCorrectionBuilder($this);
     config()->set('herdr.session', 'orbit');
@@ -2989,7 +3013,7 @@ it('dispatches an adopted resolution with its distinct exact correction prompt',
         ->and($herdr->prompts[0])->toContain('ORBIT-LOOP-RESOLUTION:')
         ->and($herdr->prompts[0])->not->toContain('actual merge conflicts')
         ->and($herdr->prompts[0])->not->toContain('independent pull request review finding');
-});
+})->with([1, 2]);
 
 it('rejects corrupted resolution adoption evidence before changing Linear', function (string $drift) {
     [$resolution] = preparePublishedResolutionAdoption($this);

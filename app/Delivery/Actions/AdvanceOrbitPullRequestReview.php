@@ -687,7 +687,7 @@ final readonly class AdvanceOrbitPullRequestReview
                 )->value,
                 'herdr_agent_name' => $agent,
                 'prompt_name' => $prompt,
-                'prompt_version' => 1,
+                'prompt_version' => OrbitFeatureWorkflow::nextPromptVersion($prompt),
                 'prompt_hash' => str_repeat('0', 64),
                 'status' => AgentDispatchStatus::Pending,
             ],
@@ -715,7 +715,7 @@ final readonly class AdvanceOrbitPullRequestReview
             )->value
             || $dispatch->herdr_agent_name !== $agent
             || $dispatch->prompt_name !== $prompt
-            || $dispatch->prompt_version !== 1
+            || ! OrbitFeatureWorkflow::supportsPromptVersion($dispatch->prompt_name, $dispatch->prompt_version)
             || $dispatch->prompt_hash !== str_repeat('0', 64)
             || $dispatch->status !== AgentDispatchStatus::Pending) {
             throw new OrbitPullRequestReviewAdvancementFailed(
@@ -851,7 +851,7 @@ final readonly class AdvanceOrbitPullRequestReview
             )->value
             && $nextDispatch->herdr_agent_name === $agent
             && $nextDispatch->prompt_name === $prompt
-            && $nextDispatch->prompt_version === 1
+            && OrbitFeatureWorkflow::supportsPromptVersion($nextDispatch->prompt_name, $nextDispatch->prompt_version)
             && $nextDispatch->prompt_hash === str_repeat('0', 64)
             && $nextDispatch->status === AgentDispatchStatus::Pending
             && $nextDispatch->herdr_session === null

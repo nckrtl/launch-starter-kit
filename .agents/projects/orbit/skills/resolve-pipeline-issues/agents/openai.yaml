@@ -1,0 +1,4 @@
+interface:
+  display_name: "Resolve Pipeline Issues"
+  short_description: "Resolve gaps in existing Orbit Linear issues"
+  default_prompt: "Use $resolve-pipeline-issues to diagnose and resolve the requirements blocking this Orbit issue."

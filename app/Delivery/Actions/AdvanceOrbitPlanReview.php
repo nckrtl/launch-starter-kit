@@ -249,7 +249,7 @@ final readonly class AdvanceOrbitPlanReview
             || $nextDispatch->idempotency_key !== $expectedKey
             || $nextDispatch->herdr_agent_name !== $intent['agent']
             || $nextDispatch->prompt_name !== $intent['prompt']
-            || $nextDispatch->prompt_version !== 1
+            || ! OrbitFeatureWorkflow::supportsPromptVersion($nextDispatch->prompt_name, $nextDispatch->prompt_version)
             || $nextDispatch->prompt_hash !== str_repeat('0', 64)
             || $nextDispatch->status !== AgentDispatchStatus::Pending) {
             throw new OrbitPlanReviewAdvancementFailed('The retained post-review intent is inconsistent.');
@@ -384,7 +384,7 @@ final readonly class AdvanceOrbitPlanReview
                     'idempotency_key' => $idempotencyKey,
                     'herdr_agent_name' => $intent['agent'],
                     'prompt_name' => $intent['prompt'],
-                    'prompt_version' => 1,
+                    'prompt_version' => OrbitFeatureWorkflow::nextPromptVersion($intent['prompt']),
                     'prompt_hash' => str_repeat('0', 64),
                     'status' => AgentDispatchStatus::Pending,
                 ],
@@ -400,7 +400,7 @@ final readonly class AdvanceOrbitPlanReview
                 || $nextDispatch->idempotency_key !== $idempotencyKey
                 || $nextDispatch->herdr_agent_name !== $intent['agent']
                 || $nextDispatch->prompt_name !== $intent['prompt']
-                || $nextDispatch->prompt_version !== 1
+                || ! OrbitFeatureWorkflow::supportsPromptVersion($nextDispatch->prompt_name, $nextDispatch->prompt_version)
                 || $nextDispatch->prompt_hash !== str_repeat('0', 64)
                 || $nextDispatch->status !== AgentDispatchStatus::Pending) {
                 throw new OrbitPlanReviewAdvancementFailed('The retained post-review intent is inconsistent.');

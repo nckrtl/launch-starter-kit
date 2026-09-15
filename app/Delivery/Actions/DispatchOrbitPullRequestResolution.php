@@ -238,7 +238,9 @@ final readonly class DispatchOrbitPullRequestResolution
                 || $dispatches->count() !== 1
                 || $dispatch->agent_role !== OrbitFeatureWorkflow::RESOLUTION_AGENT_ROLE
                 || $dispatch->prompt_name !== 'orbit_resolution'
-                || $dispatch->prompt_version !== OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION) {
+                || ! OrbitFeatureWorkflow::supportsPromptVersion('orbit_resolution', $dispatch->prompt_version)
+                || ($dispatch->prompt_version === OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION
+                    && $project->manifest_project_id !== 'orbit')) {
                 throw new OrbitResolutionDispatchFailed('The retained Orbit resolution intent is inconsistent.');
             }
 
@@ -265,6 +267,7 @@ final readonly class DispatchOrbitPullRequestResolution
                     $dispatch->id,
                     $this->receiptCommand($phase, $dispatch),
                     $resolutionInput,
+                    $dispatch->prompt_version,
                 )
                 : $this->workflow->pullRequestResolutionPrompt(
                     (string) $delivery->external_issue_key,
@@ -275,6 +278,7 @@ final readonly class DispatchOrbitPullRequestResolution
                     $dispatch->id,
                     $this->receiptCommand($phase, $dispatch),
                     $resolutionInput,
+                    $dispatch->prompt_version,
                 );
 
             if ($dispatch->status === AgentDispatchStatus::Pending) {
@@ -861,6 +865,8 @@ final readonly class DispatchOrbitPullRequestResolution
                 || $dispatch->state_change_seq < 0
                 || $dispatch->dispatched_at === null
                 || $dispatch->settled_at !== null
+                || ($dispatch->prompt_version === OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION
+                    && $project->manifest_project_id !== 'orbit')
                 || ! $this->receipts->matchesInput($delivery, $phase, $dispatch)) {
                 throw new OrbitResolutionDispatchFailed(
                     'The interrupted Orbit resolution dispatch is not safe to recover.',
@@ -878,6 +884,7 @@ final readonly class DispatchOrbitPullRequestResolution
                     $dispatch->id,
                     $this->receiptCommand($phase, $dispatch),
                     $input,
+                    $dispatch->prompt_version,
                 )
                 : $this->workflow->pullRequestResolutionPrompt(
                     (string) $delivery->external_issue_key,
@@ -888,6 +895,7 @@ final readonly class DispatchOrbitPullRequestResolution
                     $dispatch->id,
                     $this->receiptCommand($phase, $dispatch),
                     $input,
+                    $dispatch->prompt_version,
                 );
 
             if (! hash_equals($dispatch->prompt_hash, hash('sha256', $prompt))) {

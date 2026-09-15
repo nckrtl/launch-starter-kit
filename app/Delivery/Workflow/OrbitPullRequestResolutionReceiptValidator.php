@@ -25,7 +25,8 @@ final readonly class OrbitPullRequestResolutionReceiptValidator
     {
         $input = $this->associativeArray($resolution->input);
 
-        if ($input === null) {
+        if ($input === null
+            || ! OrbitFeatureWorkflow::supportsPromptVersion('orbit_resolution', $dispatch->prompt_version)) {
             return false;
         }
 
@@ -65,6 +66,7 @@ final readonly class OrbitPullRequestResolutionReceiptValidator
             $dispatch->id,
             $this->receiptCommand($resolution, $dispatch),
             $input,
+            $dispatch->prompt_version,
         );
 
         return $resolution->delivery_id === $delivery->id
@@ -81,7 +83,6 @@ final readonly class OrbitPullRequestResolutionReceiptValidator
             )->value
             && $dispatch->herdr_agent_name === strtolower((string) $delivery->external_issue_key).'-loop-resolution-'.$resolution->attempt
             && $dispatch->prompt_name === 'orbit_resolution'
-            && $dispatch->prompt_version === OrbitFeatureWorkflow::RESOLUTION_PROMPT_VERSION
             && hash_equals($dispatch->prompt_hash, hash('sha256', $expectedPrompt));
     }
 

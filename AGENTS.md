@@ -15,6 +15,10 @@ Laravel 13 + Launch Laravel + React 19 + Inertia v3 + VitePlus + Tailwind CSS v4
 
 The kit depends on `nckrtl/launch-laravel` from Packagist. To develop against a local checkout, use `composer link ../../packages/launch-laravel` after `composer install` — see "Working on the kit itself" in README.md, which is the source of truth for this workflow. `composer link` keeps `composer.json` and `composer.lock` untouched; `composer unlink <path>` restores the published package.
 
+## Managed project work
+
+For maintenance of a registered project, use [.agents/projects/AGENTS.md](.agents/projects/AGENTS.md) to find its skills. Select by the shared-knowledge project ID. The stack skills below apply to work on Commander itself.
+
 ## Agent Skills
 
 Use the stack-specific skills whenever their domain is involved:
