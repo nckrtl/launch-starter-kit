@@ -8,6 +8,10 @@ return [
     'orbit' => [
         'url' => env('COMMANDER_ORBIT_URL', 'https://10.44.0.1'),
         'ca' => env('COMMANDER_ORBIT_CA', storage_path('app/orbit-gateway-ca.crt')),
+        'herdr_observer_origins' => array_values(array_filter(
+            array_map(trim(...), explode(',', (string) env('COMMANDER_ORBIT_HERDR_OBSERVER_ORIGINS', ''))),
+            static fn (string $origin): bool => $origin !== '',
+        )),
     ],
 
     'github_binary' => env('COMMANDER_GITHUB_BINARY', '/home/linuxbrew/.linuxbrew/bin/gh'),

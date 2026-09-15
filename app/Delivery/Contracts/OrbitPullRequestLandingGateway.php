@@ -22,5 +22,7 @@ interface OrbitPullRequestLandingGateway
 
     public function merge(int $number, string $candidateSha): MergedOrbitPullRequest;
 
+    public function inspectMerged(int $number, string $candidateSha): MergedOrbitPullRequest;
+
     public function release(string $issueId, string $pullRequestUrl): void;
 }

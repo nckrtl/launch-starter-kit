@@ -36,6 +36,7 @@ use App\Delivery\Data\VerifiedOrbitPlanningArtifact;
 use App\Delivery\Data\VerifiedOrbitPlanningOutcome;
 use App\Delivery\Data\VerifiedOrbitPlanningRepository;
 use App\Delivery\Exceptions\OrbitRepositoryFailed;
+use App\Tasks\Runtime\TaskProcessEnvironment;
 use FilesystemIterator;
 use Illuminate\Support\Facades\Process;
 use Illuminate\Support\Str;
@@ -69,13 +70,9 @@ use Throwable;
  */
 final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCleaner, OrbitImplementationRepository, OrbitMainCacheRefreshRequester, OrbitMainCorrectnessInspector, OrbitMergeLineageVerifier, OrbitPrimaryCheckoutReconciler, OrbitProofTopologyCloser, OrbitRepository, OrbitStaleWorktreeRetirer, OrbitWorktreeCleaner
 {
-    private const array PROJECTS = ['apps/cli', 'apps/docs', 'apps/gateway', 'apps/e2e', 'packages/php-sdk'];
+    use OrbitReservationFiles;
 
-    private const array COMMANDS = [
-        ['composer', 'validate', '--strict'],
-        ['composer', 'check'],
-        ['composer', 'test:affected'],
-    ];
+    public function __construct(private OrbitCandidateReceipt $candidateReceipts = new OrbitCandidateReceipt) {}
 
     public function verifyMergeLineage(
         OrbitProjectConfig $config,
@@ -228,9 +225,9 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
             }
 
             try {
-                $status = Process::path($repository)->timeout(10)->run(['git', 'status', '--porcelain']);
-                $branch = Process::path($repository)->timeout(10)->run(['git', 'branch', '--show-current']);
-                $ancestor = Process::path($repository)->timeout(10)->run([
+                $status = Process::path($repository)->env(TaskProcessEnvironment::isolated())->timeout(10)->run(['git', 'status', '--porcelain']);
+                $branch = Process::path($repository)->env(TaskProcessEnvironment::isolated())->timeout(10)->run(['git', 'branch', '--show-current']);
+                $ancestor = Process::path($repository)->env(TaskProcessEnvironment::isolated())->timeout(10)->run([
                     'git', 'merge-base', '--is-ancestor', $mergeCommitSha, 'origin/main',
                 ]);
             } catch (RuntimeException $exception) {
@@ -253,12 +250,12 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
             }
 
             try {
-                $merge = Process::path($repository)->timeout(120)->run([
+                $merge = Process::path($repository)->env(TaskProcessEnvironment::isolated())->timeout(120)->run([
                     'git', 'merge', '--ff-only', 'origin/main',
                 ]);
-                $head = Process::path($repository)->timeout(10)->run(['git', 'rev-parse', 'HEAD']);
-                $main = Process::path($repository)->timeout(10)->run(['git', 'rev-parse', 'main']);
-                $origin = Process::path($repository)->timeout(10)->run(['git', 'rev-parse', 'origin/main']);
+                $head = Process::path($repository)->env(TaskProcessEnvironment::isolated())->timeout(10)->run(['git', 'rev-parse', 'HEAD']);
+                $main = Process::path($repository)->env(TaskProcessEnvironment::isolated())->timeout(10)->run(['git', 'rev-parse', 'main']);
+                $origin = Process::path($repository)->env(TaskProcessEnvironment::isolated())->timeout(10)->run(['git', 'rev-parse', 'origin/main']);
             } catch (RuntimeException $exception) {
                 throw new OrbitRepositoryFailed(
                     'The Orbit primary checkout could not be reconciled.',
@@ -2685,105 +2682,6 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
         return is_int($pid) && $pid > 0 && ! is_dir('/proc/'.$pid);
     }
 
-    private function ensureReservationDirectory(string $path): void
-    {
-        if (! file_exists($path) && ! is_link($path)) {
-            @mkdir($path, 0700);
-        }
-
-        if (is_link($path) || ! is_dir($path) || realpath($path) !== $path) {
-            throw new OrbitRepositoryFailed('The Orbit delivery reservation directory is unsafe.');
-        }
-    }
-
-    /** @return array{resource, bool} */
-    private function openReservationLock(string $directory, string $lockPath): array
-    {
-        if (file_exists($lockPath)) {
-            $handle = @fopen($lockPath, 'c+');
-
-            if ($handle === false) {
-                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock could not be opened.');
-            }
-
-            return [$handle, false];
-        }
-
-        $temporary = tempnam($directory, '.controller-lock-');
-
-        if ($temporary === false) {
-            throw new OrbitRepositoryFailed('The Orbit delivery reservation lock could not be opened.');
-        }
-
-        try {
-            $handle = @fopen($temporary, 'r+');
-
-            if ($handle === false
-                || ! $this->isOpenedReservationLock($handle, $temporary)
-                || ! $this->isPrivateOpenedReservationLock($handle)) {
-                if (is_resource($handle)) {
-                    fclose($handle);
-                }
-
-                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
-            }
-
-            if (@link($temporary, $lockPath)) {
-                return [$handle, true];
-            }
-
-            fclose($handle);
-
-            if (is_link($lockPath) || ! is_file($lockPath)) {
-                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock is unsafe.');
-            }
-
-            $handle = @fopen($lockPath, 'c+');
-
-            if ($handle === false) {
-                throw new OrbitRepositoryFailed('The Orbit delivery reservation lock could not be opened.');
-            }
-
-            return [$handle, false];
-        } finally {
-            if (file_exists($temporary)) {
-                unlink($temporary);
-            }
-        }
-    }
-
-    /**
-     * @param  resource  $handle
-     *
-     * @phpstan-impure
-     */
-    private function isPrivateOpenedReservationLock(mixed $handle): bool
-    {
-        $opened = fstat($handle);
-
-        return $opened !== false && ($opened['mode'] & 0777) === 0600;
-    }
-
-    /**
-     * @param  resource  $handle
-     *
-     * @phpstan-impure
-     */
-    private function isOpenedReservationLock(mixed $handle, string $path): bool
-    {
-        clearstatcache(true, $path);
-        $opened = fstat($handle);
-        $pathStat = @lstat($path);
-
-        return $opened !== false
-            && $pathStat !== false
-            && ! is_link($path)
-            && ($opened['mode'] & 0170000) === 0100000
-            && ($pathStat['mode'] & 0170000) === 0100000
-            && $opened['dev'] === $pathStat['dev']
-            && $opened['ino'] === $pathStat['ino'];
-    }
-
     public function prepareWorktree(OrbitProjectConfig $config, string $issueKey): PreparedWorktree
     {
         $repository = realpath($config->repository);
@@ -2881,7 +2779,7 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
             throw new OrbitRepositoryFailed('The checked candidate Git metadata is invalid.');
         }
 
-        $receiptPath = $this->validatedCandidateReceiptPath($reportedReceipt, $worktree, $treeSha, $path, $common);
+        $receiptPath = $this->candidateReceipts->validate($reportedReceipt, $worktree, $treeSha, $path, $common);
 
         return new CandidateCheck($receiptPath, $worktree->headSha, $treeSha);
     }
@@ -2950,7 +2848,7 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
             throw new OrbitRepositoryFailed('Orbit planning preparation requires the discovery flow.');
         }
 
-        $receiptPath = $this->validatedCandidateReceiptPath(
+        $receiptPath = $this->candidateReceipts->validate(
             $candidate->receiptPath,
             $worktree,
             $candidate->treeSha,
@@ -3264,7 +3162,7 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
 
         $candidate = new PreparedWorktree($path, $candidateSha);
         $treeSha = trim($tree->output());
-        $gate = $this->validatedCandidateReceiptPath($gateReceiptPath, $candidate, $treeSha, $path, $common);
+        $gate = $this->candidateReceipts->validate($gateReceiptPath, $candidate, $treeSha, $path, $common);
         $requiredBodyBindings = [
             'Issue: '.$snapshot->issueKey,
             $candidateSha,
@@ -3369,38 +3267,6 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
         }
     }
 
-    private function validatedCandidateReceiptPath(
-        string $reportedReceipt,
-        PreparedWorktree $worktree,
-        string $treeSha,
-        string $path,
-        string $common,
-    ): string {
-        $receiptPath = realpath($reportedReceipt);
-        $expectedDirectory = $common.'/orbit-checks/'.$worktree->headSha;
-
-        if ($receiptPath === false || $receiptPath !== $reportedReceipt
-            || is_link($reportedReceipt) || ! is_file($receiptPath)
-            || basename($receiptPath) !== 'result.json'
-            || dirname(dirname($receiptPath)) !== $expectedDirectory) {
-            throw new OrbitRepositoryFailed('Orbit candidate check returned an invalid receipt path.');
-        }
-
-        $contents = file_get_contents($receiptPath);
-
-        try {
-            $receipt = $contents === false ? null : json_decode($contents, true, flags: JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
-            $receipt = null;
-        }
-
-        if (! is_array($receipt) || ! $this->validCandidateReceipt($receipt, $worktree, $treeSha, $path)) {
-            throw new OrbitRepositoryFailed('Orbit candidate check returned an invalid receipt.');
-        }
-
-        return $receiptPath;
-    }
-
     private function hasExactIssueWorktree(string $output, string $path, string $branch): bool
     {
         $records = preg_split('/\R\R+/', trim($output)) ?: [];
@@ -3422,55 +3288,6 @@ final readonly class ProcessOrbitRepository implements OrbitAbandonedWorktreeCle
         return count($matches) === 1
             && ($matches[0]['worktree'] ?? null) === $path
             && ($matches[0]['branch'] ?? null) === 'refs/heads/'.$branch;
-    }
-
-    /** @param array<mixed, mixed> $receipt */
-    private function validCandidateReceipt(array $receipt, PreparedWorktree $worktree, string $treeSha, string $path): bool
-    {
-        $checks = $receipt['checks'] ?? null;
-
-        if (($receipt['schema'] ?? null) !== 1 || ($receipt['role'] ?? null) !== 'builder'
-            || ($receipt['candidate'] ?? null) !== $worktree->headSha
-            || ($receipt['tree'] ?? null) !== $treeSha
-            || realpath(is_string($receipt['worktree'] ?? null) ? $receipt['worktree'] : '') !== $path
-            || ($receipt['passed'] ?? null) !== true || ($receipt['unchanged'] ?? null) !== true
-            || ! is_array($checks) || count($checks) !== count(self::PROJECTS) * count(self::COMMANDS)) {
-            return false;
-        }
-
-        $actual = [];
-
-        foreach ($checks as $check) {
-            if (! is_array($check) || ! is_string($check['project'] ?? null)
-                || ! is_array($check['command'] ?? null) || ($check['exit_code'] ?? null) !== 0) {
-                return false;
-            }
-
-            $command = [];
-
-            foreach ($check['command'] as $part) {
-                if (! is_string($part)) {
-                    return false;
-                }
-
-                $command[] = $part;
-            }
-
-            $actual[] = $check['project'].'|'.implode("\0", $command);
-        }
-
-        $expected = [];
-
-        foreach (self::PROJECTS as $project) {
-            foreach (self::COMMANDS as $command) {
-                $expected[] = $project.'|'.implode("\0", $command);
-            }
-        }
-
-        sort($actual);
-        sort($expected);
-
-        return $actual === $expected;
     }
 
     /** @param array<string, mixed> $payload */

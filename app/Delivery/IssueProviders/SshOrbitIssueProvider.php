@@ -8,6 +8,7 @@ use App\Delivery\Contracts\OrbitActiveIssueProvider;
 use App\Delivery\Contracts\OrbitCloseoutIssueProvider;
 use App\Delivery\Contracts\OrbitEligibleIssueProvider;
 use App\Delivery\Contracts\OrbitIssueProvider;
+use App\Delivery\Contracts\OrbitIssueReader;
 use App\Delivery\Contracts\OrbitIssueResolver;
 use App\Delivery\Contracts\OrbitPlanningResolutionIssueProvider;
 use App\Delivery\Data\OrbitEligibleIssue;
@@ -17,7 +18,7 @@ use Illuminate\Support\Facades\Process;
 use JsonException;
 use RuntimeException;
 
-final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitEligibleIssueProvider, OrbitIssueProvider, OrbitIssueResolver, OrbitPlanningResolutionIssueProvider
+final readonly class SshOrbitIssueProvider implements OrbitActiveIssueProvider, OrbitCloseoutIssueProvider, OrbitEligibleIssueProvider, OrbitIssueProvider, OrbitIssueReader, OrbitIssueResolver, OrbitPlanningResolutionIssueProvider
 {
     private const string QUERY = <<<'GRAPHQL'
 query LoopIssue($id: String!) {
@@ -61,6 +62,13 @@ query OrbitEligibleIssues($teamId: String!) {
 GRAPHQL;
 
     public function __construct(private OrbitIssueSnapshotFactory $snapshots) {}
+
+    public function read(string $issueId, string $issueKey): OrbitIssueSnapshot
+    {
+        [$response, $viewerId] = $this->request($issueId, $issueKey);
+
+        return $this->snapshots->read($response, $issueId, $issueKey, $viewerId);
+    }
 
     public function fetch(string $issueId, string $issueKey): OrbitIssueSnapshot
     {

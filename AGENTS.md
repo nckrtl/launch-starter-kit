@@ -197,7 +197,7 @@ its long-running processes are run per environment.
 ### SSR
 
 Production SSR is enabled: `bun run build` builds the SSR bundle, and its port
-is pinned to 13719 in `vite.config.ts` (no env override exists — read the
+is pinned to 13729 for this isolated Tasks instance in `vite.config.ts` (no env override exists — read the
 comment there before changing it). Feature tests deliberately disable SSR and
 Vite (`tests/Pest.php` sets `inertia.ssr.enabled=false` and calls
 `withoutVite()`) so they stay deterministic — passing Feature tests therefore

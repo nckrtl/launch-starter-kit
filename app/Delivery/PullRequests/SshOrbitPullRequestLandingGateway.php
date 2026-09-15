@@ -131,14 +131,20 @@ final readonly class SshOrbitPullRequestLandingGateway implements OrbitPullReque
         }
 
         try {
-            $pullRequest = $this->pullRequest($number);
-            $mergeCommitSha = $this->assertMergedCandidate($pullRequest, $number, $candidateSha);
+            return $this->inspectMerged($number, $candidateSha);
         } catch (OrbitPullRequestLandingFailed $exception) {
             throw new OrbitPullRequestLandingFailed(
                 'The Orbit pull request merge outcome is unresolved; retain the merge reservation.',
                 previous: $failure ?? $exception,
             );
         }
+    }
+
+    public function inspectMerged(int $number, string $candidateSha): MergedOrbitPullRequest
+    {
+        $this->assertMergeInput($number, $candidateSha);
+        $pullRequest = $this->pullRequest($number);
+        $mergeCommitSha = $this->assertMergedCandidate($pullRequest, $number, $candidateSha);
 
         return new MergedOrbitPullRequest(
             number: $number,

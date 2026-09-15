@@ -35,6 +35,30 @@ final readonly class OrbitIssueSnapshotFactory
 {
     private const int MAX_COLLECTION_SIZE = 100;
 
+    public function read(
+        mixed $response,
+        string $expectedIssueId,
+        string $expectedIssueKey,
+        string $expectedViewerId,
+    ): OrbitIssueSnapshot {
+        $root = $this->map($response);
+        $data = $this->map($root['data'] ?? null);
+        $viewer = $this->map($data['viewer'] ?? null);
+        $rawIssue = $this->map($data['issue'] ?? null);
+        $issue = $this->normalizeIssue($rawIssue);
+        $viewerId = $this->requiredUuid($viewer['id'] ?? null);
+
+        if (($root['errors'] ?? []) !== [] || ! $this->isUuid($expectedIssueId)
+            || preg_match('/^ORB-[0-9]+$/', $expectedIssueKey) !== 1
+            || ! $this->isUuid($expectedViewerId) || $viewerId !== $expectedViewerId
+            || $issue['id'] !== $expectedIssueId || $issue['identifier'] !== $expectedIssueKey
+            || ! array_key_exists('assignee', $rawIssue) || ! array_key_exists('delegate', $rawIssue)) {
+            throw new OrbitIssueProviderFailed('The Linear issue response does not match the requested Orbit issue or omits ownership.');
+        }
+
+        return new OrbitIssueSnapshot($issue['id'], $issue['identifier'], $issue, $this->contractHash($issue));
+    }
+
     public function make(
         mixed $response,
         string $expectedIssueId,
@@ -120,6 +144,7 @@ final readonly class OrbitIssueSnapshotFactory
         OrbitIssueSnapshot $snapshot,
         string $expectedContractHash,
         ?string $pullRequestUrl = null,
+        ?string $pullRequestTitle = null,
     ): bool {
         if (hash_equals($expectedContractHash, $snapshot->contractHash)) {
             return true;
@@ -138,7 +163,7 @@ final readonly class OrbitIssueSnapshotFactory
             return false;
         }
 
-        $expectedTitle = $snapshot->issueKey.': '.$title;
+        $expectedTitle = $pullRequestTitle ?? $snapshot->issueKey.': '.$title;
         $matches = array_keys(array_filter(
             $nodes,
             static fn (mixed $attachment): bool => is_array($attachment)
