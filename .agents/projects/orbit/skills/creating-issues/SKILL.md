@@ -9,7 +9,7 @@ Read the [Orbit project guide](../../AGENTS.md) and use its selected checkout an
 
 Turn defined work into a clear Linear issue. This skill owns issue structure, fields, validation, and publication.
 
-Read the request, affected architecture, code, tests, and existing issues. Use Orbit’s `grill-with-docs` when the feature needs shaping. For an existing issue blocked by unclear requirements, use [resolve-pipeline-issues](../resolve-pipeline-issues/SKILL.md) to diagnose and settle them.
+Read the request, affected architecture, code, tests, and existing issues. Use Orbit’s `grill-with-docs` when the feature needs shaping.
 
 ## Describe the work
 

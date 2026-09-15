@@ -7,7 +7,7 @@ description: Use in Commander for the registered Orbit project when asked to res
 
 Read the [Orbit project guide](../../AGENTS.md) and use its selected checkout and issue board.
 
-Diagnose what prevents an existing issue from being ready to implement, then settle those gaps. Use [creating-issues](../creating-issues/SKILL.md) for issue structure and publication.
+Diagnose what prevents an existing issue from being ready to implement, then settle those gaps.
 
 ## Select the work
 
