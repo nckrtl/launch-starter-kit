@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "4ffa8f0ea630c9adfbc723a825bbd614",
+    "content-hash": "ca261a5fab54ca5b93065ee52e5417e3",
     "packages": [
         {
             "name": "brick/math",
@@ -1452,16 +1452,16 @@
         },
         {
             "name": "laravel/mcp",
-            "version": "v0.7.2",
+            "version": "v1.0.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/laravel/mcp.git",
-                "reference": "08962a276357f89164f78b38407c08187ab26cfe"
+                "reference": "cfa4f38f82873eeb6848527883545f98f871e229"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/laravel/mcp/zipball/08962a276357f89164f78b38407c08187ab26cfe",
-                "reference": "08962a276357f89164f78b38407c08187ab26cfe",
+                "url": "https://api.github.com/repos/laravel/mcp/zipball/cfa4f38f82873eeb6848527883545f98f871e229",
+                "reference": "cfa4f38f82873eeb6848527883545f98f871e229",
                 "shasum": ""
             },
             "require": {
@@ -1489,7 +1489,7 @@
             "extra": {
                 "laravel": {
                     "aliases": {
-                        "Mcp": "Laravel\\Mcp\\Server\\Facades\\Mcp"
+                        "Mcp": "Laravel\\Mcp\\Facades\\Mcp"
                     },
                     "providers": [
                         "Laravel\\Mcp\\Server\\McpServiceProvider"
@@ -1522,7 +1522,7 @@
                 "issues": "https://github.com/laravel/mcp/issues",
                 "source": "https://github.com/laravel/mcp"
             },
-            "time": "2026-05-22T11:45:29+00:00"
+            "time": "2026-09-14T14:35:19+00:00"
         },
         {
             "name": "laravel/prompts",
@@ -9457,16 +9457,16 @@
         },
         {
             "name": "laravel/boost",
-            "version": "v2.7.0",
+            "version": "v2.9.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/laravel/boost.git",
-                "reference": "b19e98a8637cb69b2aab7b5b6c5fe9e2c79d182f"
+                "reference": "ebe59d97cbc66b66f735e6ec7ff859233e7934e0"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/laravel/boost/zipball/b19e98a8637cb69b2aab7b5b6c5fe9e2c79d182f",
-                "reference": "b19e98a8637cb69b2aab7b5b6c5fe9e2c79d182f",
+                "url": "https://api.github.com/repos/laravel/boost/zipball/ebe59d97cbc66b66f735e6ec7ff859233e7934e0",
+                "reference": "ebe59d97cbc66b66f735e6ec7ff859233e7934e0",
                 "shasum": ""
             },
             "require": {
@@ -9475,7 +9475,7 @@
                 "illuminate/contracts": "^11.45.3|^12.41.1|^13.0",
                 "illuminate/routing": "^11.45.3|^12.41.1|^13.0",
                 "illuminate/support": "^11.45.3|^12.41.1|^13.0",
-                "laravel/mcp": "^0.7.1|^0.8.0|^0.9.0",
+                "laravel/mcp": "^0.7.1|^0.8.0|^0.9.0|^1.0",
                 "laravel/prompts": "^0.3.10",
                 "laravel/roster": "^1.0.0",
                 "php": "^8.2"
@@ -9519,7 +9519,7 @@
                 "issues": "https://github.com/laravel/boost/issues",
                 "source": "https://github.com/laravel/boost"
             },
-            "time": "2026-08-26T21:39:22+00:00"
+            "time": "2026-09-14T14:40:10+00:00"
         },
         {
             "name": "laravel/pail",
@@ -10046,21 +10046,21 @@
         },
         {
             "name": "nckrtl/laravel-toolbar",
-            "version": "v0.3.5",
+            "version": "v0.3.6",
             "source": {
                 "type": "git",
                 "url": "https://github.com/nckrtl/laravel-toolbar.git",
-                "reference": "93850b28641862117d9022722a7d7e200a6fa026"
+                "reference": "bbe53a7342bc59eb365bde22bcca8800a2e7d81b"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/nckrtl/laravel-toolbar/zipball/93850b28641862117d9022722a7d7e200a6fa026",
-                "reference": "93850b28641862117d9022722a7d7e200a6fa026",
+                "url": "https://api.github.com/repos/nckrtl/laravel-toolbar/zipball/bbe53a7342bc59eb365bde22bcca8800a2e7d81b",
+                "reference": "bbe53a7342bc59eb365bde22bcca8800a2e7d81b",
                 "shasum": ""
             },
             "require": {
                 "illuminate/contracts": "^11.0||^12.0||^13.0",
-                "laravel/mcp": "^0.5.1 || ^0.6.0 || ^0.7.0",
+                "laravel/mcp": "^0.5.1 || ^0.6.0 || ^0.7.0 || ^1.0",
                 "php": "^8.4",
                 "spatie/laravel-data": "*",
                 "spatie/laravel-package-tools": "^1.16"
@@ -10119,7 +10119,7 @@
             ],
             "support": {
                 "issues": "https://github.com/nckrtl/laravel-toolbar/issues",
-                "source": "https://github.com/nckrtl/laravel-toolbar/tree/v0.3.5"
+                "source": "https://github.com/nckrtl/laravel-toolbar/tree/v0.3.6"
             },
             "funding": [
                 {
@@ -10127,7 +10127,7 @@
                     "type": "github"
                 }
             ],
-            "time": "2026-08-04T10:41:40+00:00"
+            "time": "2026-09-15T13:58:08+00:00"
         },
         {
             "name": "nckrtl/laravel-toolbar-agentation",
