@@ -25,19 +25,48 @@ it('exposes safe project details and defers remote integrations', function () {
         'id' => 'demo', 'name' => 'Demo', 'secret' => 'not-for-the-browser',
         'applications' => [['name' => 'Demo app', 'repository' => 'git@github.com:acme/demo.git', 'development_url' => 'javascript:alert(1)']],
         'slack' => ['channels' => [['id' => 'C123', 'name' => 'demo']]],
+        'locations' => [['machine' => 'beast', 'path' => '/fast/apps/demo']],
     ], 8));
     try {
         $this->get('/projects/demo')->assertSuccessful()->assertInertia(fn ($page) => $page
             ->component('Projects/Show')->where('project.name', 'Demo')
             ->where('project.repositories', ['acme/demo'])->where('project.applications.0.url', null)
-            ->where('project.channels.0.url', 'https://slack.com/app_redirect?channel=C123')
-            ->missing('project.secret')->missing('orbit')->missing('github'));
+            ->where('project.channels.0.url', 'slack://channel?id=C123')
+            ->missing('project.locations')->missing('project.secret')->missing('orbit')->missing('github'));
         $this->get('/projects/missing')->assertNotFound();
         Http::assertNothingSent();
         Process::assertNothingRan();
     } finally {
         File::deleteDirectory($path);
     }
+});
+
+it('matches an Orbit app by its manifest application ID and returns all instances', function () {
+    Http::fake([
+        'orbit.example/api/v1/apps' => Http::response(['data' => [
+            ['id' => 34, 'name' => 'Commander', 'slug' => 'commander'],
+        ]]),
+        'orbit.example/api/v1/instances' => Http::response(['data' => [
+            ['app_id' => 34, 'node_id' => 9, 'name' => 'tasks', 'url' => 'https://tasks.commander.test'],
+            ['app_id' => 34, 'node_id' => 9, 'name' => 'default', 'url' => 'https://commander.test'],
+        ]]),
+        'orbit.example/api/v1/nodes' => Http::response(['data' => [['id' => 9, 'name' => 'Beast']]]),
+    ]);
+
+    $project = app(ProjectDetails::class)->get([
+        'id' => 'commander',
+        'applications' => [['id' => 'commander', 'name' => 'Commander']],
+    ]);
+    $result = app(OrbitProjects::class)->get($project);
+
+    expect($project['applications'][0]['orbit_app_slug'])->toBe('commander')
+        ->and($result['unmatched'])->toBe([])
+        ->and($result['apps'])->toHaveCount(1)
+        ->and($result['apps'][0]['instances'])->toHaveCount(2)
+        ->and($result['apps'][0]['instances'])->sequence(
+            fn ($instance) => $instance->toMatchArray(['name' => 'tasks', 'url' => 'https://tasks.commander.test', 'node' => 'Beast']),
+            fn ($instance) => $instance->toMatchArray(['name' => 'default', 'url' => 'https://commander.test', 'node' => 'Beast']),
+        );
 });
 
 it('prefers explicit Orbit IDs and does not merge apps sharing a repository', function () {
@@ -93,18 +122,37 @@ it('normalizes repository identities and excludes unsafe links', function () {
         ->and(ProjectDetails::url('https://user:secret@example.com'))->toBeNull();
 });
 
-it('fetches open PRs and issues in one cached read and keeps partial GitHub failures separate', function () {
+it('fetches filtered PRs and issues in one cached read and keeps partial GitHub failures separate', function () {
     Process::fake(['*' => Process::result(output: json_encode(['data' => ['r0' => [
-        'pullRequests' => ['totalCount' => 25, 'nodes' => [['number' => 7, 'title' => 'Ship it', 'isDraft' => true]]],
-        'issues' => ['totalCount' => 1, 'nodes' => [['number' => 8, 'title' => 'Fix it']]],
+        'pullRequestsAll' => ['totalCount' => 26, 'nodes' => [['number' => 9, 'title' => 'Landed', 'isDraft' => false, 'state' => 'MERGED']]],
+        'pullRequestsOpen' => ['totalCount' => 1, 'nodes' => [['number' => 7, 'title' => 'Ship it', 'isDraft' => true, 'state' => 'OPEN']]],
+        'pullRequestsClosed' => ['totalCount' => 25, 'nodes' => [['number' => 9, 'title' => 'Landed', 'isDraft' => false, 'state' => 'MERGED']]],
+        'issuesAll' => ['totalCount' => 2, 'nodes' => [['number' => 10, 'title' => 'Done', 'state' => 'CLOSED']]],
+        'issuesOpen' => ['totalCount' => 1, 'nodes' => [['number' => 8, 'title' => 'Fix it', 'state' => 'OPEN']]],
+        'issuesClosed' => ['totalCount' => 1, 'nodes' => [['number' => 10, 'title' => 'Done', 'state' => 'CLOSED']]],
     ], 'r1' => null]], JSON_THROW_ON_ERROR))]);
     $service = app(GitHubProjects::class);
     $result = $service->get(['acme/demo', 'acme/private']);
-    expect($result[0]['status'])->toBe('available')->and($result[0]['pull_request_count'])->toBe(25)
-        ->and($result[0]['pull_requests'][0])->toMatchArray(['url' => 'https://github.com/acme/demo/pull/7', 'draft' => true])
-        ->and($result[0]['issues'][0]['url'])->toBe('https://github.com/acme/demo/issues/8')
+    expect($result[0]['status'])->toBe('available')
+        ->and($result[0]['pull_requests']['all']['count'])->toBe(26)
+        ->and($result[0]['pull_requests']['open']['items'][0])->toMatchArray([
+            'url' => 'https://github.com/acme/demo/pull/7', 'draft' => true, 'state' => 'open',
+        ])
+        ->and($result[0]['pull_requests']['closed']['items'][0]['state'])->toBe('merged')
+        ->and($result[0]['issues']['open']['items'][0]['url'])->toBe('https://github.com/acme/demo/issues/8')
+        ->and($result[0]['issues']['closed']['items'][0]['state'])->toBe('closed')
         ->and($result[1]['status'])->toBe('unavailable');
     $service->get(['acme/demo', 'acme/private']);
+    Process::assertRan(function ($process): bool {
+        $query = $process->command[6] ?? '';
+
+        return str_contains($query, 'pullRequestsAll: pullRequests')
+            && str_contains($query, 'pullRequestsOpen: pullRequests(first: 20, states: [OPEN]')
+            && str_contains($query, 'pullRequestsClosed: pullRequests(first: 20, states: [CLOSED, MERGED]')
+            && str_contains($query, 'issuesAll: issues')
+            && str_contains($query, 'issuesOpen: issues(first: 20, states: [OPEN]')
+            && str_contains($query, 'issuesClosed: issues(first: 20, states: [CLOSED]');
+    });
     Process::assertRanTimes(fn () => true, 1);
 });
 

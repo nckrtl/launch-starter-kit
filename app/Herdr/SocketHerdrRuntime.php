@@ -71,6 +71,27 @@ final readonly class SocketHerdrRuntime implements HerdrRuntime, HerdrWorkspaceR
         return $this->identifiers(Payload::assoc($result['pane'] ?? null), '');
     }
 
+    public function createTab(
+        string $workspaceId,
+        string $workingDirectory,
+        ?string $label = null,
+    ): HerdrAgentIdentifiers {
+        $parameters = [
+            'workspace_id' => $workspaceId,
+            'cwd' => $workingDirectory,
+            'focus' => false,
+        ];
+
+        if ($label !== null) {
+            $parameters['label'] = $label;
+        }
+
+        $result = $this->client->request('tab.create', $parameters);
+        $this->assertType($result, 'tab_created');
+
+        return $this->identifiers(Payload::assoc($result['root_pane'] ?? null), '');
+    }
+
     public function startAgent(
         string $paneId,
         string $name,
@@ -108,6 +129,14 @@ final readonly class SocketHerdrRuntime implements HerdrRuntime, HerdrWorkspaceR
     {
         $result = $this->client->request('agent.get', ['target' => $name]);
         $this->assertType($result, 'agent_info');
+
+        return $this->identifiers(Payload::assoc($result['agent'] ?? null), $name);
+    }
+
+    public function promptAgentOnce(string $name, string $prompt): HerdrAgentIdentifiers
+    {
+        $result = $this->client->request('agent.prompt', ['target' => $name, 'text' => $prompt]);
+        $this->assertType($result, 'agent_prompted');
 
         return $this->identifiers(Payload::assoc($result['agent'] ?? null), $name);
     }

@@ -259,6 +259,32 @@ it('allows only the known Linear pull request attachment after publication', fun
         ))->toBeFalse();
 });
 
+it('matches only the exact own PR title and URL while retaining the complete issue contract', function (bool $explicit, string $change) {
+    $factory = app(OrbitIssueSnapshotFactory::class);
+    $baseline = $factory->make(providerResponse(), providerIssueId(), 'ORB-234', providerViewerId());
+    $url = 'https://github.com/nckrtl/orbit/pull/42';
+    $title = $explicit ? 'ORB-234: Implement the reviewed task' : 'ORB-234: '.providerIssue()['title'];
+    $payload = providerIssue();
+    $attachment = ['title' => $title, 'url' => $url];
+    $payload['attachments']['nodes'][] = $attachment;
+    match ($change) {
+        'none' => null,
+        'title' => $payload['attachments']['nodes'][2]['title'] = $explicit ? 'ORB-234: '.$payload['title'] : 'Unexpected title',
+        'url' => $payload['attachments']['nodes'][2]['url'] = 'https://github.com/nckrtl/orbit/pull/43',
+        'duplicate' => $payload['attachments']['nodes'][] = $attachment,
+        'description' => $payload['description'] .= ' A new requirement.',
+        'labels' => $payload['labels']['nodes'][] = ['name' => 'apps:gateway'],
+        'other attachment' => $payload['attachments']['nodes'][] = ['title' => 'Other', 'url' => 'https://github.com/nckrtl/orbit/pull/43'],
+    };
+    $current = $factory->make(providerResponse($payload), providerIssueId(), 'ORB-234', providerViewerId());
+    $matches = $explicit
+        ? $factory->matchesExpectedContract($current, $baseline->contractHash, $url, $title)
+        : $factory->matchesExpectedContract($current, $baseline->contractHash, $url);
+
+    expect($matches)->toBe($change === 'none');
+})->with(['legacy title' => false, 'explicit title' => true])
+    ->with(['none', 'title', 'url', 'duplicate', 'description', 'labels', 'other attachment']);
+
 it('rejects an issue response with different stable identity', function (array $overrides) {
     fakeProviderResponse(providerResponse($overrides));
 

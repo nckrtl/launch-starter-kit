@@ -70,7 +70,7 @@ final class ProjectDetails
             $applications[] = [
                 'name' => self::text($app['name'] ?? $app['id'] ?? null, 'Application'),
                 'orbit_app_id' => is_int($app['orbit_app_id'] ?? null) ? $app['orbit_app_id'] : null,
-                'orbit_app_slug' => self::text($app['orbit_app_slug'] ?? null),
+                'orbit_app_slug' => self::text($app['orbit_app_slug'] ?? $app['id'] ?? null),
                 'repository' => $slug,
                 'url' => self::url($app['development_url'] ?? null) ?? self::url($app['runtime_url'] ?? null),
             ];
@@ -79,7 +79,7 @@ final class ProjectDetails
         foreach (self::rows(data_get($manifest, 'slack.channels')) as $channel) {
             $id = self::text($channel['id'] ?? null);
             if (preg_match('/^[CG][A-Z0-9]+$/D', $id)) {
-                $channels[] = ['name' => self::text($channel['name'] ?? null, $id), 'url' => 'https://slack.com/app_redirect?channel='.$id];
+                $channels[] = ['name' => self::text($channel['name'] ?? null, $id), 'url' => 'slack://channel?id='.$id];
             }
         }
 
@@ -90,10 +90,6 @@ final class ProjectDetails
             'repositories' => array_values($repositories),
             'applications' => $applications,
             'channels' => $channels,
-            'locations' => array_map(static fn (array $row): array => [
-                'machine' => self::text($row['machine'] ?? null),
-                'path' => self::text($row['path'] ?? null),
-            ], self::rows($manifest['locations'] ?? [])),
         ];
     }
 }

@@ -92,6 +92,12 @@ final class SocketClient
         }
     }
 
+    /** @param array<string, mixed> $params */
+    public static function requestLine(string $id, string $method, array $params): string
+    {
+        return json_encode(['id' => $id, 'method' => $method, 'params' => (object) $params], JSON_THROW_ON_ERROR)."\n";
+    }
+
     /**
      * @return resource
      */
@@ -116,7 +122,7 @@ final class SocketClient
     private function exchange($stream, string &$buffer, string $method, array $params): array
     {
         $id = (string) $this->nextId++;
-        $line = json_encode(['id' => $id, 'method' => $method, 'params' => (object) $params], JSON_THROW_ON_ERROR)."\n";
+        $line = self::requestLine($id, $method, $params);
 
         if (@fwrite($stream, $line) !== strlen($line)) {
             throw new ConnectionClosed("Herdr did not accept the {$method} request");

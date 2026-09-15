@@ -783,6 +783,11 @@ final class LandingGateway implements OrbitPullRequestLandingGateway
         );
     }
 
+    public function inspectMerged(int $number, string $candidateSha): MergedOrbitPullRequest
+    {
+        throw new LogicException('Legacy landing must not acquire a new reconciliation path implicitly.');
+    }
+
     public function release(string $issueId, string $pullRequestUrl): void
     {
         expect(DB::transactionLevel())->toBe($this->transactionLevel);

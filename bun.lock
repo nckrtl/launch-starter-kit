@@ -4,34 +4,36 @@
   "workspaces": {
     "": {
       "dependencies": {
-        "@base-ui/react": "^1.6.0",
+        "@base-ui/react": "^1.8.0",
         "@inertiajs/react": "3.6.1",
         "@inertiajs/vite": "3.6.1",
-        "@laravel/vite-plugin-wayfinder": "^0.1.7",
+        "@laravel/vite-plugin-wayfinder": "^0.1.10",
         "@nckrtl/launch-ui": "^0.0.26",
-        "@vitejs/plugin-react": "^6.0.5",
+        "@vitejs/plugin-react": "^6.1.1",
+        "@xterm/addon-fit": "^0.11.0",
+        "@xterm/xterm": "^6.0.0",
         "class-variance-authority": "^0.7.1",
         "clsx": "^2.1.1",
-        "lucide-react": "^1.28.0",
+        "lucide-react": "^1.41.0",
         "next-themes": "^0.4.6",
         "react": "^19.2.8",
         "react-dom": "^19.2.8",
-        "shadcn": "^4.16.1",
-        "sonner": "^2.0.7",
+        "shadcn": "^4.21.0",
+        "sonner": "^2.0.8",
         "tailwind-merge": "^3.6.0",
         "tw-animate-css": "^1.4.0",
         "typescript": "^7.0.2",
       },
       "devDependencies": {
         "@tailwindcss/vite": "^4.3.3",
-        "@types/node": "^26.1.2",
+        "@types/node": "^26.4.1",
         "@types/react": "^19.2.18",
-        "@types/react-dom": "^19.2.4",
-        "laravel-vite-plugin": "^3.1.3",
-        "playwright": "^1.62.1",
+        "@types/react-dom": "^19.2.7",
+        "laravel-vite-plugin": "^3.2.0",
+        "playwright": "^1.63.0",
         "tailwindcss": "^4.3.3",
         "vite": "npm:@voidzero-dev/vite-plus-core@0.2.8",
-        "vite-plus": "^0.2.8",
+        "vite-plus": "^0.2.9",
       },
     },
   },
@@ -601,6 +603,10 @@
     "@voidzero-dev/vite-plus-win32-x64-msvc": ["@voidzero-dev/vite-plus-win32-x64-msvc@0.2.8", "", { "os": "win32", "cpu": "x64" }, "sha512-VSpa+gK1MjOH7GeO6H5xtJLqisQOWVeRQIDQs9XKizXFX0R4NCrioYO6Rc31QLXfL0lPCkwsKhp/9M9gllImRg=="],
 
     "@webcontainer/env": ["@webcontainer/env@1.1.1", "", {}, "sha512-6aN99yL695Hi9SuIk1oC88l9o0gmxL1nGWWQ/kNy81HigJ0FoaoTXpytCj6ItzgyCEwA9kF1wixsTuv5cjsgng=="],
+
+    "@xterm/addon-fit": ["@xterm/addon-fit@0.11.0", "", {}, "sha512-jYcgT6xtVYhnhgxh3QgYDnnNMYTcf8ElbxxFzX0IZo+vabQqSPAjC3c1wJrKB5E19VwQei89QCiZZP86DCPF7g=="],
+
+    "@xterm/xterm": ["@xterm/xterm@6.0.0", "", {}, "sha512-TQwDdQGtwwDt+2cgKDLn0IRaSxYu1tSUjgKarSDkUM0ZNiSRXFpjxEsvc/Zgc5kq5omJ+V0a8/kIM2WD3sMOYg=="],
 
     "@yuku-codegen/binding-darwin-arm64": ["@yuku-codegen/binding-darwin-arm64@0.5.48", "", { "os": "darwin", "cpu": "arm64" }, "sha512-yo96Oef12WzqnphInfz/eexVse3+kWgfGS5g2S3rFS3dcGn1ENW9xLFDZUP9rh+yP76DOq38wBoFi1+I9+6qBg=="],
 

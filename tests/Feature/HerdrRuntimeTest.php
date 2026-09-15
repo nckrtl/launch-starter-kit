@@ -25,6 +25,7 @@ beforeEach(function () {
                 'worktree' => ['path' => '/tmp/worktree'], 'already_open' => false,
             ],
             'pane.split' => ['type' => 'pane_info', 'pane' => $pane],
+            'tab.create' => ['type' => 'tab_created', 'tab' => ['tab_id' => 't2'], 'root_pane' => $pane],
             'agent.start' => ['type' => 'agent_started', 'agent' => $pane, 'argv' => ['codex']],
             'agent.prompt' => ['type' => 'agent_prompted', 'agent' => $pane],
             'agent.get' => ['type' => 'agent_info', 'agent' => $pane],
@@ -41,12 +42,14 @@ it('maps protocol 22 orchestration responses and sends exact methods', function 
     $runtime = new SocketHerdrRuntime(new SocketClient($this->server->socketPath));
     $opened = $runtime->openWorktree('/tmp/repository', '/tmp/worktree');
     $pane = $runtime->splitPane('p1', '/tmp/worktree');
+    $tab = $runtime->createTab('w1', '/tmp/worktree', 'Task 42');
     $started = $runtime->startAgent('p1', 'commander-1');
     $prompted = $runtime->promptAgent('commander-1', 'safe prompt');
     $agent = $runtime->getAgent('commander-1');
 
     expect($opened->paneId)->toBe('p1')
         ->and($pane->terminalId)->toBe('term1')
+        ->and($tab->terminalId)->toBe('term1')
         ->and($started->agentId)->toBe('thread-1')
         ->and($started->stateChangeSeq)->toBe(3)
         ->and($prompted->agentName)->toBe('commander-1')
@@ -54,13 +57,19 @@ it('maps protocol 22 orchestration responses and sends exact methods', function 
         ->and($agent->workingDirectory)->toBe('/tmp/worktree')
         ->and($agent->agentStatus)->toBe('working')
         ->and(array_column($this->server->requests(), 'method'))->toBe([
-            'worktree.open', 'pane.split', 'agent.start', 'agent.prompt', 'agent.get',
+            'worktree.open', 'pane.split', 'tab.create', 'agent.start', 'agent.prompt', 'agent.get',
         ])
         ->and($this->server->requests()[0]['params'])->toBe([
             'cwd' => '/tmp/repository',
             'path' => '/tmp/worktree',
             'focus' => false,
             'trust_repository' => false,
+        ])
+        ->and($this->server->requests()[2]['params'])->toBe([
+            'workspace_id' => 'w1',
+            'cwd' => '/tmp/worktree',
+            'focus' => false,
+            'label' => 'Task 42',
         ]);
 });
 

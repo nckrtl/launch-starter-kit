@@ -336,6 +336,78 @@ it('rejects an invalid approval or main protection contract', function (string $
     ))->toThrow(OrbitPullRequestLandingFailed::class);
 })->with(['approval', 'protection']);
 
+it('reconciles an exact merged candidate without another merge request or reservation mutation', function () {
+    fakeOrbitLandingGateway([[
+        'payload' => ['service' => 'github', 'path' => 'repos/nckrtl/orbit/pulls/42'],
+        'output' => orbitLandingPullRequest($this->candidate, $this->body, overrides: [
+            'state' => 'closed',
+            'merged' => true,
+            'merge_commit_sha' => $this->merge,
+        ]),
+    ]]);
+
+    $merged = app(OrbitPullRequestLandingGateway::class)->inspectMerged(42, $this->candidate);
+
+    expect($merged->number)->toBe(42)
+        ->and($merged->url)->toBe($this->pullRequestUrl)
+        ->and($merged->candidateSha)->toBe($this->candidate)
+        ->and($merged->mergeCommitSha)->toBe($this->merge);
+    Process::assertRanTimes(fn () => true, 1);
+});
+
+it('does not infer a confirmed merge from an open, unmerged, changed or malformed pull request', function (array $overrides) {
+    fakeOrbitLandingGateway([[
+        'payload' => ['service' => 'github', 'path' => 'repos/nckrtl/orbit/pulls/42'],
+        'output' => orbitLandingPullRequest($this->candidate, $this->body, overrides: [
+            'state' => 'closed',
+            'merged' => true,
+            'merge_commit_sha' => $this->merge,
+            ...$overrides,
+        ]),
+    ]]);
+
+    expect(fn () => app(OrbitPullRequestLandingGateway::class)->inspectMerged(42, $this->candidate))
+        ->toThrow(OrbitPullRequestLandingFailed::class, 'exact merged Orbit candidate');
+    Process::assertRanTimes(fn () => true, 1);
+})->with([
+    'open' => [['state' => 'open', 'merged' => false]],
+    'closed without merging' => [['merged' => false]],
+    'different PR' => [['number' => 43]],
+    'different URL' => [['html_url' => 'https://github.com/nckrtl/orbit/pull/43']],
+    'different head' => [['head' => ['sha' => str_repeat('c', 40), 'repo' => ['full_name' => 'nckrtl/orbit']]]],
+    'different source repository' => [['head' => ['sha' => str_repeat('a', 40), 'repo' => ['full_name' => 'other/orbit']]]],
+    'different base branch' => [['base' => ['ref' => 'develop', 'repo' => ['full_name' => 'nckrtl/orbit']]]],
+    'different base repository' => [['base' => ['ref' => 'main', 'repo' => ['full_name' => 'other/orbit']]]],
+    'missing merge object' => [['merge_commit_sha' => null]],
+    'invalid merge object' => [['merge_commit_sha' => 'main']],
+]);
+
+it('does not mutate or release a reservation when merge inspection fails', function (array $response) {
+    fakeOrbitLandingGateway([[
+        'payload' => ['service' => 'github', 'path' => 'repos/nckrtl/orbit/pulls/42'],
+        ...$response,
+    ]]);
+
+    expect(fn () => app(OrbitPullRequestLandingGateway::class)->inspectMerged(42, $this->candidate))
+        ->toThrow(OrbitPullRequestLandingFailed::class);
+    Process::assertRanTimes(fn () => true, 1);
+})->with([
+    'transport failure' => [['exit' => 1]],
+    'invalid JSON' => [['output' => '{']],
+    'invalid response shape' => [['output' => []]],
+]);
+
+it('rejects unpinned merge inspection before any external request', function () {
+    Process::preventStrayProcesses();
+    $gateway = app(OrbitPullRequestLandingGateway::class);
+
+    expect(fn () => $gateway->inspectMerged(0, $this->candidate))
+        ->toThrow(OrbitPullRequestLandingFailed::class, 'merge input is invalid')
+        ->and(fn () => $gateway->inspectMerged(42, 'main'))
+        ->toThrow(OrbitPullRequestLandingFailed::class, 'merge input is invalid');
+    Process::assertNothingRan();
+});
+
 it('merges only the exact approved head and verifies the merge commit by read back', function () {
     fakeOrbitLandingGateway([
         [

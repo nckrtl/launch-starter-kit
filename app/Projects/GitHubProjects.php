@@ -23,17 +23,23 @@ final class GitHubProjects
 
         $binary = ProjectDetails::text(config('commander.github_binary'));
 
-        return Cache::remember('commander:github:v1:'.hash('sha256', $binary.implode(',', $repositories)), 120, function () use ($repositories, $binary): array {
+        return Cache::remember('commander:github:v2:'.hash('sha256', $binary.implode(',', $repositories)), 120, function () use ($repositories, $binary): array {
             $data = [];
             try {
                 $fields = [];
                 foreach ($repositories as $index => $repository) {
                     [$owner, $name] = explode('/', $repository, 2);
                     $fields[] = 'r'.$index.': repository(owner: "'.$owner.'", name: "'.$name.'") { '
-                        .'pullRequests(first: 20, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title isDraft } } '
-                        .'issues(first: 20, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title } } }';
+                        .'pullRequestsAll: pullRequests(first: 20, states: [OPEN, CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title isDraft state } } '
+                        .'pullRequestsOpen: pullRequests(first: 20, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title isDraft state } } '
+                        .'pullRequestsClosed: pullRequests(first: 20, states: [CLOSED, MERGED], orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title isDraft state } } '
+                        .'issuesAll: issues(first: 20, states: [OPEN, CLOSED], orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title state } } '
+                        .'issuesOpen: issues(first: 20, states: [OPEN], orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title state } } '
+                        .'issuesClosed: issues(first: 20, states: [CLOSED], orderBy: {field: UPDATED_AT, direction: DESC}) { totalCount nodes { number title state } } }';
                 }
-                $response = Process::timeout(15)->run([$binary, 'api', '--hostname', 'github.com', 'graphql', '-f', 'query={ '.implode(' ', $fields).' }']);
+                $response = Process::timeout(15)
+                    ->run([$binary, 'api', '--hostname', 'github.com', 'graphql', '-f', 'query={ '.implode(' ', $fields).' }'])
+                    ->throw();
                 $decoded = json_decode($response->output(), true, flags: JSON_THROW_ON_ERROR);
                 $data = is_array($decoded) && is_array($decoded['data'] ?? null) ? $decoded['data'] : [];
             } catch (Throwable $exception) {
@@ -47,16 +53,35 @@ final class GitHubProjects
                     'name' => $repository,
                     'url' => 'https://github.com/'.$repository,
                     'status' => is_array($row) ? 'available' : 'unavailable',
-                    'pull_requests' => $this->items(data_get($row, 'pullRequests.nodes'), $repository, 'pull'),
-                    'issues' => $this->items(data_get($row, 'issues.nodes'), $repository, 'issues'),
-                    'pull_request_count' => data_get($row, 'pullRequests.totalCount', 0),
-                    'issue_count' => data_get($row, 'issues.totalCount', 0),
+                    'pull_requests' => $this->activity($row, $repository, 'pull', 'pullRequests'),
+                    'issues' => $this->activity($row, $repository, 'issues', 'issues'),
                     'checked_at' => now()->toIso8601String(),
                 ];
             }
 
             return $result;
         });
+    }
+
+    /** @return array{all: array{items: list<array<string, mixed>>, count: int}, open: array{items: list<array<string, mixed>>, count: int}, closed: array{items: list<array<string, mixed>>, count: int}} */
+    private function activity(mixed $row, string $repository, string $type, string $field): array
+    {
+        return [
+            'all' => $this->bucket(data_get($row, $field.'All'), $repository, $type),
+            'open' => $this->bucket(data_get($row, $field.'Open'), $repository, $type),
+            'closed' => $this->bucket(data_get($row, $field.'Closed'), $repository, $type),
+        ];
+    }
+
+    /** @return array{items: list<array<string, mixed>>, count: int} */
+    private function bucket(mixed $connection, string $repository, string $type): array
+    {
+        $count = data_get($connection, 'totalCount', 0);
+
+        return [
+            'items' => $this->items(data_get($connection, 'nodes'), $repository, $type),
+            'count' => is_int($count) ? $count : 0,
+        ];
     }
 
     /** @return list<array<string, mixed>> */
@@ -71,6 +96,12 @@ final class GitHubProjects
                 'number' => $row['number'],
                 'title' => ProjectDetails::text($row['title'] ?? null),
                 'draft' => ($row['isDraft'] ?? false) === true,
+                'state' => match ($row['state'] ?? null) {
+                    'OPEN' => 'open',
+                    'CLOSED' => 'closed',
+                    'MERGED' => 'merged',
+                    default => null,
+                },
                 'url' => 'https://github.com/'.$repository.'/'.$type.'/'.$row['number'],
             ];
         }
