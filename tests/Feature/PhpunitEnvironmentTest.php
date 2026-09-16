@@ -57,3 +57,44 @@ it('does not resolve the live sqlite path after phpunit applies a leftover envir
 
     unlink($live);
 });
+
+it('isolates laravel boot from a leftover server database path', function () {
+    $live = tempnam(sys_get_temp_dir(), 'launch-live-sqlite-');
+
+    $process = new Process([
+        PHP_BINARY,
+        '-r',
+        <<<'PHP'
+        require 'vendor/autoload.php';
+        $_SERVER['APP_ENV'] = 'production';
+        $_SERVER['DB_CONNECTION'] = 'mysql';
+        $_SERVER['DB_DATABASE'] = $argv[1];
+        $_SERVER['DB_URL'] = 'sqlite://'.$argv[1];
+        $_ENV['DB_DATABASE'] = $argv[1];
+        putenv('DB_DATABASE='.$argv[1]);
+        $case = new class('isolation') extends Tests\TestCase
+        {
+            public function testIsolation(): void {}
+        };
+        $app = $case->createApplication();
+        echo json_encode([
+            'database' => $app['config']->get('database.connections.sqlite.database'),
+            'connection' => $app['config']->get('database.default'),
+            'env' => $app->environment(),
+            'server' => $_SERVER['DB_DATABASE'] ?? null,
+        ], JSON_THROW_ON_ERROR);
+        PHP,
+        $live,
+    ], base_path());
+    $process->setTimeout(20)->mustRun();
+
+    expect(json_decode($process->getOutput(), true, flags: JSON_THROW_ON_ERROR))
+        ->toMatchArray([
+            'database' => ':memory:',
+            'connection' => 'sqlite',
+            'env' => 'testing',
+            'server' => ':memory:',
+        ]);
+
+    unlink($live);
+});
