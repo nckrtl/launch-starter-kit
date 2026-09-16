@@ -46,6 +46,34 @@ it('waits for the writer before entering the callback and reserves it before rea
         ->and($this->contender->wait())->toBe(0);
 });
 
+it('defaults the sqlite journal mode to WAL', function () {
+    $settings = require dirname(__DIR__, 2).'/config/database.php';
+
+    expect($settings['connections']['sqlite']['journal_mode'])->toBe('WAL')
+        ->and($settings['connections']['sqlite']['synchronous'])->toBe('NORMAL')
+        ->and($settings['connections']['sqlite']['transaction_mode'])->toBe('IMMEDIATE')
+        ->and($settings['connections']['sqlite']['busy_timeout'])->toBe(5000)
+        ->and(config('database.connections.sqlite.journal_mode'))->toBe('WAL')
+        ->and(config('database.connections.sqlite.synchronous'))->toBe('NORMAL');
+});
+
+it('opens sqlite connections in WAL journal mode', function () {
+    $path = tempnam(sys_get_temp_dir(), 'commander-sqlite-wal-');
+    $settings = [...(require dirname(__DIR__, 2).'/config/database.php')['connections']['sqlite'],
+        'database' => $path, 'url' => null];
+    $pdo = new SQLiteConnector()->connect($settings);
+    $connection = new SQLiteConnection($pdo, $path, '', $settings);
+
+    expect($connection->getConfig('journal_mode'))->toBe('WAL')
+        ->and(strtolower((string) $connection->selectOne('PRAGMA journal_mode')->journal_mode))->toBe('wal')
+        ->and((int) $connection->selectOne('PRAGMA synchronous')->synchronous)->toBe(1);
+
+    $connection->disconnect();
+    unlink($path);
+    @unlink($path.'-wal');
+    @unlink($path.'-shm');
+});
+
 it('times out before executing a callback when the writer stays occupied', function () {
     $other = new PDO('sqlite:'.$this->sqlitePath);
     $other->exec('BEGIN IMMEDIATE');

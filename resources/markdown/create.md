@@ -19,7 +19,7 @@ The steps below are the equivalent non-interactive path.
 | Toolchain        | VitePlus (Vite 8 + Oxc lint/format), Bun as package manager    |
 | PHP routing      | Waymaker — PHP attributes, no route files                      |
 | Frontend routing | Wayfinder — generated TypeScript route helpers                 |
-| Database         | SQLite by default                                              |
+| Database         | SQLite by default (`journal_mode` WAL, `synchronous` NORMAL)   |
 
 ## Prerequisites
 

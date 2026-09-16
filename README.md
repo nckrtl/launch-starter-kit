@@ -83,6 +83,7 @@ environment addendum linked above instead.
 - **Icons**: Lucide React
 - **Toolchain**: VitePlus (Vite 8 + Oxc linting/formatting)
 - **Routing**: Waymaker (PHP attributes) + Wayfinder (TS route helpers)
+- **Database**: SQLite (`journal_mode` WAL, `synchronous` NORMAL)
 - **Component registry**: `@launch` shadcn registry from [launch-ui](https://github.com/nckrtl/launch-ui)
 
 ## AI-Assisted Development
