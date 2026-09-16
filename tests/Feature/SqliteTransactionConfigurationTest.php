@@ -58,7 +58,7 @@ it('defaults the sqlite journal mode to WAL', function () {
 });
 
 it('opens sqlite connections in WAL journal mode', function () {
-    $path = tempnam(sys_get_temp_dir(), 'commander-sqlite-wal-');
+    $path = tempnam(sys_get_temp_dir(), 'launch-sqlite-wal-');
     $settings = [...(require dirname(__DIR__, 2).'/config/database.php')['connections']['sqlite'],
         'database' => $path, 'url' => null];
     $pdo = new SQLiteConnector()->connect($settings);

@@ -19,7 +19,7 @@ it('forces the shipped phpunit database env over a leftover process environment'
 });
 
 it('does not resolve the live sqlite path after phpunit applies a leftover environment file', function () {
-    $live = tempnam(sys_get_temp_dir(), 'commander-live-sqlite-');
+    $live = tempnam(sys_get_temp_dir(), 'launch-live-sqlite-');
     $environment = getenv();
     $environment['APP_ENV'] = 'production';
     $environment['DB_CONNECTION'] = 'mysql';
