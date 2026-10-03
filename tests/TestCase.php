@@ -4,6 +4,7 @@ namespace Tests;
 
 use Illuminate\Foundation\Testing\TestCase as BaseTestCase;
 use Illuminate\Support\Facades\DB;
+use Illuminate\Testing\ParallelTesting;
 use RuntimeException;
 
 abstract class TestCase extends BaseTestCase
@@ -23,7 +24,16 @@ abstract class TestCase extends BaseTestCase
             $_SERVER[$key] = $value;
         }
 
-        return parent::createApplication();
+        $app = parent::createApplication();
+
+        // Parallel workers share one checkout. Give each worker its own storage so
+        // process-wide files, such as the Tasks closeout lock, do not collide.
+        $token = $app->make(ParallelTesting::class)->token();
+        if ($token !== false) {
+            $app->useStoragePath($app->storagePath('framework/testing/parallel-'.$token));
+        }
+
+        return $app;
     }
 
     protected function setUp(): void
