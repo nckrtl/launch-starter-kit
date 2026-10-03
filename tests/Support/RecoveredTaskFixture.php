@@ -12,6 +12,8 @@ use App\Tasks\Runtime\TaskRuntimePlan;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\File;
 use Illuminate\Support\Facades\Process;
+use PDO;
+use RuntimeException;
 
 final class RecoveredTaskFixture
 {
@@ -59,6 +61,12 @@ final class RecoveredTaskFixture
             'CACHE_STORE' => 'array', 'QUEUE_CONNECTION' => 'sync', 'SESSION_DRIVER' => 'array',
             'COMMANDER_TASK_RUNTIME_ENABLED' => 'false',
         ]))->run([PHP_BINARY, 'artisan', 'migrate', '--force', '--no-interaction'])->throw();
+        // The app opens SQLite in WAL mode; recovery accepts only rollback-journal files.
+        $journal = new PDO('sqlite:'.$this->backup);
+        if ($journal->query('PRAGMA journal_mode=DELETE')->fetchColumn() !== 'delete') {
+            throw new RuntimeException('Cannot convert the recovery fixture backup to rollback-journal mode.');
+        }
+        $journal = null;
         DB::connectUsing('resume-source', ['driver' => 'sqlite', 'database' => $this->backup, 'foreign_key_constraints' => true]);
         $root = Task::on('resume-source')->create(['project_id' => 'orbit', 'kind' => TaskKind::Group,
             'title' => 'Feature', 'description' => 'Integrate both tasks.', 'acceptance_criteria' => 'Integrated evidence passes.']);

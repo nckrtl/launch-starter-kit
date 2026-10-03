@@ -33,6 +33,10 @@ beforeEach(function () {
         'CACHE_STORE' => 'array', 'QUEUE_CONNECTION' => 'sync', 'SESSION_DRIVER' => 'array',
         'COMMANDER_TASK_RUNTIME_ENABLED' => 'false',
     ]))->run([PHP_BINARY, 'artisan', 'migrate', '--force', '--no-interaction'])->throw();
+    // The app opens SQLite in WAL mode; recovery accepts only rollback-journal files.
+    $journal = new PDO('sqlite:'.$this->recoveryBackup);
+    expect($journal->query('PRAGMA journal_mode=DELETE')->fetchColumn())->toBe('delete');
+    $journal = null;
     DB::connectUsing('recovery-fixture', ['driver' => 'sqlite', 'database' => $this->recoveryBackup, 'foreign_key_constraints' => true]);
     $this->recoveryRoot = Task::on('recovery-fixture')->create(['project_id' => 'orbit', 'kind' => TaskKind::Group,
         'title' => 'Feature', 'description' => 'Integrate both tasks.', 'acceptance_criteria' => 'Both parts pass integrated verification.']);
