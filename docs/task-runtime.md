@@ -435,6 +435,9 @@ services and their databases. The command refuses configured application
 database paths, linked files, sidecars, WAL-format files, changed backup contents,
 and conflicting runtime history. Both inputs must use rollback-journal SQLite
 format: even a sidecar-free WAL file can create sidecars when opened read-only.
+The application opens SQLite in WAL mode, so a `.backup` copy keeps the WAL
+format. Create each copy with `VACUUM INTO`, or run `PRAGMA journal_mode=DELETE`
+on the copy, before you record its digest.
 The importer checks the file header before opening SQLite and never changes its
 journal mode. `--exclusive` asserts operator ownership; it does not stop a worker
 or grant authority over unrelated data.
