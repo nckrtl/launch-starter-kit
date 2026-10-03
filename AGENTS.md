@@ -217,9 +217,8 @@ not treat the test suite as SSR coverage.
 - **Git hooks**: committed `.vite-hooks/` scripts, installed by `vp config` (run
   automatically by `bun install` via the package.json `prepare` script), which points
   `core.hooksPath` at the VitePlus dispatcher. Pre-commit runs `vp staged` (the `staged`
-  tasks in `vite.config.ts` against staged files); pre-push runs
-  `composer test && composer analyse`. Skip once with `VP_GIT_HOOKS=0`. Do not configure
-  `hook.*` git config keys — nothing reads them
+  tasks in `vite.config.ts` against staged files).
+  Skip once with `VP_GIT_HOOKS=0`. Do not configure `hook.*` git config keys — nothing reads them
 - **CSP**: Spatie laravel-csp with Basic + Development presets
 
 ## Feature Completion Gates

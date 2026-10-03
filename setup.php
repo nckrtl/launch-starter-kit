@@ -262,8 +262,8 @@ function setupGitHooks($envContent, $updated)
 {
     // Hooks are installed by `vp config`, which `bun install` runs via the
     // package.json `prepare` script. It sets core.hooksPath to VitePlus's
-    // dispatcher, which runs the committed .vite-hooks/pre-commit and
-    // .vite-hooks/pre-push scripts. Nothing to configure here -- this step only
+    // dispatcher, which runs the committed .vite-hooks/pre-commit
+    // script. Nothing to configure here -- this step only
     // reports what happened.
     //
     // Do not unset core.hooksPath, and do not set hook.* git config keys: those
@@ -274,8 +274,7 @@ function setupGitHooks($envContent, $updated)
 
     if ($code === 0 && $hooksPath !== '') {
         echo "Git hooks installed (core.hooksPath = {$hooksPath}).\n";
-        echo "  pre-commit: staged tasks from vite.config.ts\n";
-        echo "  pre-push:   composer test && composer analyse\n\n";
+        echo "  pre-commit: staged tasks from vite.config.ts\n\n";
 
         return [$envContent, $updated];
     }

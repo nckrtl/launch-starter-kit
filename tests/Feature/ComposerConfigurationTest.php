@@ -30,31 +30,16 @@ it('runs Pest through the git-aware runner', function (): void {
         ->and($composer['scripts']['dev'][1] ?? '')->not->toContain('npm run dev');
 });
 
-it('ships committed git hooks that install themselves', function (): void {
+it('ships a committed git hook that installs itself', function (): void {
     // `vp config` (run by `bun install` via the prepare script) points
-    // core.hooksPath at VitePlus's dispatcher, which sources these files. They
+    // core.hooksPath at VitePlus's dispatcher, which sources this file. It
     // must be committed and executable or the dispatcher silently exits 0 and
-    // no hook runs at all.
-    foreach (['pre-commit', 'pre-push'] as $hook) {
-        $path = base_path('.vite-hooks/'.$hook);
+    // the hook does not run.
+    $path = base_path('.vite-hooks/pre-commit');
 
-        expect(File::exists($path))->toBeTrue(".vite-hooks/{$hook} must be committed")
-            ->and(is_executable($path))->toBeTrue(".vite-hooks/{$hook} must be executable");
-    }
-
-    expect(File::get(base_path('.vite-hooks/pre-commit')))->toContain('vp staged');
-});
-
-it('isolates pre-push commands from Git arguments and stdin', function (): void {
-    // Git invokes pre-push with the remote name and URL as arguments and pipes
-    // the pushed refs on stdin. Composer would treat a stray remote name as its
-    // own argument, so neither may reach it.
-    $hook = File::get(base_path('.vite-hooks/pre-push'));
-
-    expect($hook)
-        ->toContain('composer test </dev/null')
-        ->toContain('composer analyse </dev/null')
-        ->not->toContain('"$@"');
+    expect(File::exists($path))->toBeTrue('.vite-hooks/pre-commit must be committed')
+        ->and(is_executable($path))->toBeTrue('.vite-hooks/pre-commit must be executable')
+        ->and(File::get($path))->toContain('vp staged');
 });
 
 it('forwards composer test arguments to pest instead of artisan', function (): void {

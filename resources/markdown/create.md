@@ -179,7 +179,7 @@ is a separate one-time download. Pest browser tests (`composer test:browser`, al
 
 `bun install` in step 4 runs `vp config` via the package.json `prepare` script, which points
 `core.hooksPath` at VitePlus's dispatcher; that dispatcher runs the committed
-`.vite-hooks/pre-commit` and `.vite-hooks/pre-push` scripts.
+`.vite-hooks/pre-commit` script.
 
 `composer create-project` from a dist or local path artifact does not create a git repository,
 and `vp config` cannot install hooks until one exists. If `.git` is missing after step 1:
@@ -190,8 +190,7 @@ vp config
 ```
 
 Pre-commit runs the `staged` tasks from `vite.config.ts` against staged files and re-stages
-what they fix. Pre-push runs `composer test && composer analyse`. Prefix a command with
-`VP_GIT_HOOKS=0` to skip them once.
+what they fix. Prefix a command with `VP_GIT_HOOKS=0` to skip it once.
 
 Do not configure `hook.*` git config keys. Nothing reads them.
 

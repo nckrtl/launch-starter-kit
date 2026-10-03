@@ -1,9 +1,0 @@
-#!/usr/bin/env sh
-# Installed automatically by `vp config`, which `bun install` runs via the
-# package.json `prepare` script. Set VP_GIT_HOOKS=0 to skip hooks for one command.
-#
-# Git invokes pre-push with the remote name and URL as arguments, and pipes the
-# refs being pushed on stdin. Neither is forwarded below: the positional
-# arguments are deliberately not passed on, and stdin is closed, because
-# Composer would otherwise treat the remote name as one of its own arguments.
-composer test </dev/null && composer analyse </dev/null

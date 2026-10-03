@@ -31,11 +31,9 @@ bun run build
 
 Git hooks need no setup. `bun install` runs `vp config` via the package.json `prepare`
 script, which points `core.hooksPath` at VitePlus's dispatcher; that dispatcher runs the
-committed [`.vite-hooks/pre-commit`](.vite-hooks/pre-commit) and
-[`.vite-hooks/pre-push`](.vite-hooks/pre-push) scripts. Pre-commit runs the `staged` tasks
-declared in `vite.config.ts` against staged files only and re-stages what they fix; pre-push
-runs `composer test && composer analyse`. Prefix a command with `VP_GIT_HOOKS=0` to skip them
-once.
+committed [`.vite-hooks/pre-commit`](.vite-hooks/pre-commit) script. It runs the `staged`
+tasks declared in `vite.config.ts` against staged files only and re-stages what they fix.
+Prefix a command with `VP_GIT_HOOKS=0` to skip it once.
 
 Then set the site up for your local environment — Herd and Orbit each need different steps,
 and both serve the app themselves, so neither uses `php artisan serve` or `composer dev`:
