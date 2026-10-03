@@ -17,7 +17,7 @@ The steps below are the equivalent non-interactive path.
 | Components       | shadcn `base-nova` style, backed by Base UI (`@base-ui/react`) |
 | Icons            | Lucide React                                                   |
 | Toolchain        | VitePlus (Vite 8 + Oxc lint/format), Bun as package manager    |
-| PHP routing      | Waymaker — PHP attributes, no route files                      |
+| PHP routing      | Laravel routes in `routes/web.php`                             |
 | Frontend routing | Wayfinder — generated TypeScript route helpers                 |
 | Database         | SQLite by default (`journal_mode` WAL, `synchronous` NORMAL)   |
 
@@ -278,7 +278,7 @@ php artisan migrate --force
 Setup is done. Before writing any code in this project, read
 <https://launch.nckrtl.com/conventions.md>.
 
-It covers the rules that keep a Launch project consistent — attribute routing with Waymaker,
+It covers the rules that keep a Launch project consistent — routes in `routes/web.php`,
 typed URLs with Wayfinder, Base UI rather than Radix, where design tokens live, SSR
 constraints, the command list, and the quality gates a feature has to clear before you can call
 it done. Skipping it produces code that runs but fights the toolchain.

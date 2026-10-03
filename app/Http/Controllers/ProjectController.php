@@ -14,19 +14,14 @@ use Illuminate\Http\RedirectResponse;
 use Inertia\Inertia;
 use Inertia\Response;
 use InvalidArgumentException;
-use NckRtl\Waymaker\Get;
-use NckRtl\Waymaker\Post;
-use NckRtl\Waymaker\Put;
 
 final class ProjectController extends Controller
 {
-    #[Get(uri: '/projects')]
     public function index(SharedKnowledgeProjectRepository $projects): Response
     {
         return inertia('Projects/Index', ['projects' => $projects->all()]);
     }
 
-    #[Post(uri: '/projects')]
     public function store(StoreProjectRequest $request, SharedKnowledgeProjectRepository $projects): RedirectResponse
     {
         try {
@@ -38,10 +33,9 @@ final class ProjectController extends Controller
             return back()->withErrors(['id' => $exception->getMessage()]);
         }
 
-        return to_route('ProjectController.index')->with('success', 'Project created.');
+        return to_route('projects.index')->with('success', 'Project created.');
     }
 
-    #[Get(uri: '/projects/{id}')]
     public function show(string $id, SharedKnowledgeProjectRepository $projects, ProjectDetails $details, OrbitProjects $orbit, GitHubProjects $github): Response
     {
         try {
@@ -60,7 +54,6 @@ final class ProjectController extends Controller
         ]);
     }
 
-    #[Put(uri: '/projects/{id}')]
     public function update(string $id, UpdateProjectRequest $request, SharedKnowledgeProjectRepository $projects): RedirectResponse
     {
         try {
@@ -72,6 +65,6 @@ final class ProjectController extends Controller
             abort(404, $exception->getMessage());
         }
 
-        return to_route('ProjectController.index')->with('success', 'Project updated.');
+        return to_route('projects.index')->with('success', 'Project updated.');
     }
 }

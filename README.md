@@ -82,7 +82,7 @@ environment addendum linked above instead.
 - **Components**: shadcn base-nova components backed by Base UI (`@base-ui/react`)
 - **Icons**: Lucide React
 - **Toolchain**: VitePlus (Vite 8 + Oxc linting/formatting)
-- **Routing**: Waymaker (PHP attributes) + Wayfinder (TS route helpers)
+- **Routing**: Laravel route files + Wayfinder (TS route helpers)
 - **Database**: SQLite (`journal_mode` WAL, `synchronous` NORMAL)
 - **Component registry**: `@launch` shadcn registry from [launch-ui](https://github.com/nckrtl/launch-ui)
 

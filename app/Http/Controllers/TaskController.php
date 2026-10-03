@@ -24,19 +24,14 @@ use Illuminate\Validation\ValidationException;
 use Inertia\Response;
 use InvalidArgumentException;
 use LogicException;
-use NckRtl\Waymaker\Get;
-use NckRtl\Waymaker\Post;
-use NckRtl\Waymaker\Put;
 
 final class TaskController extends Controller
 {
-    #[Get(uri: '/projects/{projectId}/tasks')]
     public function index(string $projectId, SharedKnowledgeProjectRepository $projects, TaskCatalog $catalog): Response
     {
         return inertia('Tasks/Index', ['project' => $this->project($projectId, $projects), 'tasks' => $catalog->listing($projectId)]);
     }
 
-    #[Get(uri: '/projects/{projectId}/tasks/{taskId}')]
     public function show(string $projectId, string $taskId, SharedKnowledgeProjectRepository $projects, TaskCatalog $catalog, TaskTerminalSessions $sessions): Response
     {
         $task = $catalog->find($projectId, $taskId);
@@ -47,7 +42,6 @@ final class TaskController extends Controller
         ]);
     }
 
-    #[Post(uri: '/projects/{projectId}/tasks/{taskId}/terminal/{role}/observation-grant', middleware: 'throttle:120,1')]
     public function observationGrant(string $projectId, string $taskId, string $role, StoreTaskObservationGrantRequest $request, TaskCatalog $catalog, TaskTerminalSessions $sessions, OrbitHerdrObservationGrants $grants): JsonResponse
     {
         $task = $catalog->find($projectId, $taskId);
@@ -68,7 +62,6 @@ final class TaskController extends Controller
         ]);
     }
 
-    #[Post(uri: '/projects/{projectId}/tasks')]
     public function store(string $projectId, StoreTaskRequest $request, SharedKnowledgeProjectRepository $projects, TaskCatalog $catalog, CreateTask $create): RedirectResponse
     {
         $this->project($projectId, $projects);
@@ -78,11 +71,10 @@ final class TaskController extends Controller
             $task = $create->handle($projectId, $request->string('title')->toString(), $request->string('description')->toString(),
                 TaskKind::from($request->string('kind')->toString()), $parent, $request->string('acceptance_criteria')->toString(), $request->string('creation_key')->toString());
 
-            return to_route('TaskController.show', ['projectId' => $projectId, 'taskId' => $parent->id ?? $task->id])->with('success', 'Task created.');
+            return to_route('projects.tasks.show', ['projectId' => $projectId, 'taskId' => $parent->id ?? $task->id])->with('success', 'Task created.');
         });
     }
 
-    #[Put(uri: '/projects/{projectId}/tasks/{taskId}')]
     public function update(string $projectId, string $taskId, UpdateTaskRequest $request, SharedKnowledgeProjectRepository $projects, TaskCatalog $catalog, UpdateTask $update): RedirectResponse
     {
         $this->project($projectId, $projects);
@@ -92,11 +84,10 @@ final class TaskController extends Controller
             $update->handle($task, $request->string('expected_version')->toString(), $request->string('title')->toString(),
                 $request->string('description')->toString(), $request->string('acceptance_criteria')->toString());
 
-            return to_route('TaskController.show', ['projectId' => $projectId, 'taskId' => $taskId])->with('success', 'Task saved.');
+            return to_route('projects.tasks.show', ['projectId' => $projectId, 'taskId' => $taskId])->with('success', 'Task saved.');
         });
     }
 
-    #[Put(uri: '/projects/{projectId}/tasks/{taskId}/order')]
     public function reorder(string $projectId, string $taskId, ReorderTaskChildrenRequest $request, SharedKnowledgeProjectRepository $projects, TaskCatalog $catalog, ReorderTaskChildren $reorder): RedirectResponse
     {
         $this->project($projectId, $projects);
@@ -109,7 +100,7 @@ final class TaskController extends Controller
         return $this->mutate(function () use ($projectId, $taskId, $task, $ordered, $expected, $reorder): RedirectResponse {
             $reorder->handle($task, array_map(intval(...), $ordered), array_map(intval(...), $expected));
 
-            return to_route('TaskController.show', ['projectId' => $projectId, 'taskId' => $taskId])->with('success', 'Task order saved.');
+            return to_route('projects.tasks.show', ['projectId' => $projectId, 'taskId' => $taskId])->with('success', 'Task order saved.');
         });
     }
 

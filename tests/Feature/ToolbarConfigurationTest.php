@@ -58,7 +58,7 @@ it('keeps Agentation out of the frontend build', function (): void {
 
     expect($package['dependencies'] ?? [])->not->toHaveKey('agentation')
         ->and($package['devDependencies'] ?? [])->not->toHaveKey('agentation')
-        ->and(File::get(base_path('vite.config.ts')))->toContain('agentation: false');
+        ->and(File::get(base_path('vite.config.ts')))->not->toContain('agentation');
 });
 
 it('keeps the composer manifest installable from a public registry', function (): void {

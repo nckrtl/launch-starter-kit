@@ -9,11 +9,9 @@ use App\Operations\HermesSnapshot;
 use App\Projects\SharedKnowledgeProjectRepository;
 use Inertia\Response;
 use Inertia\ResponseFactory;
-use NckRtl\Waymaker\Get;
 
 class HomeController extends Controller
 {
-    #[Get(uri: '/')]
     public function show(
         SharedKnowledgeProjectRepository $projects,
         HermesSnapshot $hermes,

@@ -34,7 +34,7 @@ it('serves the conventions separately from the setup guide', function () {
         ->assertHeader('Content-Type', 'text/markdown; charset=utf-8');
 
     expect($conventions->getContent())
-        ->toContain('Waymaker')
+        ->toContain('routes/web.php')
         ->toContain('Wayfinder')
         ->toContain('@radix-ui')
         ->toContain('Quality gates');
