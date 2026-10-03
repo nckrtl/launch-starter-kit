@@ -45,6 +45,25 @@ beforeEach(function () {
 
 afterEach(fn () => File::deleteDirectory($this->projectsPath));
 
+/**
+ * Load the named migration and every later one in the order Laravel applies them.
+ * Reversing a migration requires reversing every later migration first.
+ *
+ * @return list<object>
+ */
+function taskMigrationsFrom(string $first): array
+{
+    $paths = collect(File::files(database_path('migrations')))
+        ->map(fn (SplFileInfo $file): string => $file->getPathname())
+        ->filter(fn (string $path): bool => basename($path, '.php') >= $first)
+        ->sort()
+        ->values();
+
+    expect(basename((string) $paths->first(), '.php'))->toBe($first);
+
+    return $paths->map(fn (string $path): object => require $path)->all();
+}
+
 it('reverses and reapplies the task migrations without changing existing delivery records', function () {
     $orchestration = ProjectOrchestration::query()->create(['manifest_project_id' => 'orbit', 'config' => []]);
     $delivery = Delivery::query()->create([
@@ -56,17 +75,11 @@ it('reverses and reapplies the task migrations without changing existing deliver
         'status' => DeliveryStatus::Queued,
         'current_phase' => 'planning',
     ]);
-    $migration = require database_path('migrations/2026_09_12_065336_create_task_tables.php');
-    $reviewMigration = require database_path('migrations/2026_09_12_092418_add_task_review_gate.php');
-    $briefMigration = require database_path('migrations/2026_09_12_115402_add_task_brief_fields_to_tasks.php');
-    $runtimeMigration = require database_path('migrations/2026_09_12_151853_create_task_runtime_tables.php');
-    $continuationMigration = require database_path('migrations/2026_09_13_000000_add_task_final_continuations.php');
+    $migrations = taskMigrationsFrom('2026_09_12_065336_create_task_tables');
 
-    $continuationMigration->down();
-    $runtimeMigration->down();
-    $briefMigration->down();
-    $reviewMigration->down();
-    $migration->down();
+    foreach (array_reverse($migrations) as $migration) {
+        $migration->down();
+    }
 
     foreach (['tasks', 'task_runs', 'task_dependencies', 'task_run_reviews'] as $table) {
         expect(Schema::hasTable($table))->toBeFalse();
@@ -78,11 +91,9 @@ it('reverses and reapplies the task migrations without changing existing deliver
 
     $this->assertModelExists($delivery);
     $this->assertModelExists($orchestration);
-    $migration->up();
-    $reviewMigration->up();
-    $briefMigration->up();
-    $runtimeMigration->up();
-    $continuationMigration->up();
+    foreach ($migrations as $migration) {
+        $migration->up();
+    }
 
     expect(Task::query()->count())->toBe(0)
         ->and(TaskRun::query()->count())->toBe(0)
@@ -106,18 +117,20 @@ it('reverses populated runtime tables without changing task briefs or acceptance
         'token_hash' => str_repeat('c', 64), 'handoff_token' => 'migration-token', 'prompt' => 'Test',
         'execution_key' => 'migration-job',
     ]);
-    $migration = require database_path('migrations/2026_09_12_151853_create_task_runtime_tables.php');
-    $continuationMigration = require database_path('migrations/2026_09_13_000000_add_task_final_continuations.php');
-    $continuationMigration->down();
-    $migration->down();
+    $migrations = taskMigrationsFrom('2026_09_12_151853_create_task_runtime_tables');
+
+    foreach (array_reverse($migrations) as $migration) {
+        $migration->down();
+    }
 
     expect(Schema::hasTable('task_workspaces'))->toBeFalse()
         ->and(Schema::hasTable('task_agent_dispatches'))->toBeFalse()
         ->and($this->dependency->fresh()->accepted_task_run_id)->toBe($this->run->id)
         ->and($this->run->reviews()->count())->toBe(2)
         ->and(DB::select('PRAGMA foreign_key_check'))->toBe([]);
-    $migration->up();
-    $continuationMigration->up();
+    foreach ($migrations as $migration) {
+        $migration->up();
+    }
 
     expect(TaskWorkspace::query()->count())->toBe(0)
         ->and(Schema::hasColumn('task_agent_dispatches', 'execution_key'))->toBeTrue()
