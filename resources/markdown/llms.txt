@@ -1,6 +1,6 @@
 # Launch
 
-> A Laravel 13 + React 19 + Inertia v3 starter kit with SSR, Tailwind CSS v4, shadcn (base-nova/Base UI), attribute-based routing, and a typed frontend route layer. Built to be set up and extended by AI coding agents.
+> A Laravel 13 + React 19 + Inertia v3 starter kit with SSR, Tailwind CSS v4, shadcn (base-nova/Base UI), Laravel route files, and a typed frontend route layer. Built to be set up and extended by AI coding agents.
 
 If you were pointed at this site to scaffold a new project, read the setup guide below. It is self-contained: follow it top to bottom and you will have a running application.
 
@@ -10,7 +10,7 @@ If you were pointed at this site to scaffold a new project, read the setup guide
 
 ## Building on it
 
-- [Conventions](https://launch.nckrtl.com/conventions.md): The rules a Launch project expects — attribute routing, typed frontend URLs, Base UI over Radix, design tokens, SSR constraints, commands, and the quality gates a feature must clear. Read after setup, before writing code.
+- [Conventions](https://launch.nckrtl.com/conventions.md): The rules a Launch project expects — routes in `routes/web.php`, typed frontend URLs, Base UI over Radix, design tokens, SSR constraints, commands, and the quality gates a feature must clear. Read after setup, before writing code.
 
 ## How the app is served
 
