@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "ca261a5fab54ca5b93065ee52e5417e3",
+    "content-hash": "b76d95e45056e30205b276bff5aa06e5",
     "packages": [
         {
             "name": "brick/math",
@@ -2518,88 +2518,6 @@
                 }
             ],
             "time": "2026-08-07T12:09:10+00:00"
-        },
-        {
-            "name": "nckrtl/waymaker",
-            "version": "v0.2.7",
-            "source": {
-                "type": "git",
-                "url": "https://github.com/nckrtl/waymaker.git",
-                "reference": "7f414500b9057d9f46e4939aa44cb71d21dfe6b1"
-            },
-            "dist": {
-                "type": "zip",
-                "url": "https://api.github.com/repos/nckrtl/waymaker/zipball/7f414500b9057d9f46e4939aa44cb71d21dfe6b1",
-                "reference": "7f414500b9057d9f46e4939aa44cb71d21dfe6b1",
-                "shasum": ""
-            },
-            "require": {
-                "illuminate/contracts": "^13.0",
-                "inertiajs/inertia-laravel": "^3.0",
-                "php": "^8.4",
-                "spatie/laravel-package-tools": "^1.16"
-            },
-            "require-dev": {
-                "larastan/larastan": "^3.0",
-                "laravel/pint": "^1.14",
-                "nunomaduro/collision": "^8.0",
-                "orchestra/testbench": "^11.0",
-                "pestphp/pest": "^4.0||^5.0",
-                "pestphp/pest-plugin-arch": "^4.0||^5.0",
-                "pestphp/pest-plugin-laravel": "^4.0||^5.0",
-                "phpstan/extension-installer": "^1.3||^2.0",
-                "phpstan/phpstan-deprecation-rules": "^1.1||^2.0",
-                "phpstan/phpstan-phpunit": "^1.3||^2.0"
-            },
-            "type": "library",
-            "extra": {
-                "laravel": {
-                    "aliases": {
-                        "Waymaker": "NckRtl\\Waymaker\\Facades\\Waymaker"
-                    },
-                    "providers": [
-                        "NckRtl\\Waymaker\\WaymakerServiceProvider"
-                    ]
-                }
-            },
-            "autoload": {
-                "psr-4": {
-                    "NckRtl\\Waymaker\\": "src/",
-                    "NckRtl\\Waymaker\\Database\\Factories\\": "database/factories/"
-                }
-            },
-            "notification-url": "https://packagist.org/downloads/",
-            "license": [
-                "MIT"
-            ],
-            "authors": [
-                {
-                    "name": "nckrtl",
-                    "email": "nick.retel@gmail.com",
-                    "role": "Developer"
-                }
-            ],
-            "description": "Attribute-based route generation for Laravel - automatically generate routes from controller method attributes",
-            "homepage": "https://github.com/nckrtl/waymaker",
-            "keywords": [
-                "attributes",
-                "code-generation",
-                "inertia",
-                "laravel",
-                "routing",
-                "wayfinder"
-            ],
-            "support": {
-                "issues": "https://github.com/nckrtl/waymaker/issues",
-                "source": "https://github.com/nckrtl/waymaker/tree/v0.2.7"
-            },
-            "funding": [
-                {
-                    "url": "https://github.com/NckRtl",
-                    "type": "github"
-                }
-            ],
-            "time": "2026-08-07T11:18:06+00:00"
         },
         {
             "name": "nesbot/carbon",

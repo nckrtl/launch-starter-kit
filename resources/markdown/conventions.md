@@ -11,34 +11,19 @@ The same rules are written to `AGENTS.md` in the project root when it is generat
 is the authoritative copy for a given project, since a project can amend it. This page is the
 canonical version of the defaults.
 
-## Routing: Waymaker, not route files
+## Routing: `routes/web.php`
 
-`routes/web.php` contains only `Waymaker::routes()`. Routes are declared as PHP attributes on
-controller methods:
+Declare every web route in `routes/web.php` and give it a dotted name:
 
 ```php
-namespace App\Http\Controllers;
+use App\Http\Controllers\ProjectController;
+use Illuminate\Support\Facades\Route;
 
-use Inertia\Response;
-use NckRtl\Waymaker\Get;
-
-class ProjectController extends Controller
-{
-    #[Get(uri: '/projects/{project}')]
-    public function show(Project $project): Response
-    {
-        return inertia('Projects/Show', [
-            'project' => $project,
-        ]);
-    }
-}
+Route::get('/projects/{project}', [ProjectController::class, 'show'])->name('projects.show');
 ```
 
-Do not add routes to `routes/web.php`.
-
-`routes/waymaker.php` is generated from those attributes — never edit it by hand. Regenerate it
-with `php artisan waymaker:generate` after adding or changing a route, then run `composer lint`,
-because the generator emits fully-qualified class names that Pint rewrites into imports.
+Use the name in PHP redirects, for example `to_route('projects.show', $project)`. Check the result
+with `php artisan route:list`.
 
 ## URLs in the frontend: Wayfinder, not strings
 

@@ -25,7 +25,6 @@ Use the stack-specific skills whenever their domain is involved:
 
 - Laravel PHP: `laravel-best-practices`
 - Pest unit, feature, or browser tests: `pest-testing`
-- Waymaker controller routes: `waymaker-development`
 - Wayfinder frontend route functions: `wayfinder-development`
 - React and Inertia: `vercel-react-best-practices` and
   `inertia-react-development` together
@@ -57,7 +56,7 @@ import { defineLaunchConfig } from "@nckrtl/launch-ui/vite";
 export default await defineLaunchConfig();
 ```
 
-This configures: laravel-vite-plugin, @inertiajs/vite (with SSR), @vitejs/plugin-react, @tailwindcss/vite, @laravel/vite-plugin-wayfinder, and artisan runners for waymaker + typescript:transform.
+This configures: laravel-vite-plugin, @inertiajs/vite (with SSR), @vitejs/plugin-react, @tailwindcss/vite, @laravel/vite-plugin-wayfinder, and an artisan runner for typescript:transform.
 
 ### Options
 
@@ -126,7 +125,7 @@ function LanguageSwitcher() {
 
 ## Routing
 
-- **Waymaker** (`nckrtl/waymaker`): attribute-based PHP routing. Controllers use `#[Get]`, `#[Post]`, etc. attributes instead of route files. Routes are registered via `Waymaker::routes()` in `routes/web.php`.
+- **Laravel routes**: every web route is declared in `routes/web.php` with `Route::get()`, `Route::post()`, and so on. Give each route a dotted name such as `projects.show`.
 - **Wayfinder** (`laravel/wayfinder` + `@laravel/vite-plugin-wayfinder`): auto-generates TypeScript route helpers at build time. Import from `@/actions/` for type-safe URLs.
 
 ## Component Registry
@@ -146,7 +145,7 @@ bunx shadcn add @launch/app-sidebar-layout # Layout from the @launch registry
 
 ```
 app/
-  Http/Controllers/       # Waymaker-attributed controllers
+  Http/Controllers/       # Controllers referenced from routes/web.php
   Http/Middleware/         # HandleInertiaRequests, CSP middleware
   Support/Csp/            # CSP presets (Basic, Development)
 resources/

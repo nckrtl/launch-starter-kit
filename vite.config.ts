@@ -13,7 +13,6 @@ export default defineConfig(async (environment) => {
                 port: Number(process.env.INERTIA_SSR_PORT ?? env.INERTIA_SSR_PORT ?? 13719),
             },
         },
-        agentation: false,
     });
 
     return {
