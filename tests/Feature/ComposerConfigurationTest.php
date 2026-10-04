@@ -54,28 +54,6 @@ it('ships a committed git hook that installs itself', function (): void {
 });
 
 it('forwards composer test arguments to pest instead of artisan', function (): void {
-    $assertSinglePassingTest = static function (string $output): void {
-        expect($output)->not->toContain('The "--filter" option does not exist');
-
-        foreach (preg_split('/\R/', $output) ?: [] as $line) {
-            $result = json_decode($line, true);
-
-            if (is_array($result) && ($result['tool'] ?? null) === 'pest') {
-                expect($result)->toMatchArray([
-                    'result' => 'passed',
-                    'tests' => 1,
-                    'passed' => 1,
-                ]);
-
-                return;
-            }
-        }
-
-        expect($output)
-            ->toContain('Tests:')
-            ->toContain('1 passed');
-    };
-
     $filter = new Process(
         ['composer', 'test', '--', '--filter=it asserts true is true', '--compact'],
         base_path(),
@@ -85,7 +63,10 @@ it('forwards composer test arguments to pest instead of artisan', function (): v
 
     $filterOutput = $filter->getOutput().$filter->getErrorOutput();
 
-    $assertSinglePassingTest($filterOutput);
+    expect($filterOutput)
+        ->toContain('Tests:')
+        ->toContain('1 passed')
+        ->not->toContain('The "--filter" option does not exist');
 
     $path = new Process(
         ['composer', 'test', '--', 'tests/Unit/ExampleTest.php', '--compact'],
@@ -96,7 +77,10 @@ it('forwards composer test arguments to pest instead of artisan', function (): v
 
     $pathOutput = $path->getOutput().$path->getErrorOutput();
 
-    $assertSinglePassingTest($pathOutput);
+    expect($pathOutput)
+        ->toContain('Tests:')
+        ->toContain('1 passed')
+        ->not->toContain('The "--filter" option does not exist');
 });
 
 it('does not reintroduce git config hooks, which cannot ship configured', function (): void {

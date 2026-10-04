@@ -15,10 +15,6 @@ Laravel 13 + Launch Laravel + React 19 + Inertia v3 + VitePlus + Tailwind CSS v4
 
 The kit depends on `nckrtl/launch-laravel` from Packagist. To develop against a local checkout, use `composer link ../../packages/launch-laravel` after `composer install` — see "Working on the kit itself" in README.md, which is the source of truth for this workflow. `composer link` keeps `composer.json` and `composer.lock` untouched; `composer unlink <path>` restores the published package.
 
-## Managed project work
-
-For maintenance of a registered project, use [.agents/projects/AGENTS.md](.agents/projects/AGENTS.md) to find its skills. Select by the shared-knowledge project ID. The stack skills below apply to work on Commander itself.
-
 ## Agent Skills
 
 Use the stack-specific skills whenever their domain is involved:
@@ -195,9 +191,9 @@ its long-running processes are run per environment.
 
 ### SSR
 
-Production SSR is enabled: `bun run build` builds the SSR bundle. Set
-`INERTIA_SSR_PORT` per instance before building and running it: main uses 13719,
-Tasks uses 13729. Vite and Laravel share this setting. Feature tests deliberately disable SSR and
+Production SSR is enabled: `bun run build` builds the SSR bundle, and its port
+is pinned to 13719 in `vite.config.ts` (no env override exists — read the
+comment there before changing it). Feature tests deliberately disable SSR and
 Vite (`tests/Pest.php` sets `inertia.ssr.enabled=false` and calls
 `withoutVite()`) so they stay deterministic — passing Feature tests therefore
 prove nothing about SSR. Do not "fix" tests by re-enabling SSR in them, and do
