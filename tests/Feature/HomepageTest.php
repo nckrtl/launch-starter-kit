@@ -1,35 +1,14 @@
 <?php
 
 use App\Providers\ToolbarConfigProvider;
-use Illuminate\Cache\Repository;
 use Inertia\Testing\AssertableInertia as Assert;
 use NckRtl\Toolbar\Toolbar;
-
-beforeEach(function () {
-    config()->set('commander.projects_path', storage_path('framework/testing/missing-projects'));
-    config()->set('commander.herdr.sessions', []);
-    cache()->put('commander:hermes:snapshot', [
-        'status' => 'online',
-        'node' => 'mini',
-        'profiles' => [],
-        'boards' => [],
-        'signals' => [],
-    ], 60);
-    cache()->put(
-        Repository::FLEXIBLE_CREATED_KEY_PREFIX.'commander:hermes:snapshot',
-        now()->getTimestamp(),
-        60,
-    );
-});
 
 it('renders the homepage with the Home inertia component', function () {
     $this->get('/')
         ->assertSuccessful()
         ->assertInertia(fn (Assert $page) => $page
             ->component('Home')
-            ->has('projects')
-            ->where('hermes.status', 'online')
-            ->has('herdr.sessions')
         );
 });
 

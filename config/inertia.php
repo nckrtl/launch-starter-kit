@@ -20,7 +20,7 @@ return [
 
         'ensure_runtime_exists' => (bool) env('INERTIA_SSR_ENSURE_RUNTIME_EXISTS', false),
 
-        'url' => env('INERTIA_SSR_URL', (file_exists('/.dockerenv') ? 'http://host.docker.internal:' : 'http://127.0.0.1:').env('INERTIA_SSR_PORT', 13719)),
+        'url' => env('INERTIA_SSR_URL', file_exists('/.dockerenv') ? 'http://host.docker.internal:13719' : 'http://127.0.0.1:13719'),
 
         'hot_url' => env('INERTIA_SSR_HOT_URL'),
 
@@ -119,12 +119,7 @@ return [
 
         'enabled' => env('INERTIA_DEVTOOLS_ENABLED'),
 
-        'except' => [
-            'telescope*',
-            'horizon*',
-            '_inertia/devtools*',
-            'projects/*/tasks/*/terminal/*/observation-grant',
-        ],
+        'except' => ['telescope*', 'horizon*', '_inertia/devtools*'],
 
         'storage' => [
             'path' => storage_path('inertia-devtools'),
@@ -145,7 +140,6 @@ return [
                 'token',
                 '_token',
                 'access_token',
-                'observer_url',
                 'refresh_token',
                 'secret',
                 'client_secret',
