@@ -30,6 +30,17 @@ it('runs Pest through the git-aware runner', function (): void {
         ->and($composer['scripts']['dev'][1] ?? '')->not->toContain('npm run dev');
 });
 
+it('lets composer scripts run longer than the default process timeout', function (): void {
+    $composer = json_decode(
+        File::get(base_path('composer.json')),
+        associative: true,
+        flags: JSON_THROW_ON_ERROR,
+    );
+
+    // The full suite takes longer than Composer's default 300-second limit.
+    expect($composer['config']['process-timeout'] ?? null)->toBe(0);
+});
+
 it('ships a committed git hook that installs itself', function (): void {
     // `vp config` (run by `bun install` via the prepare script) points
     // core.hooksPath at VitePlus's dispatcher, which sources this file. It
