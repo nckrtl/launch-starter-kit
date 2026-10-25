@@ -1,0 +1,44 @@
+#!/usr/bin/env php
+<?php
+
+$name = basename($argv[0]);
+$key = $name.' '.implode(' ', array_slice($argv, 1));
+file_put_contents(getenv('DEPENDENCY_TEST_LOG'), $name.'|'.implode(' ', array_slice($argv, 1)).'|'.getcwd()."\n", FILE_APPEND);
+// Composer has no installed inventory in a fresh VM. Fixture responses must
+// not hide the empty, non-JSON output when audit is called without --locked.
+if ($name === 'composer' && $argv[1] === 'audit' && ! is_dir('vendor') && ! in_array('--locked', $argv, true)) {
+    fwrite(STDERR, "No packages - skipping audit.\n");
+    exit(0);
+}
+$fixture = getenv('DEPENDENCY_TEST_FIXTURE');
+if ($fixture) {
+    $responses = json_decode(file_get_contents($fixture), true);
+    $countsFile = $fixture.'.counts';
+    $counts = is_file($countsFile) ? json_decode(file_get_contents($countsFile), true) : [];
+    $n = $counts[$key] ?? 0;
+    $counts[$key] = $n + 1;
+    file_put_contents($countsFile, json_encode($counts));
+    $items = $responses[$key] ?? null;
+    if ($items !== null) {
+        $response = $items[min($n, count($items) - 1)];
+        echo isset($response['raw']) ? $response['raw'] : json_encode($response['data']);
+        exit($response['code'] ?? 0);
+    }
+}
+if ($name === 'composer' && $argv[1] === 'require') {
+    [$package, $range] = explode(':', $argv[2], 2);
+    $file = 'composer.json';
+    $section = in_array('--dev', $argv, true) ? 'require-dev' : 'require';
+} elseif ($name === 'vp' && $argv[1] === 'add') {
+    $split = strrpos($argv[2], '@');
+    $package = substr($argv[2], 0, $split);
+    $range = substr($argv[2], $split + 1);
+    $file = 'package.json';
+    $section = in_array('--save-dev', $argv, true) ? 'devDependencies' : (in_array('--save-optional', $argv, true) ? 'optionalDependencies' : 'dependencies');
+}
+if (isset($file)) {
+    $data = json_decode(file_get_contents($file), true);
+    $data[$section][$package] = $range;
+    file_put_contents($file, json_encode($data));
+}
+exit((int) (getenv($name === 'composer' ? 'DEPENDENCY_TEST_COMPOSER_EXIT' : 'DEPENDENCY_TEST_VP_EXIT') ?: 0));

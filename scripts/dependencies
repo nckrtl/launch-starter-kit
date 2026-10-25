@@ -1,0 +1,494 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+// Repo-owned dependency commands. Every subprocess receives a literal argv.
+chdir(dirname(__DIR__));
+
+function stop(string $message, int $code = 64): never
+{
+    fwrite(STDERR, $message."\n");
+    exit($code);
+}
+
+function localVp(): string
+{
+    $path = './node_modules/.bin/vp';
+    if (! is_executable($path)) {
+        stop('Missing executable node_modules/.bin/vp; install the repository dependencies first.', 127);
+    }
+
+    return $path;
+}
+
+function command(array $args, bool $json = false): array
+{
+    $out = $json ? tmpfile() : STDOUT;
+    $err = $json ? tmpfile() : STDERR;
+    $process = proc_open($args, [0 => ['file', '/dev/null', 'r'], 1 => $out, 2 => $err], $pipes);
+    if (! is_resource($process)) {
+        stop('Could not start '.$args[0], 70);
+    }
+    $code = proc_close($process);
+    if (! $json) {
+        return [$code, []];
+    }
+    rewind($out);
+    rewind($err);
+    $text = stream_get_contents($out, 1048577);
+    $error = stream_get_contents($err, 4096);
+    fclose($out);
+    fclose($err);
+    try {
+        $data = json_decode($text, true, 64, JSON_THROW_ON_ERROR);
+    } catch (JsonException) {
+        stop('Invalid JSON from '.implode(' ', $args).': '.$error, 70);
+    }
+    // A Bun audit object is keyed by package name. A list-shaped value is data,
+    // not the transport error Composer and npm use.
+    if (strlen($text) > 1048576 || ! is_array($data) || $code < 0 || $code > 3 || (isset($data['error']) && ! is_array($data['error']))) {
+        stop('Dependency command failed: '.implode(' ', $args).': '.$error, 70);
+    }
+
+    return [$code, $data];
+}
+
+function run(array $args): void
+{
+    [$code] = command($args);
+    if ($code !== 0) {
+        exit($code);
+    }
+}
+
+function readJson(string $file): array
+{
+    try {
+        return json_decode(file_get_contents($file), true, 64, JSON_THROW_ON_ERROR);
+    } catch (Throwable) {
+        stop('Cannot read '.$file, 70);
+    }
+}
+
+function npmAdvisories(array $vulnerabilities, string $name): array
+{
+    $pending = [$name];
+    $seen = [];
+    $result = [];
+    while ($pending !== []) {
+        $current = array_pop($pending);
+        if (isset($seen[$current])) {
+            continue;
+        }
+        $seen[$current] = true;
+        $viaEntries = $vulnerabilities[$current]['via'] ?? null;
+        if (! is_array($viaEntries)) {
+            stop('Cannot resolve npm advisory reference: '.$current, 70);
+        }
+        foreach ($viaEntries as $via) {
+            if (is_string($via)) {
+                $pending[] = $via;
+            } elseif (is_array($via) && isset($via['source'], $via['url'])
+                && (is_int($via['source']) || is_string($via['source'])) && (string) $via['source'] !== '' && is_string($via['url'])) {
+                $id = (string) $via['source'];
+                $result[$id] = ['id' => $id, 'url' => $via['url'], 'title' => $via['title'] ?? '',
+                    'affected' => $via['range'] ?? null, 'severity' => $via['severity'] ?? null];
+            } else {
+                stop('Invalid npm advisory for '.$current, 70);
+            }
+        }
+    }
+    if ($result === []) {
+        stop('No resolvable npm advisory for '.$name, 70);
+    }
+
+    return array_values($result);
+}
+
+function capture(array $args): array
+{
+    $out = tmpfile();
+    $err = tmpfile();
+    $process = proc_open($args, [0 => ['file', '/dev/null', 'r'], 1 => $out, 2 => $err], $pipes);
+    if (! is_resource($process)) {
+        stop('Could not start '.$args[0], 70);
+    }
+    $code = proc_close($process);
+    rewind($out);
+    rewind($err);
+    $text = stream_get_contents($out, 1048577);
+    $error = stream_get_contents($err, 4096);
+    fclose($out);
+    fclose($err);
+
+    return [$code, $text, $error];
+}
+
+function jsManager(): string
+{
+    $declared = readJson('package.json')['packageManager'] ?? '';
+    if (is_string($declared) && str_starts_with($declared, 'npm@')) {
+        return 'npm';
+    }
+    if (is_string($declared) && str_starts_with($declared, 'bun@')) {
+        return 'bun';
+    }
+    stop('package.json packageManager must declare npm@ or bun@', 70);
+}
+
+function directJsPackages(): array
+{
+    $manifest = readJson('package.json');
+
+    return array_replace($manifest['dependencies'] ?? [], $manifest['devDependencies'] ?? [], $manifest['optionalDependencies'] ?? []);
+}
+
+function isMajor(string $current, string $latest): bool
+{
+    return preg_match('/^v?(\d+)\.(\d+)\./', $current, $left) === 1
+        && preg_match('/^v?(\d+)\.(\d+)\./', $latest, $right) === 1
+        && ($left[1] !== $right[1] || ($left[1] === '0' && $left[2] !== $right[2]));
+}
+
+function bunOutdatedRows(string $text): array
+{
+    $text = preg_replace("/\x1b\[[0-9;]*m/", '', $text) ?? $text;
+    $rows = [];
+    $sawTable = false;
+    foreach (preg_split("/\r\n|\n|\r/", $text) as $line) {
+        if (! str_contains($line, '|')) {
+            continue;
+        }
+        if (preg_match('/^\|[-|]+\|$/', trim($line)) === 1) {
+            $sawTable = true;
+
+            continue;
+        }
+        if (! preg_match('/^\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|\s*([^|]*?)\s*\|$/', $line, $match)) {
+            stop('Unsupported Bun outdated row', 70);
+        }
+        $name = $match[1];
+        if ($name === 'Package' || $name === '' || str_starts_with($name, '-')) {
+            $sawTable = true;
+
+            continue;
+        }
+        if ($match[2] === '' || $match[4] === '') {
+            stop('Unsupported Bun outdated row', 70);
+        }
+        $rows[$name] = ['current' => $match[2], 'latest' => $match[4]];
+        $sawTable = true;
+    }
+    if ($rows === [] && trim($text) !== '' && ! $sawTable && ! str_contains($text, 'bun outdated')) {
+        stop('Unsupported Bun outdated output', 70);
+    }
+
+    return $rows;
+}
+
+function directPackageName(string $reported, array $direct): string
+{
+    $reported = preg_replace('/\s+\((?:dev|optional|peer)\)$/', '', $reported) ?? $reported;
+    if (isset($direct[$reported])) {
+        return $reported;
+    }
+    $matches = [];
+    foreach ($direct as $name => $range) {
+        if (is_string($range) && preg_match('~(?:^|npm:)'.preg_quote($reported, '~').'@~', $range) === 1) {
+            $matches[] = $name;
+        }
+    }
+    if (count($matches) !== 1) {
+        stop('Cannot map outdated package to one direct dependency: '.$reported, 70);
+    }
+
+    return $matches[0];
+}
+
+function bunGraph(): array
+{
+    if (! is_file('bun.lock')) {
+        stop('Cannot read bun.lock', 70);
+    }
+    $text = file_get_contents('bun.lock');
+    $stripped = preg_replace('/,\s*([}\]])/', '$1', is_string($text) ? $text : '');
+    try {
+        $data = json_decode(is_string($stripped) ? $stripped : '', true, 512, JSON_THROW_ON_ERROR);
+    } catch (JsonException) {
+        stop('Cannot read bun.lock', 70);
+    }
+    if (! isset($data['packages']) || ! is_array($data['packages'])) {
+        stop('bun.lock has no packages field', 70);
+    }
+    $graph = [];
+    foreach ($data['packages'] as $name => $entry) {
+        if (! is_string($name) || ! is_array($entry)) {
+            stop('Invalid bun.lock package entry', 70);
+        }
+        $meta = $entry[2] ?? [];
+        $deps = [];
+        if (is_array($meta)) {
+            foreach (['dependencies', 'optionalDependencies', 'peerDependencies'] as $section) {
+                if (! isset($meta[$section]) || ! is_array($meta[$section])) {
+                    continue;
+                }
+                foreach ($meta[$section] as $dep => $constraint) {
+                    if (! is_string($dep)) {
+                        stop('Invalid bun.lock dependency of '.$name, 70);
+                    }
+                    $deps[$dep] = true;
+                }
+            }
+        }
+        $graph[$name] = array_keys($deps);
+    }
+
+    return $graph;
+}
+
+function bunAudits(array $data, array $direct): array
+{
+    if ($data === []) {
+        return [];
+    }
+    if (array_is_list($data)) {
+        stop('Unsupported Bun audit JSON shape', 70);
+    }
+    $byPackage = [];
+    foreach ($data as $name => $entries) {
+        if (! is_string($name) || ! is_array($entries) || ($entries !== [] && ! array_is_list($entries))) {
+            stop('Unsupported Bun audit JSON shape', 70);
+        }
+        foreach ($entries as $entry) {
+            if (! is_array($entry) || ! isset($entry['id'], $entry['url'])
+                || ! (is_int($entry['id']) || is_string($entry['id'])) || (string) $entry['id'] === '' || ! is_string($entry['url'])) {
+                stop('Invalid bun advisory for '.$name, 70);
+            }
+            $id = (string) $entry['id'];
+            $byPackage[$name][$id] = [
+                'id' => $id,
+                'url' => $entry['url'],
+                'title' => $entry['title'] ?? '',
+                'affected' => $entry['vulnerable_versions'] ?? null,
+                'severity' => $entry['severity'] ?? null,
+            ];
+        }
+    }
+    if ($byPackage === []) {
+        return [];
+    }
+    $graph = bunGraph();
+    $directNames = array_fill_keys(array_keys($direct), true);
+    $reachable = [];
+    foreach (array_keys($direct) as $root) {
+        $stack = [$root];
+        $seen = [];
+        while ($stack !== []) {
+            $current = array_pop($stack);
+            if (isset($seen[$current])) {
+                continue;
+            }
+            $seen[$current] = true;
+            $reachable[$root][$current] = true;
+            foreach ($graph[$current] ?? [] as $child) {
+                if (isset($directNames[$child]) && $child !== $root) {
+                    continue;
+                }
+                $stack[] = $child;
+            }
+        }
+    }
+    $result = [];
+    foreach ($byPackage as $package => $advisories) {
+        $owners = isset($directNames[$package]) ? [$package] : [];
+        if ($owners === []) {
+            foreach (array_keys($direct) as $root) {
+                if (isset($reachable[$root][$package])) {
+                    $owners[] = $root;
+                }
+            }
+        }
+        if ($owners === []) {
+            stop('Cannot attach bun advisory to a direct dependency: '.$package, 70);
+        }
+        foreach ($owners as $owner) {
+            foreach ($advisories as $id => $advisory) {
+                $result[$owner][$id] = $advisory;
+            }
+        }
+    }
+    foreach ($result as $name => $advisories) {
+        ksort($advisories);
+        $result[$name] = array_values($advisories);
+    }
+
+    return $result;
+}
+
+function audits(string $manager): array
+{
+    [, $data] = command($manager === 'composer'
+        ? ['composer', 'audit', '--locked', '--format=json']
+        : [localVp(), 'pm', 'audit', '--json'], true);
+    if ($manager === 'composer') {
+        if (! isset($data['advisories']) || ! is_array($data['advisories'])) {
+            stop('Composer audit has no advisories field', 70);
+        }
+        $result = [];
+        foreach ($data['advisories'] as $name => $entries) {
+            foreach ($entries as $entry) {
+                $result[$name][] = ['id' => $entry['advisoryId'], 'url' => $entry['link'] ?? null,
+                    'title' => $entry['title'] ?? '', 'affected' => $entry['affectedVersions'] ?? null];
+            }
+        }
+
+        return $result;
+    }
+    if (jsManager() === 'bun') {
+        return bunAudits($data, directJsPackages());
+    }
+    if (! isset($data['vulnerabilities']) && ! isset($data['advisories'])) {
+        stop('JavaScript audit has no vulnerabilities/advisories field', 70);
+    }
+    $result = [];
+    $direct = directJsPackages();
+    foreach (array_intersect_key($data['vulnerabilities'] ?? [], $direct) as $name => $item) {
+        $result[$name] = npmAdvisories($data['vulnerabilities'], $name);
+    }
+    foreach ($data['advisories'] ?? [] as $item) {
+        $name = $item['module_name'];
+        $result[$name][] = ['id' => (string) $item['id'], 'url' => $item['url'] ?? null,
+            'title' => $item['title'] ?? '', 'affected' => $item['vulnerable_versions'] ?? null];
+    }
+
+    return $result;
+}
+
+$mode = $argv[1] ?? '';
+if ($mode === 'routine' && $argc === 2) {
+    $vp = localVp();
+    run(['composer', 'update', '--no-interaction']);
+    run([$vp, 'update']);
+    exit(0);
+}
+if ($mode === 'detect' && $argc === 2) {
+    $vp = localVp();
+    [, $php] = command(['composer', 'outdated', '--locked', '--major-only', '--format=json'], true);
+    $jsManager = jsManager();
+    $js = [];
+    $bunRows = [];
+    if ($jsManager === 'npm') {
+        [, $js] = command([$vp, 'outdated', '--format', 'json'], true);
+    } else {
+        [$code, $bunText, $error] = capture([$vp, 'outdated']);
+        if (! is_string($bunText) || strlen($bunText) > 1048576 || $code < 0 || $code > 3) {
+            stop('Dependency command failed: '.$vp.' outdated: '.$error, 70);
+        }
+        $bunRows = bunOutdatedRows($bunText);
+    }
+    if (! isset($php['locked']) || ! is_array($php['locked'])) {
+        stop('Composer outdated has no locked field', 70);
+    }
+    $candidates = [];
+    $add = function (string $manager, string $name, string $reason, array $fields) use (&$candidates): void {
+        $key = $manager.':'.$name;
+        $row = $candidates[$key] ?? ['manager' => $manager, 'package' => $name, 'reasons' => [], 'advisories' => []];
+        $row['reasons'][] = $reason;
+        $candidates[$key] = array_replace($row, $fields);
+    };
+    foreach ($php['locked'] as $item) {
+        $add('composer', $item['name'], 'major', ['current' => $item['version'], 'latest' => $item['latest']]);
+    }
+    // npm's vp outdated JSON is an object. pnpm's is a list of objects with
+    // name/current/latest. Bun prints a table and does not support --format json.
+    if ($jsManager === 'npm') {
+        foreach ($js as $name => $item) {
+            if (! is_array($item) || ! isset($item['current'], $item['latest'])) {
+                stop('Unsupported Vite+ outdated JSON shape', 70);
+            }
+            $name = $item['name'] ?? $name;
+            if (! is_string($name)) {
+                stop('Vite+ outdated entry has no package name', 70);
+            }
+            if (isMajor($item['current'], $item['latest'])) {
+                $add('js', $name, 'major', ['current' => $item['current'], 'latest' => $item['latest']]);
+            }
+        }
+    } else {
+        $direct = directJsPackages();
+        foreach ($bunRows as $reported => $item) {
+            $name = directPackageName($reported, $direct);
+            if (isMajor($item['current'], $item['latest'])) {
+                $add('js', $name, 'major', ['current' => $item['current'], 'latest' => $item['latest']]);
+            }
+        }
+    }
+    foreach (['composer', 'js'] as $manager) {
+        foreach (audits($manager) as $name => $advisories) {
+            $add($manager, $name, 'security', ['advisories' => $advisories]);
+        }
+    }
+    ksort($candidates);
+    echo json_encode(['schema' => 1, 'candidates' => array_values($candidates)], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES)."\n";
+    exit(0);
+}
+if ($mode !== 'package' || $argc < 6) {
+    stop('Usage: scripts/dependencies routine | detect | package <composer|js> <name> <x.y.z> <major|security> [advisory-id ...]');
+}
+[, , $manager, $name, $version, $purpose] = $argv;
+$ids = array_slice($argv, 6);
+if (! in_array($manager, ['composer', 'js'], true) || ! in_array($purpose, ['major', 'security'], true)
+    || ! preg_match('/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/D', $version)
+    || ! preg_match($manager === 'composer' ? '~^[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*$~D' : '~^(?:@[a-z0-9][a-z0-9_.-]*/)?[a-z0-9][a-z0-9_.-]*$~D', $name)
+    || ($purpose === 'security') !== (count($ids) > 0)) {
+    stop('Invalid single-package target');
+}
+foreach ($ids as $id) {
+    if (! preg_match('~^[A-Za-z0-9][A-Za-z0-9_.:/-]*$~D', $id)) {
+        stop('Invalid advisory ID');
+    }
+}
+$manifest = readJson($manager === 'composer' ? 'composer.json' : 'package.json');
+$sections = $manager === 'composer' ? ['require', 'require-dev'] : ['dependencies', 'devDependencies', 'optionalDependencies'];
+$found = array_values(array_filter($sections, fn ($section) => isset($manifest[$section][$name])));
+if (count($found) !== 1 || ! is_string($manifest[$found[0]][$name]) || preg_match('~(?:npm:|workspace:|git|https?:|file:|link:)~', $manifest[$found[0]][$name])) {
+    stop('Target must be one existing direct registry dependency in exactly one section');
+}
+$range = $purpose === 'security' ? $version : '^'.$version;
+if ($purpose === 'security') {
+    $before = audits($manager)[$name] ?? [];
+    $reported = array_column($before, 'id');
+    if (array_diff($ids, $reported) !== [] && ! ($before === [] && $manifest[$found[0]][$name] === $range)) {
+        stop('Requested advisories are not current findings for this package');
+    }
+    if ($manager === 'composer' && $before !== [] && is_file('vet.json')) {
+        $vet = readJson('vet.json');
+        if (array_key_exists('minimum-release-age', $vet)) {
+            $vet['minimum-release-age-exclude'] = array_values(array_unique([...($vet['minimum-release-age-exclude'] ?? []), $name]));
+            file_put_contents('vet.json', json_encode($vet, JSON_THROW_ON_ERROR | JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES)."\n");
+        }
+    }
+}
+if ($manager === 'composer') {
+    $require = ['composer', 'require', $name.':'.$range, '--no-update', '--no-interaction'];
+    if ($found[0] === 'require-dev') {
+        $require[] = '--dev';
+    }
+    run($require);
+    run(['composer', 'update', $name, '--with-dependencies', '--no-interaction']);
+} else {
+    $add = [localVp(), 'add', $name.'@'.$range, match ($found[0]) {
+        'devDependencies' => '--save-dev', 'optionalDependencies' => '--save-optional', default => '--save-prod',
+    }];
+    if ($purpose === 'security') {
+        $add[] = '--save-exact';
+        if (str_starts_with($manifest['packageManager'] ?? '', 'npm@')) {
+            array_push($add, '--', '--min-release-age=0');
+        }
+    }
+    run($add);
+}
+if ($purpose === 'security' && (audits($manager)[$name] ?? []) !== []) {
+    stop('The selected package still has security advisories', 1);
+}

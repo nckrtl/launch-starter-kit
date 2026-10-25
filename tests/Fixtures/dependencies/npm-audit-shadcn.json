@@ -1,0 +1,50 @@
+{
+    "auditReportVersion": 2,
+    "vulnerabilities": {
+        "shadcn": {
+            "name": "shadcn",
+            "severity": "high",
+            "isDirect": true,
+            "via": ["@shadcn/registry", "zod"],
+            "effects": [],
+            "range": "<=0.0.0-rc-20261007105214 || 2.0.0 - 4.21.5",
+            "nodes": ["node_modules/shadcn"],
+            "fixAvailable": true
+        },
+        "zod": {
+            "name": "zod",
+            "severity": "high",
+            "isDirect": false,
+            "via": [
+                {
+                    "source": 1243066,
+                    "name": "zod",
+                    "dependency": "zod",
+                    "title": "Zod can exhaust memory while validating oversized constrained collections",
+                    "url": "https://github.com/advisories/GHSA-mrhx-c7xc-m3w5",
+                    "severity": "high",
+                    "cwe": ["CWE-770"],
+                    "cvss": {
+                        "score": 7.5,
+                        "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+                    },
+                    "range": "<4.6.6"
+                }
+            ],
+            "effects": ["@shadcn/registry", "chromium-bidi", "shadcn"],
+            "range": "<4.6.6",
+            "nodes": ["node_modules/zod"],
+            "fixAvailable": true
+        },
+        "@shadcn/registry": {
+            "name": "@shadcn/registry",
+            "severity": "high",
+            "isDirect": false,
+            "via": ["zod"],
+            "effects": ["shadcn"],
+            "range": "<=0.0.0-rc-20261007105214 || 0.1.0 - 0.1.4",
+            "nodes": ["node_modules/@shadcn/registry"],
+            "fixAvailable": true
+        }
+    }
+}
