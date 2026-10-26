@@ -8913,16 +8913,16 @@
         },
         {
             "name": "hardimpactdev/maintainer",
-            "version": "v0.1.0",
+            "version": "v0.1.1",
             "source": {
                 "type": "git",
                 "url": "https://github.com/hardimpactdev/maintainer.git",
-                "reference": "9a0da8432128f3384c0fbedea708d3c14483c73c"
+                "reference": "75247752b071e5da96b86d7b70fbc1993689d295"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/hardimpactdev/maintainer/zipball/9a0da8432128f3384c0fbedea708d3c14483c73c",
-                "reference": "9a0da8432128f3384c0fbedea708d3c14483c73c",
+                "url": "https://api.github.com/repos/hardimpactdev/maintainer/zipball/75247752b071e5da96b86d7b70fbc1993689d295",
+                "reference": "75247752b071e5da96b86d7b70fbc1993689d295",
                 "shasum": ""
             },
             "require": {
@@ -8947,9 +8947,9 @@
             "description": "Repo-owned dependency updates for Composer, npm, Bun, and Expo.",
             "support": {
                 "issues": "https://github.com/hardimpactdev/maintainer/issues",
-                "source": "https://github.com/hardimpactdev/maintainer/tree/v0.1.0"
+                "source": "https://github.com/hardimpactdev/maintainer/tree/v0.1.1"
             },
-            "time": "2026-10-26T05:49:59+00:00"
+            "time": "2026-10-26T08:41:57+00:00"
         },
         {
             "name": "iamcal/sql-parser",
