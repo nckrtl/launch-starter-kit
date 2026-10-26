@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "a03575401ea7bfc2d2005fe62e75e099",
+    "content-hash": "1fecb865a9a0c694d555a0575fd9c61f",
     "packages": [
         {
             "name": "brick/math",
@@ -8913,16 +8913,16 @@
         },
         {
             "name": "hardimpactdev/maintainer",
-            "version": "v0.1.1",
+            "version": "v0.2.0",
             "source": {
                 "type": "git",
                 "url": "https://github.com/hardimpactdev/maintainer.git",
-                "reference": "75247752b071e5da96b86d7b70fbc1993689d295"
+                "reference": "5ce90d19f7cc4abacff28e3b564e48b181656b67"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/hardimpactdev/maintainer/zipball/75247752b071e5da96b86d7b70fbc1993689d295",
-                "reference": "75247752b071e5da96b86d7b70fbc1993689d295",
+                "url": "https://api.github.com/repos/hardimpactdev/maintainer/zipball/5ce90d19f7cc4abacff28e3b564e48b181656b67",
+                "reference": "5ce90d19f7cc4abacff28e3b564e48b181656b67",
                 "shasum": ""
             },
             "require": {
@@ -8947,9 +8947,9 @@
             "description": "Repo-owned dependency updates for Composer, npm, Bun, and Expo.",
             "support": {
                 "issues": "https://github.com/hardimpactdev/maintainer/issues",
-                "source": "https://github.com/hardimpactdev/maintainer/tree/v0.1.1"
+                "source": "https://github.com/hardimpactdev/maintainer/tree/v0.2.0"
             },
-            "time": "2026-10-26T08:41:57+00:00"
+            "time": "2026-10-26T09:50:38+00:00"
         },
         {
             "name": "iamcal/sql-parser",
