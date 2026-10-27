@@ -31,8 +31,9 @@ it('does not resolve the live sqlite path after phpunit applies a leftover envir
         '-r',
         <<<'PHP'
         require 'vendor/autoload.php';
-        $xml = (new PHPUnit\TextUI\XmlConfiguration\Loader)->load('phpunit.xml');
-        (new PHPUnit\TextUI\Configuration\PhpHandler)->handle($xml->php());
+        $emitter = PHPUnit\Event\Facade::emitter();
+        $xml = (new PHPUnit\TextUI\XmlConfiguration\Loader($emitter))->load('phpunit.xml');
+        (new PHPUnit\TextUI\Configuration\PhpHandler($emitter))->handle($xml->php());
         $app = require 'bootstrap/app.php';
         $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();
         echo json_encode([
