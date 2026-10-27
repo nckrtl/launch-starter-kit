@@ -30,8 +30,6 @@
         "laravel/pail": "^1.2.5",
         "laravel/pint": "^1.27",
         "mockery/mockery": "^1.6",
-        "nckrtl/laravel-toolbar": "^0.3.1",
-        "nckrtl/laravel-toolbar-agentation": "^0.1",
         "nunomaduro/collision": "^8.6",
         "pestphp/pest": "^5.0",
         "pestphp/pest-plugin-browser": "^5.0",
