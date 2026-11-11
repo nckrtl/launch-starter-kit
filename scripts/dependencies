@@ -1,7 +1,0 @@
-#!/bin/sh
-set -eu
-cd "$(dirname "$0")/.."
-if [ ! -x vendor/bin/maintainer ]; then
-  composer install --no-interaction --no-scripts >&2
-fi
-exec vendor/bin/maintainer dependencies "$@"
